@@ -1,5 +1,9 @@
+use assert_fs::prelude::*;
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::{HasName, categories::NonRootFileType};
+use filen_sdk_rs::{
+	fs::{HasName, categories::NonRootFileType},
+	io::client_impl::IoSharedClientExt as _,
+};
 use predicates::prelude::PredicateBooleanExt as _;
 use rand::TryRngCore;
 use test_utils::authenticated_cli_with_args;
@@ -312,6 +316,118 @@ async fn cmd_cp() {
 			.unwrap()
 			.is_some()
 	);
+}
+
+#[shared_test_runtime]
+async fn cmd_upload_download() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// build a local tree to upload: a loose file, and a directory with a nested file
+	let local = assert_fs::TempDir::new().unwrap();
+	local
+		.child("single.txt")
+		.write_str("single content")
+		.unwrap();
+	local
+		.child("upload_source/nested")
+		.create_dir_all()
+		.unwrap();
+	local
+		.child("upload_source/nested/deep.txt")
+		.write_str("deep content")
+		.unwrap();
+
+	// upload a single file
+	authenticated_cli_with_args!(
+		"upload",
+		local.child("single.txt").path().to_str().unwrap(),
+		test_dir.name().unwrap()
+	)
+	.success()
+	.stdout(predicates::str::contains("Uploaded"));
+	let uploaded = client
+		.find_item_at_path(&format!("{}/single.txt", test_dir.name().unwrap()))
+		.await
+		.unwrap()
+		.expect("uploaded file should exist");
+	let NonRootFileType::File(uploaded) = uploaded else {
+		panic!("uploaded item should be a file");
+	};
+	assert_eq!(
+		String::from_utf8(client.download_file(uploaded.as_ref()).await.unwrap()).unwrap(),
+		"single content"
+	);
+
+	// upload a directory recursively (into a subdirectory named after it)
+	authenticated_cli_with_args!(
+		"upload",
+		local.child("upload_source").path().to_str().unwrap(),
+		test_dir.name().unwrap()
+	)
+	.success()
+	.stdout(predicates::str::contains("Uploaded"));
+	assert!(
+		client
+			.find_item_at_path(&format!(
+				"{}/upload_source/nested/deep.txt",
+				test_dir.name().unwrap()
+			))
+			.await
+			.unwrap()
+			.is_some()
+	);
+
+	// download the directory back, recursively
+	let download_target = assert_fs::TempDir::new().unwrap();
+	authenticated_cli_with_args!(
+		"download",
+		&format!("{}/upload_source", test_dir.name().unwrap()),
+		download_target.path().to_str().unwrap()
+	)
+	.success()
+	.stdout(predicates::str::contains("Downloaded"));
+	assert_eq!(
+		std::fs::read_to_string(
+			download_target
+				.child("upload_source/nested/deep.txt")
+				.path()
+		)
+		.unwrap(),
+		"deep content"
+	);
+
+	// download a single file
+	authenticated_cli_with_args!(
+		"download",
+		&format!("{}/single.txt", test_dir.name().unwrap()),
+		download_target.path().to_str().unwrap()
+	)
+	.success()
+	.stdout(predicates::str::contains("Downloaded"));
+	assert_eq!(
+		std::fs::read_to_string(download_target.child("single.txt").path()).unwrap(),
+		"single content"
+	);
+
+	// try to upload a non-existing local path
+	authenticated_cli_with_args!(
+		"upload",
+		local.child("does_not_exist").path().to_str().unwrap(),
+		test_dir.name().unwrap()
+	)
+	.failure()
+	.stdout(predicates::str::contains("No such local file or directory"));
+
+	// try to download a non-existing remote path
+	authenticated_cli_with_args!(
+		"download",
+		"/non_existing_file.txt",
+		download_target.path().to_str().unwrap()
+	)
+	.failure()
+	.stdout(predicates::str::contains("No such file or directory"));
 }
 
 #[shared_test_runtime]

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - autocompletion in interactive mode, including remote paths
 - interactive `search` command to globally search for files and directories in the drive
+- `upload` and `download` commands to transfer files and directories to and from the drive
 
 ## 0.2.7 - 2026-06-19
 

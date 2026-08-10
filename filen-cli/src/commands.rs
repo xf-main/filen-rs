@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
+use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use console::style;
 use filen_rclone_wrapper::serve::BasicServerOptions;
 use filen_sdk_rs::{
@@ -107,6 +108,24 @@ pub(crate) enum Commands {
 		/// Destination parent directory
 		#[arg(add = FilenCompleter::directory())]
 		destination: String,
+	},
+	/// Upload a local file or directory (recursively) into a directory in the Filen drive
+	Upload {
+		/// Local file or directory to upload
+		#[arg(add = ArgValueCompleter::new(PathCompleter::any()))]
+		source: String,
+		/// Destination directory in the Filen drive (default: the current working directory)
+		#[arg(add = FilenCompleter::directory())]
+		destination: Option<String>,
+	},
+	/// Download a file or directory (recursively) from the Filen drive into a local directory
+	Download {
+		/// File or directory to download ("/" for the entire Filen drive)
+		#[arg(add = FilenCompleter::file_or_directory())]
+		source: String,
+		/// Local destination directory (default: the current local directory)
+		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		destination: Option<String>,
 	},
 	/// Search for a file or directory interactively
 	Search,
@@ -269,6 +288,28 @@ pub(crate) async fn execute_command(
 				MoveOrCopy::Copy,
 				&source,
 				&destination,
+			)
+			.await?;
+			None
+		}
+		Commands::Upload {
+			source,
+			destination,
+		} => {
+			crate::transfer_cmds::upload(ui, client, working_path, &source, destination.as_deref())
+				.await?;
+			None
+		}
+		Commands::Download {
+			source,
+			destination,
+		} => {
+			crate::transfer_cmds::download(
+				ui,
+				client,
+				working_path,
+				&source,
+				destination.as_deref(),
 			)
 			.await?;
 			None

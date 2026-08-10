@@ -91,6 +91,10 @@ impl UI {
 		self.disable_suggestions = disable_suggestions;
 	}
 
+	pub(crate) fn is_quiet(&self) -> bool {
+		self.quiet
+	}
+
 	fn get_terminal_width(&self) -> Option<usize> {
 		match self.override_terminal_width {
 			Some(size) => Some(size),
