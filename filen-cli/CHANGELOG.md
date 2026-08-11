@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - interactive `search` command to globally search for files and directories in the drive
 - `upload` and `download` commands to transfer files and directories to and from the drive
 
+### Changed
+
+- improved `mv` to include renaming and handle more special cases
+
 ## 0.2.7 - 2026-06-19
 
 ### Added

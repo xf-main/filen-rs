@@ -203,41 +203,105 @@ async fn cmd_mv() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
+	let base = test_dir.name().unwrap();
 
-	// create test file to call mv on
-	let file = client
-		.make_file_builder("testfile.txt", test_dir.uuid)
-		.unwrap();
-	let content = "Hello, Filen!";
-	client.upload_file(file, content.as_bytes()).await.unwrap();
+	let exists = async |path: &str| {
+		client
+			.find_item_at_path(path)
+			.await
+			.unwrap_or_else(|e| panic!("failed to look up {}: {}", path, e))
+			.is_some()
+	};
 
-	// create destination directory
-	let destination_dir = format!("{}/moved_dir", test_dir.name().unwrap());
-	client
-		.create_dir(&test_dir.into(), "moved_dir")
+	// create a source and a destination directory
+	let src_dir = client.create_dir(&test_dir.into(), "mv_src").await.unwrap();
+	let dest_dir = client
+		.create_dir(&test_dir.into(), "mv_dest")
 		.await
 		.unwrap();
+	for (parent, name) in [
+		(&src_dir, "moved.txt"),
+		(&src_dir, "renamed.txt"),
+		(&src_dir, "in_place.txt"),
+		(&dest_dir, "occupied.txt"),
+	] {
+		let file = client.make_file_builder(name, parent.uuid).unwrap();
+		client.upload_file(file, b"Hello, Filen!").await.unwrap();
+	}
+	// a directory (with a child, to verify its contents come along) to move and rename
+	let moved_dir = client
+		.create_dir(&(&src_dir).into(), "moved_dir")
+		.await
+		.unwrap();
+	let child = client
+		.make_file_builder("child.txt", moved_dir.uuid)
+		.unwrap();
+	client.upload_file(child, b"child").await.unwrap();
 
-	// mv
+	// destination is an existing directory: move the file into it, keeping its name
 	authenticated_cli_with_args!(
 		"mv",
-		&format!("{}/testfile.txt", test_dir.name().unwrap()),
-		&destination_dir
+		&format!("{}/mv_src/moved.txt", base),
+		&format!("{}/mv_dest", base)
 	)
 	.success()
 	.stdout(predicates::str::contains("Moved"));
+	assert!(!exists(&format!("{}/mv_src/moved.txt", base)).await);
+	assert!(exists(&format!("{}/mv_dest/moved.txt", base)).await);
 
-	// verify file was moved
-	let old_file = client
-		.find_item_at_path(&format!("{}/testfile.txt", test_dir.name().unwrap()))
-		.await
-		.unwrap();
-	assert!(old_file.is_none());
-	let new_file = client
-		.find_item_at_path(&format!("{}/testfile.txt", &destination_dir))
-		.await
-		.unwrap();
-	assert!(new_file.is_some());
+	// destination is a file path in another directory: move and rename the file
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{}/mv_src/renamed.txt", base),
+		&format!("{}/mv_dest/new_name.txt", base)
+	)
+	.success()
+	.stdout(predicates::str::contains("Moved"));
+	assert!(!exists(&format!("{}/mv_src/renamed.txt", base)).await);
+	assert!(exists(&format!("{}/mv_dest/new_name.txt", base)).await);
+
+	// destination is a file path in the same directory: rename the file in place
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{}/mv_src/in_place.txt", base),
+		&format!("{}/mv_src/in_place_renamed.txt", base)
+	)
+	.success()
+	.stdout(predicates::str::contains("Moved"));
+	assert!(!exists(&format!("{}/mv_src/in_place.txt", base)).await);
+	assert!(exists(&format!("{}/mv_src/in_place_renamed.txt", base)).await);
+
+	// source is a directory: move and rename it, contents included
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{}/mv_src/moved_dir", base),
+		&format!("{}/mv_dest/renamed_dir", base)
+	)
+	.success()
+	.stdout(predicates::str::contains("Moved"));
+	assert!(!exists(&format!("{}/mv_src/moved_dir", base)).await);
+	assert!(exists(&format!("{}/mv_dest/renamed_dir", base)).await);
+	assert!(exists(&format!("{}/mv_dest/renamed_dir/child.txt", base)).await);
+
+	// refuse to overwrite an existing destination
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{}/mv_dest/moved.txt", base),
+		&format!("{}/mv_dest/occupied.txt", base)
+	)
+	.failure()
+	.stdout(predicates::str::contains("Destination already exists"));
+	assert!(exists(&format!("{}/mv_dest/moved.txt", base)).await);
+
+	// refuse a destination whose parent directory doesn't exist
+	authenticated_cli_with_args!(
+		"mv",
+		&format!("{}/mv_dest/moved.txt", base),
+		&format!("{}/no_such_dir/moved.txt", base)
+	)
+	.failure()
+	.stdout(predicates::str::contains("No such destination directory"));
+	assert!(exists(&format!("{}/mv_dest/moved.txt", base)).await);
 }
 
 #[shared_test_runtime]

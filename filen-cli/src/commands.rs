@@ -6,9 +6,10 @@ use filen_rclone_wrapper::serve::BasicServerOptions;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
-		HasName as _, HasUUID,
+		HasName as _, HasParent as _, HasUUID,
 		categories::{DirType, NonRootFileType, Normal},
-		file::traits::HasFileInfo as _,
+		dir::meta::DirectoryMetaChanges,
+		file::{meta::FileMetaChanges, traits::HasFileInfo as _},
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 };
@@ -91,13 +92,14 @@ pub(crate) enum Commands {
 		#[arg(short, long)]
 		permanent: bool,
 	},
-	/// Move a file or directory
+	/// Move and/or rename a file or directory
 	Mv {
 		/// Source file or directory
 		#[arg(add = FilenCompleter::file_or_directory())]
 		source: String,
-		/// Destination parent directory
-		#[arg(add = FilenCompleter::directory())]
+		/// Destination: an existing directory to move the source into,
+		/// or the new path of the source (to move and/or rename it)
+		#[arg(add = FilenCompleter::file_or_directory())]
 		destination: String,
 	},
 	/// Copy a file or directory
@@ -266,30 +268,14 @@ pub(crate) async fn execute_command(
 			source,
 			destination,
 		} => {
-			move_or_copy_file_or_directory(
-				ui,
-				client,
-				working_path,
-				MoveOrCopy::Move,
-				&source,
-				&destination,
-			)
-			.await?;
+			move_file_or_directory(ui, client, working_path, &source, &destination).await?;
 			None
 		}
 		Commands::Cp {
 			source,
 			destination,
 		} => {
-			move_or_copy_file_or_directory(
-				ui,
-				client,
-				working_path,
-				MoveOrCopy::Copy,
-				&source,
-				&destination,
-			)
-			.await?;
+			copy_file_or_directory(ui, client, working_path, &source, &destination).await?;
 			None
 		}
 		Commands::Upload {
@@ -844,15 +830,167 @@ async fn delete_file_or_directory(
 	Ok(())
 }
 
-enum MoveOrCopy {
-	Move,
-	Copy,
-}
-async fn move_or_copy_file_or_directory(
+/// Moves and/or renames a file or directory, following the semantics of the Unix `mv`:
+/// if the destination is an existing directory, the source is moved into it under its
+/// current name; otherwise the destination names the source's new path, so the source is
+/// moved to that path's parent directory and renamed to that path's base name.
+async fn move_file_or_directory(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	action: MoveOrCopy,
+	source_str: &str,
+	destination_str: &str,
+) -> Result<()> {
+	let source_path = working_path.navigate(source_str);
+	let destination_path = working_path.navigate(destination_str);
+	let client = client.get(ui).await?;
+	let Some(source) = client
+		.find_item_at_path(&source_path.0)
+		.await
+		.context("Failed to find source file or directory")?
+	else {
+		return Err(UI::failure(&format!(
+			"No such source file or directory: {}",
+			source_path.0
+		)));
+	};
+	let source_filename = match &source {
+		NonRootFileType::File(file) => file.name(),
+		NonRootFileType::Dir(dir) => dir.name(),
+		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
+	}
+	.context("Failed to decrypt source name")?
+	.to_string();
+
+	// resolve the destination into the directory the source ends up in, plus the name it
+	// ends up under
+	let destination_dir = match client
+		.find_item_at_path(&destination_path.0)
+		.await
+		.context("Failed to find destination")?
+	{
+		Some(NonRootFileType::Dir(dir)) => Some(DirType::Dir(dir)),
+		Some(NonRootFileType::Root(root)) => Some(DirType::Root(root)),
+		Some(NonRootFileType::File(_)) => {
+			return Err(UI::failure(&format!(
+				"Destination already exists: {}",
+				destination_path.0
+			)));
+		}
+		None => None,
+	};
+	let (destination_dir, new_name, new_path) = match destination_dir {
+		// the destination is an existing directory, so move the source into it as-is
+		Some(destination_dir) => {
+			let new_path = destination_path.navigate(&source_filename);
+			if new_path == source_path {
+				return Err(UI::failure(&format!(
+					"{} is already in {}",
+					source_path.0, destination_path.0
+				)));
+			}
+			// check that the destination doesn't already exist
+			if client
+				.find_item_at_path(&new_path.0)
+				.await
+				.context("Failed to check destination")?
+				.is_some()
+			{
+				return Err(UI::failure(&format!(
+					"Destination already exists: {}",
+					new_path.0
+				)));
+			}
+			(destination_dir, source_filename.clone(), new_path)
+		}
+		// the destination doesn't exist, so it names the source's new path
+		None => {
+			let new_name = destination_path.basename().expect("cannot fail");
+			let parent_path = destination_path.parent();
+			let destination_dir = match client
+				.find_item_at_path(&parent_path.0)
+				.await
+				.context("Failed to find destination parent directory")?
+			{
+				Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+				Some(NonRootFileType::Root(root)) => DirType::Root(root),
+				Some(NonRootFileType::File(_)) => {
+					return Err(UI::failure(&format!("Not a directory: {}", parent_path.0)));
+				}
+				None => {
+					return Err(UI::failure(&format!(
+						"No such destination directory: {}",
+						parent_path.0
+					)));
+				}
+			};
+			(
+				destination_dir,
+				new_name.to_string(),
+				destination_path.clone(),
+			)
+		}
+	};
+
+	if new_path.0.starts_with(&format!("{}/", source_path.0)) {
+		return Err(UI::failure(&format!(
+			"Cannot move {} into itself: {}",
+			source_path.0, new_path.0
+		)));
+	}
+
+	let needs_rename = new_name != source_filename;
+	match source {
+		NonRootFileType::File(file) => {
+			let mut file = file.into_owned();
+			if *file.parent() != destination_dir.uuid() {
+				client
+					.move_file(&mut file, &destination_dir)
+					.await
+					.context("Failed to move file")?;
+			}
+			if needs_rename {
+				client
+					.update_file_metadata(
+						&mut file,
+						FileMetaChanges::default()
+							.name(&new_name)
+							.context("Invalid destination file name")?,
+					)
+					.await
+					.context("Failed to rename file")?;
+			}
+		}
+		NonRootFileType::Dir(dir) => {
+			let mut dir = dir.into_owned();
+			if *dir.parent() != destination_dir.uuid() {
+				client
+					.move_dir(&mut dir, &destination_dir)
+					.await
+					.context("Failed to move directory")?;
+			}
+			if needs_rename {
+				client
+					.update_dir_metadata(
+						&mut dir,
+						DirectoryMetaChanges::default()
+							.name(&new_name)
+							.context("Invalid destination directory name")?,
+					)
+					.await
+					.context("Failed to rename directory")?;
+			}
+		}
+		NonRootFileType::Root(_) => return Err(UI::failure("Cannot move root directory")),
+	}
+	ui.print_success(&format!("Moved {} to {}", source_path.0, new_path.0));
+	Ok(())
+}
+
+async fn copy_file_or_directory(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
 	source_str: &str,
 	destination_str: &str,
 ) -> Result<()> {
@@ -889,44 +1027,20 @@ async fn move_or_copy_file_or_directory(
 			)));
 		}
 	};
-	match action {
-		MoveOrCopy::Move => match source_file_or_directory {
-			NonRootFileType::File(file) => {
-				client
-					.move_file(&mut file.into_owned(), &destination_dir)
-					.await
-					.context("Failed to move file or directory")?;
-			}
-			NonRootFileType::Dir(dir) => {
-				client
-					.move_dir(&mut dir.into_owned(), &destination_dir)
-					.await
-					.context("Failed to move directory")?;
-			}
-			NonRootFileType::Root(_) => {
-				return Err(UI::failure("Cannot move root directory"));
-			}
-		},
-		MoveOrCopy::Copy => match source_file_or_directory {
-			NonRootFileType::File(file) => {
-				copy_file(client, file.as_ref(), &destination_dir).await?;
-			}
-			NonRootFileType::Dir(dir) => {
-				copy_dir_recursive(client, dir.as_ref(), &destination_dir).await?;
-			}
-			NonRootFileType::Root(_) => {
-				return Err(UI::failure("Cannot copy root directory"));
-			}
-		},
+	match source_file_or_directory {
+		NonRootFileType::File(file) => {
+			copy_file(client, file.as_ref(), &destination_dir).await?;
+		}
+		NonRootFileType::Dir(dir) => {
+			copy_dir_recursive(client, dir.as_ref(), &destination_dir).await?;
+		}
+		NonRootFileType::Root(_) => {
+			return Err(UI::failure("Cannot copy root directory"));
+		}
 	}
 	ui.print_success(&format!(
-		"{} {} into {}",
-		match action {
-			MoveOrCopy::Move => "Moved",
-			MoveOrCopy::Copy => "Copied",
-		},
-		source_str.0,
-		destination_str.0
+		"Copied {} into {}",
+		source_str.0, destination_str.0
 	));
 	Ok(())
 }
