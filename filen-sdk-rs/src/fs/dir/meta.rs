@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_macros::js_type;
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	rkyv::date_time::DateTimeUtcDef,
@@ -19,10 +18,6 @@ use crate::{
 		name::{EntryNameError, ValidatedName},
 	},
 };
-// Reuse the file-side CreatedTime so the two twins share one uniffi enum (a second
-// enum of the same name would collide in the flattened uniffi namespace).
-#[cfg(feature = "uniffi")]
-use crate::fs::file::meta::CreatedTime;
 
 #[derive(Debug, PartialEq, Eq, Clone, CowHelpers)]
 pub enum DirectoryMeta<'a> {
@@ -131,14 +126,7 @@ impl<'a> DirectoryMeta<'a> {
 			| Self::Encrypted(_)
 			| Self::RSAEncrypted(_) => {
 				// if all the metadata is being applied, we can convert to Decoded
-				#[cfg(not(feature = "uniffi"))]
 				let created = changes.created.ok_or(MetadataWasNotDecryptedError)?;
-				#[cfg(feature = "uniffi")]
-				let created = match changes.created {
-					CreatedTime::Keep => return Err(MetadataWasNotDecryptedError.into()),
-					CreatedTime::Unset => None,
-					CreatedTime::Set(t) => Some(t),
-				};
 				*self = Self::Decoded(DecryptedDirectoryMeta {
 					name: changes
 						.name
@@ -166,14 +154,7 @@ impl<'a> DirectoryMeta<'a> {
 				} else {
 					return Err(MetadataWasNotDecryptedError.into());
 				};
-				#[cfg(not(feature = "uniffi"))]
 				let created = changes.created.ok_or(MetadataWasNotDecryptedError)?;
-				#[cfg(feature = "uniffi")]
-				let created = match &changes.created {
-					CreatedTime::Keep => return Err(MetadataWasNotDecryptedError.into()),
-					CreatedTime::Unset => None,
-					CreatedTime::Set(t) => Some(*t),
-				};
 				Self::Decoded(DecryptedDirectoryMeta { name, created })
 			}
 		})
@@ -218,44 +199,19 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 		if let Some(name) = changes.name {
 			self.name = Cow::Owned(name.into());
 		}
-		#[cfg(not(feature = "uniffi"))]
-		{
-			if let Some(created) = changes.created {
-				self.created = created;
-			}
-		}
-		#[cfg(feature = "uniffi")]
-		{
-			self.created = match changes.created {
-				CreatedTime::Keep => self.created,
-				CreatedTime::Unset => None,
-				CreatedTime::Set(t) => Some(t),
-			};
+		if let Some(created) = changes.created {
+			self.created = created;
 		}
 	}
 
 	pub fn borrowed_with_changes(&'a self, changes: &'a DirectoryMetaChanges) -> Self {
-		let created = {
-			#[cfg(feature = "uniffi")]
-			{
-				match &changes.created {
-					CreatedTime::Keep => self.created,
-					CreatedTime::Unset => None,
-					CreatedTime::Set(t) => Some(*t),
-				}
-			}
-			#[cfg(not(feature = "uniffi"))]
-			{
-				changes.created.unwrap_or(self.created)
-			}
-		};
 		Self {
 			name: if let Some(name) = &changes.name {
 				Cow::Borrowed(name.as_ref())
 			} else {
 				Cow::Borrowed(&self.name)
 			},
-			created,
+			created: changes.created.unwrap_or(self.created),
 		}
 	}
 
@@ -270,27 +226,11 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 	}
 }
 
-#[derive(Default)]
-#[js_type(import)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DirectoryMetaChanges {
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
-	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	name: Option<ValidatedName>,
-	// double option because we need to distinguish between "not set" and "set to
-	// None". uniffi collapses nested nullability (T?? == T?), so it uses the
-	// CreatedTime enum instead — matching the FileMetaChanges twin.
-	#[cfg(not(feature = "uniffi"))]
-	#[cfg_attr(
-		feature = "wasm-full",
-		tsify(type = "bigint | null"),
-		serde(
-			default,
-			deserialize_with = "crate::serde::deserialize_double_option_timestamp"
-		)
-	)]
+	// double option because we need to distinguish between "not set" and "set to None"
 	created: Option<Option<DateTime<Utc>>>,
-	#[cfg(feature = "uniffi")]
-	created: CreatedTime,
 }
 
 impl DirectoryMetaChanges {
@@ -300,18 +240,34 @@ impl DirectoryMetaChanges {
 	}
 
 	pub fn created(mut self, created: Option<DateTime<Utc>>) -> Self {
-		#[cfg(feature = "uniffi")]
-		{
-			self.created = match created {
-				Some(t) => CreatedTime::Set(t.round_subsecs(3)),
-				None => CreatedTime::Unset,
-			};
-		}
-		#[cfg(not(feature = "uniffi"))]
-		{
-			self.created = Some(created.map(|t| t.round_subsecs(3)));
-		}
+		self.created = Some(created.map(|t| t.round_subsecs(3)));
 		self
+	}
+}
+
+// The FFI twin carries the name unvalidated because neither tsify's
+// from_wasm_abi nor uniffi's record lifting can report an error; validation
+// happens here instead, inside the exported function.
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+impl TryFrom<crate::js::DirectoryMetaChanges> for DirectoryMetaChanges {
+	type Error = EntryNameError;
+
+	fn try_from(changes: crate::js::DirectoryMetaChanges) -> Result<Self, Self::Error> {
+		Ok(Self {
+			name: changes
+				.name
+				.as_deref()
+				.map(ValidatedName::try_from)
+				.transpose()?,
+			#[cfg(not(feature = "uniffi"))]
+			created: changes.created,
+			#[cfg(feature = "uniffi")]
+			created: match changes.created {
+				crate::js::CreatedTime::Keep => None,
+				crate::js::CreatedTime::Unset => Some(None),
+				crate::js::CreatedTime::Set(t) => Some(Some(t)),
+			},
+		})
 	}
 }
 
@@ -443,5 +399,78 @@ mod tests {
 		);
 		assert_eq!(meta.name(), Some("d"));
 		assert_eq!(meta.created(), None);
+	}
+
+	// The FFI boundary cannot report a failed name validation, so the twin
+	// conversion must — this is what turns the old boundary abort into an error.
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+	#[test]
+	fn js_changes_invalid_name_is_rejected() {
+		let js = crate::js::DirectoryMetaChanges {
+			name: Some("a/b".to_string()),
+			..Default::default()
+		};
+		let err = DirectoryMetaChanges::try_from(js).unwrap_err();
+		assert!(matches!(
+			err.kind,
+			crate::fs::name::EntryNameErrorKind::ForbiddenChar { ch: '/', pos: 1 }
+		));
+	}
+
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+	#[test]
+	fn js_changes_valid_name_converts() {
+		let js = crate::js::DirectoryMetaChanges {
+			name: Some("dir".to_string()),
+			..Default::default()
+		};
+		assert_eq!(
+			DirectoryMetaChanges::try_from(js).unwrap(),
+			DirectoryMetaChanges::default().name("dir").unwrap()
+		);
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown", not(feature = "uniffi")))]
+	#[test]
+	fn js_changes_created_maps_through() {
+		let t = DateTime::<Utc>::from_timestamp_millis(1718999999999).unwrap();
+		for (js_created, expected) in [
+			(None, DirectoryMetaChanges::default()),
+			(Some(None), DirectoryMetaChanges::default().created(None)),
+			(
+				Some(Some(t)),
+				DirectoryMetaChanges::default().created(Some(t)),
+			),
+		] {
+			let js = crate::js::DirectoryMetaChanges {
+				name: None,
+				created: js_created,
+			};
+			assert_eq!(DirectoryMetaChanges::try_from(js).unwrap(), expected);
+		}
+	}
+
+	#[cfg(feature = "uniffi")]
+	#[test]
+	fn js_changes_created_time_maps_through() {
+		use crate::js::CreatedTime;
+		let t = DateTime::<Utc>::from_timestamp_millis(1718999999999).unwrap();
+		for (js_created, expected) in [
+			(CreatedTime::Keep, DirectoryMetaChanges::default()),
+			(
+				CreatedTime::Unset,
+				DirectoryMetaChanges::default().created(None),
+			),
+			(
+				CreatedTime::Set(t),
+				DirectoryMetaChanges::default().created(Some(t)),
+			),
+		] {
+			let js = crate::js::DirectoryMetaChanges {
+				name: None,
+				created: js_created,
+			};
+			assert_eq!(DirectoryMetaChanges::try_from(js).unwrap(), expected);
+		}
 	}
 }

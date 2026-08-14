@@ -11,10 +11,12 @@ use crate::{
 	error::ResultExt,
 	fs::{
 		categories::{DirType, Normal},
-		file::{enums::RemoteFileType, meta::FileMetaChanges},
+		file::enums::RemoteFileType,
 	},
 	io::client_impl::IoSharedClientExt,
-	js::{AnyFile, AnyNormalDir, File, FileVersion, ManagedFuture, UploadFileParams},
+	js::{
+		AnyFile, AnyNormalDir, File, FileMetaChanges, FileVersion, ManagedFuture, UploadFileParams,
+	},
 	runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
@@ -284,7 +286,8 @@ impl JsClient {
 		let this = self.inner();
 		do_on_commander(move || async move {
 			let mut file = file.try_into()?;
-			this.update_file_metadata(&mut file, changes).await?;
+			this.update_file_metadata(&mut file, changes.try_into()?)
+				.await?;
 			Ok(file.into())
 		})
 		.await

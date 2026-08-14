@@ -1,6 +1,7 @@
 mod categories;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 mod managed_futures;
+mod meta_changes;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod params;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
@@ -38,6 +39,7 @@ pub(crate) use categories::{
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;
+pub use meta_changes::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub use params::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]

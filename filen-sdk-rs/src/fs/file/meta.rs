@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_macros::js_type;
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{Blake3Hash, EncryptedString, rsa::RSAEncryptedString},
@@ -238,6 +237,38 @@ mod tests {
 
 	const FILE_META_JSON: &str = r#"{"name":"Résumé.txt","size":3,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1719000000000}"#;
 
+	// The FFI boundary cannot report a failed name validation, so the twin
+	// conversion must — this is what turns the old boundary abort into an error.
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+	#[test]
+	fn js_changes_invalid_name_is_rejected() {
+		let js = crate::js::FileMetaChanges {
+			name: Some("a/b.txt".to_string()),
+			..Default::default()
+		};
+		let err = FileMetaChanges::try_from(js).unwrap_err();
+		assert!(matches!(
+			err.kind,
+			crate::fs::name::EntryNameErrorKind::ForbiddenChar { ch: '/', pos: 1 }
+		));
+	}
+
+	// Unlike the name() builder method, the twin conversion must not derive a
+	// mime from the new name — FFI callers never had that behavior.
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+	#[test]
+	fn js_changes_name_does_not_auto_derive_mime() {
+		let js = crate::js::FileMetaChanges {
+			name: Some("a.txt".to_string()),
+			..Default::default()
+		};
+		let changes = FileMetaChanges::try_from(js).unwrap();
+		assert_eq!(changes.name.as_ref().map(|n| n.as_ref()), Some("a.txt"));
+		assert_eq!(changes.mime, None);
+		assert_eq!(changes.last_modified, None);
+		assert_eq!(changes.created, None);
+	}
+
 	#[test]
 	fn rsa_file_metadata_valid_utf8_decodes() {
 		let meta = FileMeta::blocking_from_rsa_encrypted(
@@ -416,38 +447,13 @@ impl<'a> DecryptedFileMeta<'a> {
 		if let Some(last_modified) = changes.last_modified {
 			self.last_modified = last_modified;
 		}
-		#[cfg(not(feature = "uniffi"))]
-		{
-			if let Some(created) = changes.created {
-				self.created = created;
-			}
-		}
-
-		#[cfg(feature = "uniffi")]
-		{
-			self.created = match changes.created {
-				CreatedTime::Keep => self.created,
-				CreatedTime::Unset => None,
-				CreatedTime::Set(t) => Some(t),
-			};
+		if let Some(created) = changes.created {
+			self.created = created;
 		}
 	}
 
 	pub fn borrowed_with_changes(&'a self, changes: &'a FileMetaChanges) -> Self {
-		let created = {
-			#[cfg(feature = "uniffi")]
-			{
-				match &changes.created {
-					CreatedTime::Keep => self.created,
-					CreatedTime::Unset => None,
-					CreatedTime::Set(t) => Some(*t),
-				}
-			}
-			#[cfg(not(feature = "uniffi"))]
-			{
-				changes.created.unwrap_or(self.created)
-			}
-		};
+		let created = changes.created.unwrap_or(self.created);
 		Self {
 			name: if let Some(name) = &changes.name {
 				Cow::Borrowed(name.as_ref())
@@ -513,43 +519,43 @@ impl<'a> DecryptedFileMeta<'a> {
 	}
 }
 
-#[cfg(feature = "uniffi")]
-#[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize, uniffi::Enum)]
-pub enum CreatedTime {
-	#[default]
-	Keep,
-	Unset,
-	Set(DateTime<Utc>),
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileMetaChanges {
+	name: Option<ValidatedName>,
+	mime: Option<String>,
+	last_modified: Option<DateTime<Utc>>,
+	// double option because we need to distinguish between "not set" and "set to None"
+	created: Option<Option<DateTime<Utc>>>,
 }
 
-#[derive(Default)]
-#[js_type(import)]
-pub struct FileMetaChanges {
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
-	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
-	name: Option<ValidatedName>,
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
-	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
-	mime: Option<String>,
-	#[cfg_attr(
-		feature = "wasm-full",
-		tsify(type = "bigint"),
-		serde(default, with = "filen_types::serde::time::optional")
-	)]
-	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
-	last_modified: Option<DateTime<Utc>>,
-	#[cfg(not(feature = "uniffi"))]
-	#[cfg_attr(
-		feature = "wasm-full",
-		tsify(type = "bigint | null"),
-		serde(
-			default,
-			deserialize_with = "crate::serde::deserialize_double_option_timestamp"
-		)
-	)]
-	created: Option<Option<DateTime<Utc>>>,
-	#[cfg(feature = "uniffi")]
-	created: CreatedTime,
+// The FFI twin carries the name unvalidated because neither tsify's
+// from_wasm_abi nor uniffi's record lifting can report an error; validation
+// happens here instead, inside the exported function. Fields map directly —
+// deliberately no mime auto-derivation from the name, matching what the FFI
+// callers got before the twin existed (unlike the name() builder method).
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+impl TryFrom<crate::js::FileMetaChanges> for FileMetaChanges {
+	type Error = EntryNameError;
+
+	fn try_from(changes: crate::js::FileMetaChanges) -> Result<Self, Self::Error> {
+		Ok(Self {
+			name: changes
+				.name
+				.as_deref()
+				.map(ValidatedName::try_from)
+				.transpose()?,
+			mime: changes.mime,
+			last_modified: changes.last_modified,
+			#[cfg(not(feature = "uniffi"))]
+			created: changes.created,
+			#[cfg(feature = "uniffi")]
+			created: match changes.created {
+				crate::js::CreatedTime::Keep => None,
+				crate::js::CreatedTime::Unset => Some(None),
+				crate::js::CreatedTime::Set(t) => Some(Some(t)),
+			},
+		})
+	}
 }
 
 impl FileMetaChanges {
@@ -573,17 +579,7 @@ impl FileMetaChanges {
 	}
 
 	pub fn created(mut self, created: Option<DateTime<Utc>>) -> Self {
-		#[cfg(feature = "uniffi")]
-		{
-			self.created = match created {
-				Some(t) => CreatedTime::Set(t.round_subsecs(3)),
-				None => CreatedTime::Unset,
-			};
-		}
-		#[cfg(not(feature = "uniffi"))]
-		{
-			self.created = Some(created.map(|t| t.round_subsecs(3)));
-		}
+		self.created = Some(created.map(|t| t.round_subsecs(3)));
 		self
 	}
 }

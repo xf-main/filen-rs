@@ -800,6 +800,30 @@ test("meta updates", async () => {
 	const renamedDirMeta = getDirMeta(updatedDir.meta)
 	expect(renamedDirMeta?.name).toBe("meta-dir-renamed")
 
+	// invalid names must reject with a normal error instead of aborting at the
+	// FFI boundary
+	let fileNameError: unknown
+	try {
+		await state.updateFileMetadata(updatedFile, {
+			name: "bad/name.txt"
+		})
+	} catch (e) {
+		fileNameError = e
+	}
+	expect(fileNameError).toBeInstanceOf(FilenSdkError)
+	expect((fileNameError as FilenSdkError).kind).toBe("InvalidName")
+
+	let dirNameError: unknown
+	try {
+		await state.updateDirMetadata(updatedDir, {
+			name: "bad/dir"
+		})
+	} catch (e) {
+		dirNameError = e
+	}
+	expect(dirNameError).toBeInstanceOf(FilenSdkError)
+	expect((dirNameError as FilenSdkError).kind).toBe("InvalidName")
+
 	const favFileResult = await state.setFavorite(updatedFile, true)
 	if (favFileResult.type !== "file") {
 		throw new Error("Expected setFavorite to return a File")

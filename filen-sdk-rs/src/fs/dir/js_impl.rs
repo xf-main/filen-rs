@@ -4,17 +4,15 @@ use crate::{
 	Error,
 	auth::{Client, JsClient, js_impls::UnauthJsClient},
 	error::ResultExt,
-	fs::{
-		categories::{
-			DirType, Normal,
-			fs::{CategoryFS, CategoryFSExt},
-		},
-		dir::meta::DirectoryMetaChanges,
+	fs::categories::{
+		DirType, Normal,
+		fs::{CategoryFS, CategoryFSExt},
 	},
 	js::{
 		AnyDirWithContext, AnyLinkedDirWithContext, AnyNormalDir, Dir, DirByCategoryWithContext,
-		DirColor, DirSizeResponse, DirWithPath, DirsAndFiles, DirsAndFilesWithPaths, File,
-		FileWithPath, NonRootDirTagged, NonRootItemTagged, NormalDirsAndFiles, Root,
+		DirColor, DirSizeResponse, DirWithPath, DirectoryMetaChanges, DirsAndFiles,
+		DirsAndFilesWithPaths, File, FileWithPath, NonRootDirTagged, NonRootItemTagged,
+		NormalDirsAndFiles, Root,
 	},
 	runtime::do_on_commander,
 };
@@ -596,7 +594,8 @@ impl JsClient {
 		let this = self.inner();
 		do_on_commander(move || async move {
 			let mut dir = dir.into();
-			this.update_dir_metadata(&mut dir, changes).await?;
+			this.update_dir_metadata(&mut dir, changes.try_into()?)
+				.await?;
 			Ok(dir.into())
 		})
 		.await
