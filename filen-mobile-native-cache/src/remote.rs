@@ -263,6 +263,22 @@ impl FilenMobileCacheState {
 		.await
 	}
 
+	/// The BLAKE3 hash of the file at `os_path`, streamed off the blocking pool. The server
+	/// stamps every uploaded file with the BLAKE3 of its plaintext bytes
+	/// ([`FfiFileMeta::hash`](crate::ffi::FfiFileMeta)), so this is how a provider compares a
+	/// local copy against a server head — the reimport adopt path — without moving any bytes.
+	pub async fn blake3_hash_file(&self, os_path: String) -> Result<Vec<u8>, CacheError> {
+		crate::env::get_runtime()
+			.spawn_blocking(move || -> Result<Vec<u8>, CacheError> {
+				let file = std::fs::File::open(&os_path)?;
+				let mut hasher = blake3::Hasher::new();
+				std::io::copy(&mut std::io::BufReader::new(file), &mut hasher)?;
+				Ok(hasher.finalize().as_bytes().to_vec())
+			})
+			.await
+			.map_err(|e| CacheError::io(format!("hashing task failed: {e}")))?
+	}
+
 	/// Retries every local edit that has not reached the server yet.
 	///
 	/// A failed upload leaves the edit marked in the cache, so it survives the extension being
