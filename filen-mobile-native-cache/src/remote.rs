@@ -815,7 +815,7 @@ impl AuthCacheState {
 		// its not-found stand as the deletion.
 		let obj = match self.select_object_by_id(&id)? {
 			Some(obj) => obj,
-			None => return self.resolve_unknown_dir_uuid(&id).await,
+			None => return self.resolve_unknown_id(&id).await,
 		};
 		match obj {
 			DBObject::File(file) => self.refresh_file(file).await,
@@ -826,27 +826,60 @@ impl AuthCacheState {
 		}
 	}
 
-	/// The directory a bare-uuid id names, learned from the server (see
+	/// The item an unknown identity-form id names, learned from the server (see
 	/// [`AuthCacheState::update_and_query_item`], the only caller).
 	///
-	/// Nothing else is probed: `stable/<id>` and the path forms describe locations only this cache
-	/// can translate, so an unknown one stays unknown. The directory lands through the same upsert
-	/// a refresh uses, which leaves it exactly as a listing would have — including a parent we may
-	/// still know nothing about, and which the next query resolves the same way, one level per ask.
-	async fn resolve_unknown_dir_uuid(&self, id: &FfiId) -> Result<Option<FfiObject>, CacheError> {
-		let Ok(uuid) = id.0.parse::<Uuid>() else {
+	/// Both identity namespaces are probed — a bare uuid AND `stable/<id>`. The iOS provider
+	/// issues every identifier in the `stable/` form, and for a directory that stable id IS its
+	/// uuid (only files carry a distinct one), so refusing to probe the prefixed form made the
+	/// probe unreachable for every id that provider actually sends: an unknown parent answered
+	/// `None`, which the provider must treat as an authoritative deletion. The dir probe comes
+	/// first (the common case is a tracked file's never-listed parent); a stable id the server
+	/// does not know as a dir is then asked as a file lineage. Only the path forms stay unprobed —
+	/// they describe locations only this cache can translate. The item lands through the same
+	/// upsert a refresh uses, which leaves it exactly as a listing would have — including a parent
+	/// we may still know nothing about, and which the next query resolves the same way, one level
+	/// per ask.
+	async fn resolve_unknown_id(&self, id: &FfiId) -> Result<Option<FfiObject>, CacheError> {
+		let (addressed_stable, bare) = match id.0.strip_prefix(STABLE_PREFIX) {
+			Some(rest) => (true, rest),
+			None => (false, id.0.as_str()),
+		};
+		let Ok(uuid) = bare.parse::<Uuid>() else {
 			return Ok(None);
 		};
-		let remote_dir = match self.client.get_dir(uuid).await {
-			Ok(remote_dir) => remote_dir,
-			// The one answer that means gone. Every other failure is reported as itself: a
-			// connectivity problem must never read as a deletion.
-			Err(e) if e.kind() == ErrorKind::FolderNotFound => return Ok(None),
+		match self.client.get_dir(uuid).await {
+			Ok(remote_dir) => {
+				debug!("Learned unlisted dir {uuid} from the server");
+				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
+				return Ok(Some(DBObject::Dir(dir).into()));
+			}
+			// Not a directory the server knows — for the stable namespace that does not yet mean
+			// gone: the id may name a file lineage, probed below.
+			Err(e) if e.kind() == ErrorKind::FolderNotFound => {}
+			// Every other failure is reported as itself: a connectivity problem must never read
+			// as a deletion.
+			Err(e) => return Err(e.into()),
+		}
+		if !addressed_stable {
+			return Ok(None);
+		}
+		// Deserialization, not construction: the `stable/<id>` string is a value the foreign
+		// caller previously received from this cache, arriving back through the FFI inside an
+		// `FfiId` — the same boundary `StableUuid`'s uniffi lift sanctions, which cannot run here
+		// because the id is embedded in a larger string.
+		let stable_uuid: StableUuid =
+			serde_json::from_value(serde_json::Value::String(bare.to_string()))
+				.map_err(|e| CacheError::conversion(format!("invalid stable id in {id}: {e}")))?;
+		let head = match self.client.get_file_by_stable_uuid(stable_uuid).await {
+			Ok(head) => head,
+			// The one answer that means gone: the server knows the id as neither dir nor file.
+			Err(e) if e.kind() == ErrorKind::FileNotFound => return Ok(None),
 			Err(e) => return Err(e.into()),
 		};
-		debug!("Learned unlisted dir {uuid} from the server");
-		let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
-		Ok(Some(DBObject::Dir(dir).into()))
+		debug!("Learned unlisted file lineage {stable_uuid} from the server");
+		let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
+		Ok(Some(DBObject::File(file).into()))
 	}
 
 	/// The file behind a row, refreshed to its live head.
