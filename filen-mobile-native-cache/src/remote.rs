@@ -419,11 +419,17 @@ impl AuthCacheState {
 		let path_id = path.as_path()?;
 		let mut dir: DBDirObject = match self.update_items_in_path(&path_id).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
+			// Same reasoning as `resolve_file_to_download`'s Partial arm: the walk
+			// REACHED the server and the path stopped resolving, so the directory is
+			// gone rather than unreachable (a transport failure propagates as its own
+			// error above). A remote error here read as `.serverUnreachable` on iOS,
+			// and since the enumerator's existence probe is a local cache read, every
+			// enumeration of a remotely-deleted directory took this path and retried
+			// instead of learning `.noSuchItem`.
 			UpdateItemsInPath::Partial(_, _) => {
-				return Err(CacheError::remote(format!(
-					"Path {} does not point to a directory",
-					path_id.full_path
-				)));
+				return Err(CacheError::DoesNotExist(
+					format!("Path {} no longer resolves to an item", path_id.full_path).into(),
+				));
 			}
 		};
 		self.inner_update_dir(&mut dir).await?;
@@ -640,12 +646,21 @@ impl AuthCacheState {
 
 		match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => Ok((old_file, file)),
-			UpdateItemsInPath::Partial(_, _) | UpdateItemsInPath::Complete(_) => {
-				Err(CacheError::remote(format!(
-					"Path {} does not point to a file",
+			// The walk reached the server and the path stops resolving before the file: the item
+			// is GONE, not unreachable (a transport failure propagates as its own error above).
+			// Reporting this as a remote error read as `.serverUnreachable` on iOS, and the
+			// system retried the doomed download forever instead of learning `.noSuchItem`.
+			UpdateItemsInPath::Partial(_, _) => Err(CacheError::DoesNotExist(
+				format!(
+					"Path {} no longer resolves to an item",
 					path_values.full_path
-				)))
-			}
+				)
+				.into(),
+			)),
+			UpdateItemsInPath::Complete(_) => Err(CacheError::remote(format!(
+				"Path {} does not point to a file",
+				path_values.full_path
+			))),
 		}
 	}
 
@@ -1329,11 +1344,16 @@ impl AuthCacheState {
 		let path_values: PathFfiId<'_> = path.as_path()?;
 		let obj = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject,
+			// Server-confirmed gone (transport failures propagate above): trashing an item that
+			// no longer exists must answer `.noSuchItem`, not a retried "unreachable".
 			UpdateItemsInPath::Partial(_, _) => {
-				return Err(CacheError::remote(format!(
-					"Path {} does not point to an item",
-					path_values.full_path
-				)));
+				return Err(CacheError::DoesNotExist(
+					format!(
+						"Path {} no longer resolves to an item",
+						path_values.full_path
+					)
+					.into(),
+				));
 			}
 		};
 
@@ -1390,7 +1410,14 @@ impl AuthCacheState {
 		let uuid = self.resolve_uuid_or_stable(uuid)?;
 		let object = {
 			let conn = self.conn();
-			DBNonRootObject::select(&conn, uuid)?
+			// `.optional()`: a bare no-rows read used to surface as a raw SQL error, which iOS
+			// maps to a transient retry — restoring an item the cache no longer knows then
+			// retried forever instead of answering `.noSuchItem`.
+			DBNonRootObject::select(&conn, uuid)
+				.optional()?
+				.ok_or_else(|| {
+					CacheError::DoesNotExist(format!("No item to restore for uuid: {uuid}").into())
+				})?
 		};
 
 		// we do this first to make sure we have a valid restore target
@@ -1490,11 +1517,16 @@ impl AuthCacheState {
 							))
 						})?
 					}
+					// Server-confirmed gone: moving an item that no longer exists answers
+					// `.noSuchItem`, not a retried "unreachable".
 					UpdateItemsInPath::Partial(remaining_path, _) => {
-						return Err(CacheError::remote(format!(
-							"Path {} does not point to an item, remaining: {}",
-							item_pvs.full_path, remaining_path
-						)));
+						return Err(CacheError::DoesNotExist(
+							format!(
+								"Path {} no longer resolves to an item, remaining: {}",
+								item_pvs.full_path, remaining_path
+							)
+							.into(),
+						));
 					}
 				};
 				Ok(obj)
@@ -1556,10 +1588,11 @@ impl AuthCacheState {
 				))
 			})?,
 			None => {
-				return Err(CacheError::remote(format!(
-					"Path {} does not point to an item",
-					item_pvs.full_path
-				)));
+				// The parent was relisted just above, so a missing row is server-confirmed
+				// gone from this path — `.noSuchItem`, not a retried "unreachable".
+				return Err(CacheError::DoesNotExist(
+					format!("Path {} no longer resolves to an item", item_pvs.full_path).into(),
+				));
 			}
 		};
 		let new_path = item.parent().join(&new_name);
@@ -1722,11 +1755,13 @@ impl AuthCacheState {
 			ParsedFfiId::Path(path_values) => {
 				Some(match self.update_items_in_path(&path_values).await? {
 					UpdateItemsInPath::Complete(obj) => obj,
+					// Server-confirmed gone: a delete of an already-gone item answers
+					// `.noSuchItem` (which the system treats as "already deleted"), matching
+					// the Trash/Recents arm's tolerance above instead of retrying forever.
 					UpdateItemsInPath::Partial(_, _) => {
-						return Err(CacheError::remote(format!(
-							"Path {} does not point to an item",
-							item.0
-						)));
+						return Err(CacheError::DoesNotExist(
+							format!("Path {} no longer resolves to an item", item.0).into(),
+						));
 					}
 				})
 			}
@@ -1782,11 +1817,11 @@ impl AuthCacheState {
 			ParsedFfiId::Path(path_values) => {
 				Some(match self.update_items_in_path(&path_values).await? {
 					UpdateItemsInPath::Complete(obj) => obj,
+					// Server-confirmed gone — `.noSuchItem`, not a retried "unreachable".
 					UpdateItemsInPath::Partial(_, _) => {
-						return Err(CacheError::remote(format!(
-							"Path {} does not point to an item",
-							item.0
-						)));
+						return Err(CacheError::DoesNotExist(
+							format!("Path {} no longer resolves to an item", item.0).into(),
+						));
 					}
 				})
 			}

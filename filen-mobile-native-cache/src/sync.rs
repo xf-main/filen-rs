@@ -26,7 +26,7 @@ use crate::{
 };
 
 #[allow(unused)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum LocalRemoteComparison<'a> {
 	SameDir(DBDir, RemoteDirectory),
 	DifferentDir(DBDir, RemoteDirectory),
@@ -34,6 +34,11 @@ enum LocalRemoteComparison<'a> {
 	DifferentFile(DBFile, RemoteFile),
 	Force(DBObject, NonRootFileType<'a, Normal>),
 	NotFound(DBObject),
+	/// The server could not be ASKED — a network/server failure, as opposed to the typed
+	/// not-found `NotFound` carries. Kept distinct because a connectivity problem must never
+	/// read as a deletion: collapsing it into `NotFound` made the walk re-resolve the path and
+	/// its callers report "the item is gone" for a plain offline window.
+	Failed(CacheError),
 	Root(DBRoot),
 }
 
@@ -73,7 +78,16 @@ async fn check_local_item_matches_remote(
 					LocalRemoteComparison::DifferentDir(dir, remote_dir)
 				}
 			}
-			Err(_) => LocalRemoteComparison::NotFound(DBObject::Dir(dir)),
+			// Only a typed not-found means gone; anything else is a failure to ask.
+			Err(e)
+				if matches!(
+					e.kind(),
+					ErrorKind::FolderNotFound | ErrorKind::FileNotFound
+				) =>
+			{
+				LocalRemoteComparison::NotFound(DBObject::Dir(dir))
+			}
+			Err(e) => LocalRemoteComparison::Failed(e.into()),
 		},
 		DBObject::File(file) => match client.get_file_with_info(file.uuid).await {
 			// A versioned uuid still resolves byte-identical (parent unchanged, not trashed)
@@ -99,7 +113,16 @@ async fn check_local_item_matches_remote(
 					LocalRemoteComparison::DifferentFile(file, info.file)
 				}
 			}
-			Err(_) => LocalRemoteComparison::NotFound(DBObject::File(file)),
+			// Only a typed not-found means gone; anything else is a failure to ask.
+			Err(e)
+				if matches!(
+					e.kind(),
+					ErrorKind::FileNotFound | ErrorKind::FolderNotFound
+				) =>
+			{
+				LocalRemoteComparison::NotFound(DBObject::File(file))
+			}
+			Err(e) => LocalRemoteComparison::Failed(e.into()),
 		},
 		DBObject::Root(root) => LocalRemoteComparison::Root(root),
 	}
@@ -248,7 +271,10 @@ impl AuthCacheState {
 		let mut break_early = false;
 
 		while let Some((item, remaining_path)) = futures.next().await {
-			if !matches!(item, LocalRemoteComparison::NotFound(_)) {
+			if !matches!(
+				item,
+				LocalRemoteComparison::NotFound(_) | LocalRemoteComparison::Failed(_)
+			) {
 				final_remaining_path = remaining_path;
 			}
 
@@ -282,6 +308,12 @@ impl AuthCacheState {
 				LocalRemoteComparison::NotFound(_) => {
 					break_early = true;
 					break;
+				}
+				// A transport failure propagates as itself: continuing would re-resolve the
+				// remaining path against a server we just failed to reach, and the callers
+				// would then misreport connectivity as a missing item.
+				LocalRemoteComparison::Failed(e) => {
+					return Err(e);
 				}
 			}
 		}
