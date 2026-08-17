@@ -78,10 +78,16 @@ impl Client {
 			&api::v3::file::trash::Request { uuid: file.uuid() },
 		)
 		.await?;
-		// Remember the original parent so the trashed file knows where it came from.
-		file.parent = ParentUuid::Trash(
-			Uuid::try_from(file.parent).context("setting parent when trashing file")?,
-		);
+		// Remember the original parent so the trashed file knows where it came from. An
+		// already-Trash parent stays as it is: the server call above is an idempotent no-op for
+		// an already-trashed file (a replay, or a cross-device race), and re-deriving the
+		// original parent from a Trash value is impossible — erroring here turned the replay
+		// into a spurious failure.
+		if !file.parent.is_trash() {
+			file.parent = ParentUuid::Trash(
+				Uuid::try_from(file.parent).context("setting parent when trashing file")?,
+			);
+		}
 		Ok(())
 	}
 

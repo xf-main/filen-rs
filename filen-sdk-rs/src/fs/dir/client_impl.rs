@@ -248,10 +248,16 @@ impl Client {
 			&api::v3::dir::trash::Request { uuid: dir.uuid() },
 		)
 		.await?;
-		// Remember the original parent so the trashed dir knows where it came from.
-		dir.parent = ParentUuid::Trash(
-			Uuid::try_from(dir.parent).context("setting parent when trashing dir")?,
-		);
+		// Remember the original parent so the trashed dir knows where it came from. An
+		// already-Trash parent stays as it is: the server call above is an idempotent no-op for
+		// an already-trashed dir (a replay, or a cross-device race), and re-deriving the
+		// original parent from a Trash value is impossible — erroring here turned the replay
+		// into a spurious failure.
+		if !dir.parent.is_trash() {
+			dir.parent = ParentUuid::Trash(
+				Uuid::try_from(dir.parent).context("setting parent when trashing dir")?,
+			);
+		}
 		Ok(())
 	}
 
