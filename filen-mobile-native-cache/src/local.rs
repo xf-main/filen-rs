@@ -9,7 +9,8 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
-		FfiChanges, FfiId, FfiObject, FfiRoot, QueryChildrenResponse, QueryNonDirChildrenResponse,
+		FfiChanges, FfiId, FfiObject, FfiRoot, FfiWorkingSet, QueryChildrenResponse,
+		QueryNonDirChildrenResponse,
 	},
 	sql::{
 		self, DBDirExt, DBDirObject, DBItemTrait, DBRoot,
@@ -140,6 +141,24 @@ impl FilenMobileCacheState {
 	/// incrementally — everything else is reconciled when it is presented.
 	pub fn query_working_set(&self) -> Result<Vec<FfiObject>, CacheError> {
 		self.sync_execute_authed(|auth_state| working_set(&auth_state.conn()))
+	}
+
+	/// The working set together with the anchor to report for the enumeration serving it.
+	///
+	/// The anchor is read FIRST, before the rows — the same load-bearing order [`changes_since`]
+	/// documents. The system's change-tracking contract pairs a full enumeration with an anchor
+	/// read AFTER it, so pairing [`Self::query_working_set`] with a separate, later
+	/// [`Self::current_sync_anchor`] puts the anchor ABOVE whatever landed between the two calls
+	/// — and a strictly-above diff then never delivers it: a permanently skipped change for any
+	/// container that is never browsed again. Anchor-first degrades that worst case to duplicate
+	/// delivery, which an idempotent replica absorbs.
+	pub fn query_working_set_with_anchor(&self) -> Result<FfiWorkingSet, CacheError> {
+		self.sync_execute_authed(|auth_state| {
+			let conn = auth_state.conn();
+			let anchor = current_sync_anchor(&conn)?;
+			let items = working_set(&conn)?;
+			Ok(FfiWorkingSet { anchor, items })
+		})
 	}
 }
 

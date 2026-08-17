@@ -359,6 +359,19 @@ pub struct QueryNonDirChildrenResponse {
 	pub millis_since_updated: Option<u64>,
 }
 
+/// A full working-set enumeration paired with the anchor to report for it, from
+/// [`FilenMobileCacheState::query_working_set_with_anchor`](crate::auth::FilenMobileCacheState).
+#[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
+pub struct FfiWorkingSet {
+	/// The anchor the consumer reports as current once it has applied `items`. Read BEFORE the
+	/// rows, so a write landing mid-enumeration is re-delivered by the next diff instead of
+	/// being skipped by it forever.
+	pub anchor: Vec<u8>,
+	/// The working set itself (see
+	/// [`FilenMobileCacheState::query_working_set`](crate::auth::FilenMobileCacheState)).
+	pub items: Vec<FfiObject>,
+}
+
 /// What a replica missed since the anchor it handed in, from
 /// [`FilenMobileCacheState::enumerate_changes`](crate::auth::FilenMobileCacheState).
 #[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
