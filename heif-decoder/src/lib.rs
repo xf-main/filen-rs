@@ -67,10 +67,14 @@ impl HeicContext<'_> {
 			inner: context,
 			_lifetime: PhantomData,
 		};
+		// The vtable pointer must be the one stored INSIDE the reader:
+		// libheif keeps it and calls through it lazily on every later decode,
+		// so a temporary table here would dangle the moment this call returns.
+		let vtable = &raw const reader.vtable;
 		let result = unsafe {
 			heif_context_read_from_reader(
 				context,
-				&reader.as_heif_reader(),
+				vtable,
 				reader as *mut _ as *mut c_void,
 				std::ptr::null(),
 			)
@@ -333,30 +337,164 @@ pub fn try_get_rgba_thumbnail_from_reader<T: Read + Seek>(
 	out_image.make_rgba().map(Some)
 }
 
+/// The tile grid of a `grid`-encoded HEIF (every Apple HEIC): decode one
+/// 512²-ish tile at a time instead of the whole frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeifTiling {
+	pub num_columns: u32,
+	pub num_rows: u32,
+	pub tile_width: u32,
+	pub tile_height: u32,
+	pub image_width: u32,
+	pub image_height: u32,
+}
+
+/// A parsed HEIF whose reader stays open across calls, so the container can
+/// be inspected (dims, tiling, embedded thumbnail) and then decoded tile by
+/// tile without re-parsing. The one-shot `try_get_*` entry points above stay
+/// for callers that want a single decode.
+pub struct HeifSession<T: Read + Seek> {
+	// Declared before `reader` on purpose: fields drop in declaration order,
+	// and libheif must never outlive the reader its callbacks point into.
+	context: HeicContext<'static>,
+	// Boxed so the address libheif captured in `new` stays stable; libheif
+	// calls back into it lazily on every decode.
+	#[allow(dead_code)] // held for its stable address + Drop order
+	reader: Box<HeifReader<T>>,
+}
+
+impl<T: Read + Seek> HeifSession<T> {
+	pub fn new(reader: T, file_size: u64) -> Result<Self, HeifError> {
+		let mut reader = Box::new(HeifReader::new(reader, file_size));
+		// Mirrors `HeicContext::from_reader`, but the reader is heap-pinned so
+		// the context may keep calling it (and the vtable stored inside it)
+		// after this function returns. The 'static on the context is the same
+		// lifetime laundering `from_file` already does; the struct's field
+		// order keeps it honest.
+		let context: HeicContext<'static> = HeicContext::from_reader(&mut reader)?;
+		Ok(HeifSession { context, reader })
+	}
+
+	fn primary(&self) -> Result<ImageHandle<'_>, HeifError> {
+		ImageHandle::new(&self.context)
+	}
+
+	pub fn primary_dims(&self) -> Result<(u32, u32), HeifError> {
+		let primary = self.primary()?;
+		let (width, height) = (primary.width(), primary.height());
+		if width <= 0 || height <= 0 {
+			return Err(HeifError::invalid_decoded_image());
+		}
+		Ok((width as u32, height as u32))
+	}
+
+	/// The embedded thumbnail, decoded — `None` when there is none or it is
+	/// implausibly large for a thumbnail.
+	pub fn embedded_thumbnail_rgba(&self, max_pixels: u64) -> Result<Option<RgbaImage>, HeifError> {
+		let primary = self.primary()?;
+		let Some(thumb) = primary.first_thumbnail() else {
+			return Ok(None);
+		};
+		if thumb.pixel_count().is_none_or(|px| px > max_pixels) {
+			return Ok(None);
+		}
+		OutImage::new(&thumb)?.make_rgba().map(Some)
+	}
+
+	/// The primary image's tile grid, or `None` when it is a single tile
+	/// (then only [`decode_primary_rgba`](Self::decode_primary_rgba) helps).
+	/// Sizes are in the transformed (display) coordinate space, matching what
+	/// [`decode_tile_rgba`](Self::decode_tile_rgba) produces.
+	pub fn tiling(&self) -> Result<Option<HeifTiling>, HeifError> {
+		let primary = self.primary()?;
+		let mut raw: heif_image_tiling = unsafe { std::mem::zeroed() };
+		let result = unsafe { heif_image_handle_get_image_tiling(primary.inner, 1, &mut raw) };
+		if result.code != heif_error_code_heif_error_Ok {
+			return Ok(None);
+		}
+		if raw.num_columns <= 1 && raw.num_rows <= 1 {
+			return Ok(None);
+		}
+		if raw.tile_width == 0
+			|| raw.tile_height == 0
+			|| raw.image_width == 0
+			|| raw.image_height == 0
+		{
+			return Ok(None);
+		}
+		Ok(Some(HeifTiling {
+			num_columns: raw.num_columns,
+			num_rows: raw.num_rows,
+			tile_width: raw.tile_width,
+			tile_height: raw.tile_height,
+			image_width: raw.image_width,
+			image_height: raw.image_height,
+		}))
+	}
+
+	/// Decodes exactly one grid tile to RGBA (~tile-sized allocation, not
+	/// image-sized). Tile coordinates are grid indices, transformed space.
+	pub fn decode_tile_rgba(&self, tile_x: u32, tile_y: u32) -> Result<RgbaImage, HeifError> {
+		let primary = self.primary()?;
+		let mut heif_image_ptr = std::ptr::null_mut();
+		let result = unsafe {
+			heif_image_handle_decode_image_tile(
+				primary.inner,
+				&mut heif_image_ptr,
+				heif_colorspace_heif_colorspace_RGB,
+				heif_chroma_heif_chroma_interleaved_RGBA,
+				std::ptr::null(),
+				tile_x,
+				tile_y,
+			)
+		};
+		if result.code != heif_error_code_heif_error_Ok {
+			return Err(HeifError::from_raw(result));
+		}
+		let out = OutImage {
+			inner: heif_image_ptr,
+			_lifetime: PhantomData,
+		};
+		out.make_rgba()
+	}
+
+	/// Whole-frame decode of the primary image — only for sources the caller
+	/// already verified are small.
+	pub fn decode_primary_rgba(&self) -> Result<RgbaImage, HeifError> {
+		let primary = self.primary()?;
+		OutImage::new(&primary)?.make_rgba()
+	}
+}
+
 struct HeifReader<T>
 where
 	T: Read + Seek,
 {
 	inner: T,
 	file_size: u64,
+	/// libheif does NOT copy the function table — `StreamReader_CApi` keeps
+	/// the raw `const heif_reader*` and dereferences it on every later lazy
+	/// read (bitstream.h). The table must therefore live exactly as long as
+	/// the reader itself, not as a temporary at the registration call site.
+	vtable: heif_reader,
 }
 
 impl<T: Read + Seek> HeifReader<T> {
 	fn new(inner: T, file_size: u64) -> Self {
-		HeifReader { inner, file_size }
-	}
-
-	fn as_heif_reader(&mut self) -> heif_reader {
-		heif_reader {
-			reader_api_version: 1,
-			get_position: Some(get_position_impl::<T>),
-			read: Some(read_impl::<T>),
-			seek: Some(seek_impl::<T>),
-			wait_for_file_size: Some(wait_for_file_size_impl::<T>),
-			request_range: None,
-			preload_range_hint: None,
-			release_file_range: None,
-			release_error_msg: None,
+		HeifReader {
+			inner,
+			file_size,
+			vtable: heif_reader {
+				reader_api_version: 1,
+				get_position: Some(get_position_impl::<T>),
+				read: Some(read_impl::<T>),
+				seek: Some(seek_impl::<T>),
+				wait_for_file_size: Some(wait_for_file_size_impl::<T>),
+				request_range: None,
+				preload_range_hint: None,
+				release_file_range: None,
+				release_error_msg: None,
+			},
 		}
 	}
 
