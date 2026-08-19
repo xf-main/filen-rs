@@ -671,6 +671,7 @@ impl CacheState {
 					// A previous resync attempt did not converge (drive-lock contention or a
 					// transient failure) and scheduled this one-shot re-attempt. The flag-gated
 					// retry makes a stale fire harmless.
+					tracing::debug!("resync: retry timer fired");
 					self.resync_retry = None;
 					self.maybe_run_resync().await;
 				},
@@ -1531,6 +1532,7 @@ impl CacheState {
 		if converged {
 			self.resync_retry = None;
 		} else {
+			tracing::debug!("resync: not converged; retrying in {RESYNC_RETRY_INTERVAL:?}");
 			self.arm_resync_retry();
 		}
 	}
@@ -1618,6 +1620,7 @@ impl CacheState {
 		ack: AddSyncRootAck,
 	) -> bool {
 		if let Some(registrations) = self.sync_roots.get_mut(&uuid) {
+			tracing::debug!("AddSyncRoot {uuid}: already active; joining its registrations");
 			registrations.push((registration_id, callback));
 			let _ = ack.send(Ok(()));
 			return false;
@@ -1672,6 +1675,10 @@ impl CacheState {
 			let _ = ack.send(Err(Box::new(error)));
 			return false;
 		}
+		// The get_dir validation above is the only network await between control-message receipt
+		// and the ack; logging its successful side too keeps the registration path gap-free for
+		// stall post-mortems.
+		tracing::debug!("AddSyncRoot {uuid}: validated; registering as a new sync root");
 		self.sync_roots
 			.insert(uuid, vec![(registration_id, callback)]);
 		let _ = ack.send(Ok(()));
@@ -2177,6 +2184,15 @@ impl CacheState {
 		let sync_roots: Vec<Uuid> = self.sync_roots.keys().copied().collect();
 		let file_roots: Vec<StableUuid> = self.file_roots.keys().copied().collect();
 
+		// Entry marker for post-mortems: a resync that silently never STARTS is otherwise
+		// indistinguishable from one that parked mid-way (nightly test_search stalls, 2026-08-08 /
+		// 2026-08-18, produced 240s of captured silence with no way to tell which).
+		tracing::debug!(
+			"resync: starting ({} dir root(s), {} file root(s))",
+			sync_roots.len(),
+			file_roots.len()
+		);
+
 		// Progress brackets: `Started` fires BEFORE the drive-lock wait (another device can hold
 		// the lock for a while), and every exit path past this point fires `Finished`, so a
 		// consumer's spinner can never hang on a failed attempt.
@@ -2249,6 +2265,10 @@ impl CacheState {
 		// bounding is what lost the race). Draining happens only BEFORE we hold the lock; the
 		// snapshot id we read once we hold it is >= any drained watermark (remote ids are
 		// monotonic), so committing it never regresses the watermark.
+		tracing::debug!(
+			"resync: listing {} dir root(s) under the drive lock",
+			sync_roots.len()
+		);
 		let lock = {
 			let mut acquire = std::pin::pin!(
 				deps.client
