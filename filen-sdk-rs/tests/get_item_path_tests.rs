@@ -231,6 +231,16 @@ async fn get_item_path_recent_file() {
 
 #[shared_test_runtime]
 async fn get_item_path_trashed_file_from_list_trash() {
+	// Hold the trash lock across trash -> list_trash: another leg's account-global empty-trash
+	// (serialized on this lock) would permanently delete the file before the listing finds it.
+	// Acquired BEFORE the drive lock below — every other holder orders trash -> drive, and
+	// inverting it here would deadlock across legs.
+	let _trash_lock = test_utils::RESOURCES
+		.client()
+		.await
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
@@ -311,6 +321,13 @@ async fn get_item_path_trashed_dir_resolves_pre_trash_path() {
 
 #[shared_test_runtime]
 async fn get_item_path_trashed_dir_from_list_trash() {
+	// Trash lock before the drive lock — see the file test above for the ordering rationale.
+	let _trash_lock = test_utils::RESOURCES
+		.client()
+		.await
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;

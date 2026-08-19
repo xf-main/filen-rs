@@ -560,6 +560,14 @@ async fn cmd_list_trash_empty_trash() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 
+	// empty-trash is account-global and permanently deletes whatever other test binaries on this
+	// shared account have sitting in trash mid-restore (nightly 2026-08-14), so serialize on the
+	// trash lock the sdk's own trash tests use.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
+
 	// create test file to trash
 	let test_dir = &resources.dir;
 	let file = client

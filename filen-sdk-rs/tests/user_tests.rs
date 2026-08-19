@@ -337,6 +337,14 @@ async fn events_file_upload_trash_restore_delete() {
 	.await;
 	assert_file_meta_name(&upload_event.metadata, &file_name);
 
+	// Hold the trash lock across trash -> restore: another leg's account-global empty-trash
+	// (commands_tests / file_tests, both serialized on this lock) would permanently delete the
+	// file mid-window.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
+
 	// trash → fileTrash
 	client.trash_file(&mut file).await.unwrap();
 	let trash_event = poll_for_event(
@@ -593,6 +601,12 @@ async fn events_folder_trash_restore_move_delete() {
 
 	let folder_name = unique_dir_name("trash-cycle");
 	let mut folder = client.create_dir(&dir.into(), &folder_name).await.unwrap();
+
+	// Trash lock: see the file trash-cycle test above.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 
 	// trash → folderTrash
 	client.trash_dir(&mut folder).await.unwrap();

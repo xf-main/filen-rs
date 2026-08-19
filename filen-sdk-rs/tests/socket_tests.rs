@@ -173,6 +173,12 @@ async fn test_websocket_file_events() {
 
 	assert_eq!(event.0, file_a);
 
+	// Hold the trash lock across trash -> restore: another leg's account-global empty-trash
+	// (serialized on this lock) would permanently delete the file mid-window.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_file(&mut file_a).await.unwrap();
 	await_event(
 		&mut receiver,
@@ -617,6 +623,11 @@ async fn test_websocket_folder_events() {
 	.await;
 	assert_eq!(event.0, dir_a);
 
+	// Trash lock: see the file restore test above.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_dir(&mut dir_a).await.unwrap();
 	await_event(
 		&mut receiver,

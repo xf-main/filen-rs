@@ -790,6 +790,13 @@ async fn test_cache_file_restore_via_socket() {
 		"file should appear in cache"
 	);
 
+	// Hold the trash lock across the trash -> restore/permanent-delete window: another leg's
+	// account-global empty-trash (serialized on this lock) would permanently delete the file
+	// out from under the later call.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
 
 	assert!(
@@ -867,6 +874,13 @@ async fn test_cache_file_deleted_permanently_via_socket() {
 		"file should appear in cache"
 	);
 
+	// Hold the trash lock across the trash -> restore/permanent-delete window: another leg's
+	// account-global empty-trash (serialized on this lock) would permanently delete the file
+	// out from under the later call.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
 
 	assert!(
@@ -902,6 +916,11 @@ async fn test_cache_dir_restore_via_socket() {
 		"dir should appear in cache"
 	);
 
+	// Trash lock: see the file restore test above.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_dir(&mut dir).await.unwrap();
 
 	assert!(
@@ -1002,6 +1021,11 @@ async fn test_cache_dir_deleted_permanently_via_socket() {
 		"dir should appear in cache"
 	);
 
+	// Trash lock: see the file restore test above.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_dir(&mut dir).await.unwrap();
 
 	assert!(
@@ -1587,7 +1611,13 @@ async fn test_cache_file_root_trashed_while_offline_is_removed_on_reopen() {
 	}
 	client.flush_cache().await; // clean flush + join before reopening the same DB file
 
-	// Trashed with nobody listening.
+	// Trashed with nobody listening. The trash lock keeps another leg's account-global
+	// empty-trash from permanently deleting it before session 2 observes it and the final
+	// delete_file_permanently below runs.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
 
 	// Session 2: same DB, same lineage. Re-adding the file root respawns the worker and converges.

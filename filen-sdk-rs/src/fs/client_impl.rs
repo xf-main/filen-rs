@@ -167,6 +167,12 @@ impl Client {
 	}
 
 	pub async fn empty_trash(&self) -> Result<(), Error> {
+		// Account-global permanent delete; serialize with the other drive mutators like every
+		// sibling here (this was the only one that skipped the lock). CAVEAT for FFI callers:
+		// a "drive-write" lock taken via the raw acquire_lock API bypasses the in-process
+		// cache, so calling this while holding one parks it until that lock is released — use
+		// lock_drive/lockDrive, which shares.
+		let _lock = self.lock_drive().await?;
 		api::v3::trash::empty::post(self.client()).await?;
 		Ok(())
 	}

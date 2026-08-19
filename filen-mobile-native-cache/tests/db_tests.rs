@@ -1045,6 +1045,15 @@ pub async fn test_trash_item_file_restore() {
 	// Verify file exists before trashing
 	let db_obj = db.query_item(&file_path).unwrap().unwrap();
 
+	// The file must survive in the server trash until the restore below; another leg's
+	// empty-trash on this shared account would permanently delete it out from under us
+	// (nightly 2026-08-14), so hold the trash lock across the trash -> restore window.
+	let _trash_lock = rss
+		.client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
+
 	// Trash the file
 	db.trash_item(file_path.clone()).await.unwrap();
 
@@ -6030,7 +6039,14 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 	);
 	let archived = std::mem::replace(&mut file, edited);
 
-	// Trashed behind its back: still an item, and still this item.
+	// Trashed behind its back: still an item, and still this item. The trash lock keeps another
+	// leg's account-global empty-trash from permanently deleting it before the fetch below (and
+	// the lineage deletes further down) observe it.
+	let _trash_lock = rss
+		.client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	rss.client.trash_file(&mut file).await.unwrap();
 	let trashed = match db.update_and_query_item(stable_id.clone()).await.unwrap() {
 		Some(FfiObject::File(f)) => f,
@@ -6416,6 +6432,13 @@ pub async fn test_the_stable_namespace_reaches_restore_and_download_after_an_edi
 	);
 	let stable_id = format!("stable/{stable}");
 
+	// Hold the trash lock across trash -> restore so another leg's account-global empty-trash
+	// cannot permanently delete the file inside the window.
+	let _trash_lock = rss
+		.client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	db.trash_item(file_path).await.unwrap();
 	let restored = db.restore_item(&stable_id, None).await.unwrap();
 	match restored.object {
@@ -6997,6 +7020,13 @@ pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
 	wait_until_tracking_is_live(&db, &file_path, &listener).await;
 
 	let anchor = db.current_sync_anchor().unwrap();
+	// Hold the trash lock across the trash -> restore window: another leg's account-global
+	// empty-trash (serialized on this lock) would permanently delete the file mid-poll.
+	let _trash_lock = rss
+		.client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	rss.client.trash_file(&mut file).await.unwrap();
 
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);

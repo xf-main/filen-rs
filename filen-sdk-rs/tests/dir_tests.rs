@@ -53,6 +53,13 @@ async fn create_list_trash() {
 		panic!("Directory not found in root directory");
 	}
 
+	// Hold the trash lock across trash -> list_trash/get_dir: another leg's account-global
+	// empty-trash (serialized on this lock) would permanently delete the dir before the
+	// listing finds it.
+	let _trash_lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
 	client.trash_dir(&mut dir).await.unwrap();
 
 	let (trashed_dirs, _) = client
