@@ -23,17 +23,6 @@ use crate::{
 /// Sources larger than this are not worth downloading just to thumbnail them.
 const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Upper bound on the pixels a single decode may materialise. Chosen ABOVE the
-/// common phone sensors — 12 MP is 4032×3024 = 12,192,768 and 16 MP sensors run
-/// to ~15.9M, so a cap below that silently denies most camera photos a
-/// thumbnail (cached as "none" forever on iOS). Peak memory per decode:
-/// ~8 bytes/pixel on the HEIF path (libheif's RGBA buffer plus the returned
-/// copy, briefly) ≈ 130 MiB at this cap, ~3–4 bytes/pixel on the image-crate
-/// path — and [`DECODE_GATE`] keeps at most [`MAX_CONCURRENT_DECODES`] decodes
-/// alive, so the worst case stays bounded. HEIF sources over the cap fall back
-/// to their embedded thumbnail; other formats over it get no thumbnail.
-const MAX_THUMBNAIL_SOURCE_PIXELS: u64 = 17_000_000;
-
 /// Files.app hands over entire grid batches at once; bound how many ITEMS are
 /// in flight so a 1000-photo directory cannot queue hundreds of concurrent
 /// downloads. Wider than the decode bound: downloads are disk-streamed and
@@ -41,12 +30,13 @@ const MAX_THUMBNAIL_SOURCE_PIXELS: u64 = 17_000_000;
 /// not starve cache hits behind it.
 const THUMBNAIL_CONCURRENCY: usize = 4;
 
-/// How many DECODES may run at once, process-wide — the decode buffers are the
-/// memory hazard, and this gate (not the per-batch item bound) is what enforces
-/// the budget in [`MAX_THUMBNAIL_SOURCE_PIXELS`]'s arithmetic. Global on
+/// How many DECODES may run at once, process-wide. ONE: the decode pipeline
+/// bounds itself to [`filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET`]
+/// (~12 MB) per decode, and the iOS file-provider extension has ~20 MB total
+/// before jetsam — two concurrent decodes could not both fit. Global on
 /// purpose: it also covers the single-item `get_thumbnail` path (Android's
 /// only route) and concurrent batches.
-const MAX_CONCURRENT_DECODES: usize = 2;
+const MAX_CONCURRENT_DECODES: usize = 1;
 
 /// See [`MAX_CONCURRENT_DECODES`].
 static DECODE_GATE: tokio::sync::Semaphore =
@@ -184,7 +174,7 @@ impl AuthCacheState {
 					image_reader,
 					target_width,
 					target_height,
-					MAX_THUMBNAIL_SOURCE_PIXELS,
+					filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET,
 					&mut tmp_file,
 				)
 			},

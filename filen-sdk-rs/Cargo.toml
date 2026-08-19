@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 [features]
 default = ["multi-threaded-crypto"]
 malformed = []
-heif-decoder = ["dep:heif-decoder"]
+heif-decoder = ["dep:heif-decoder", "microthumb/heif"]
 avif-decoder = ["image/avif-native"]
 uniffi = ["dep:uniffi", "filen-types/uniffi"]
 wasm-full = ["multi-threaded-crypto"]
@@ -169,6 +169,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 tracing-log = "0.2"
 heif-decoder = { path = "../heif-decoder", optional = true }
+microthumb = { path = "../microthumb" }
 tokio-tungstenite = { version = "0.28.0", features = [
 	"rustls",
 	"rustls-tls-webpki-roots",

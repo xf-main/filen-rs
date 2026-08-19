@@ -1,8 +1,4 @@
-use std::io::{BufRead, Seek, Write};
-
-use image::{
-	DynamicImage, ImageDecoder, ImageReader, codecs::webp::WebPEncoder, imageops::FilterType,
-};
+use image::{DynamicImage, ImageDecoder, imageops::FilterType};
 
 use crate::{
 	ErrorKind,
@@ -168,65 +164,206 @@ mod js_impls {
 	}
 }
 
-/// Encodes a `target_width`×`target_height` webp thumbnail of `image_reader`
-/// into `out`, refusing to decode sources above `max_source_pixels` (a decode
-/// materialises the full image in memory before any resize — 3–8 bytes per
-/// pixel depending on the format). `Ok(None)` means no thumbnail could be made
-/// within that budget; HEIF sources fall back to their embedded thumbnail
-/// before giving up.
-pub fn make_thumbnail<R, W>(
-	mime: Option<&str>,
-	_image_file_size: u64,
-	image_reader: R,
-	target_width: u32,
-	target_height: u32,
-	max_source_pixels: u64,
-	out: &mut W,
-) -> Result<Option<(u32, u32)>, Error>
-where
-	R: BufRead + Seek,
-	W: Write,
-{
-	let should_use_heic = cfg!(feature = "heif-decoder")
-		&& (mime == Some("image/heic") || mime == Some("image/heif"));
-	let img = if should_use_heic {
-		#[cfg(feature = "heif-decoder")]
-		{
-			match heif_decoder::try_get_rgba_thumbnail_from_reader(
-				image_reader,
-				_image_file_size,
-				target_width,
-				target_height,
-				max_source_pixels,
-			)? {
-				Some(image) => DynamicImage::ImageRgba8(image),
-				None => return Ok(None),
+// The bounded pipeline is native-only: its only consumer is the mobile
+// cache (wasm thumbnails run through `make_thumbnail_in_memory` above),
+// and the microthumb dependency is gated to match.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod bounded {
+	use std::io::{BufRead, Seek, Write};
+
+	use image::codecs::webp::WebPEncoder;
+
+	use super::*;
+
+	pub use microthumb::DEFAULT_MEM_BUDGET as DEFAULT_THUMBNAIL_MEM_BUDGET;
+	use microthumb::{ByteSource, ThumbError, ThumbSpec};
+
+	/// [`microthumb::ByteSource`] over any `BufRead + Seek` — the local-file
+	/// path. `len` is the caller-declared size; reads past it answer 0.
+	struct ReadSeekSource<R> {
+		inner: R,
+		len: u64,
+	}
+
+	impl<R: BufRead + Seek + Send> ByteSource for ReadSeekSource<R> {
+		fn len(&self) -> u64 {
+			self.len
+		}
+
+		fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+			if offset >= self.len {
+				return Ok(0);
+			}
+			self.inner.seek(std::io::SeekFrom::Start(offset))?;
+			self.inner.read(buf)
+		}
+	}
+
+	fn thumb_error(e: ThumbError) -> Error {
+		match e {
+			ThumbError::Io(e) => e.into(),
+			other => Error::custom(ErrorKind::ImageError, other.to_string()),
+		}
+	}
+
+	/// Encodes a `target_width`×`target_height` webp thumbnail of `image_reader`
+	/// into `out` without ever materialising a full decoded frame: microthumb
+	/// streams every format it can (IDCT-scaled JPEG, PNG scanlines, HEIF tiles,
+	/// embedded previews) and refuses anything whose honest decode peak exceeds
+	/// `mem_budget` bytes ([`DEFAULT_THUMBNAIL_MEM_BUDGET`] fits an iOS
+	/// file-provider extension's ~20 MB jetsam ceiling). `Ok(None)` means no
+	/// thumbnail could be made within the budget — or the bytes are not a
+	/// supported image, which the sniff decides; `mime` is unused and kept for
+	/// callers that log it.
+	pub fn make_thumbnail<R, W>(
+		_mime: Option<&str>,
+		image_file_size: u64,
+		image_reader: R,
+		target_width: u32,
+		target_height: u32,
+		mem_budget: usize,
+		out: &mut W,
+	) -> Result<Option<(u32, u32)>, Error>
+	where
+		R: BufRead + Seek + Send + 'static,
+		W: Write,
+	{
+		let source = ReadSeekSource {
+			inner: image_reader,
+			len: image_file_size,
+		};
+		let spec = ThumbSpec {
+			target_width,
+			target_height,
+			mem_budget,
+		};
+		let Some(small) = microthumb::generate(Box::new(source), &spec).map_err(thumb_error)?
+		else {
+			return Ok(None);
+		};
+		let Some(rgba) = image::RgbaImage::from_vec(small.width, small.height, small.rgba) else {
+			return Err(Error::custom(
+				ErrorKind::ImageError,
+				"thumbnail canvas has an inconsistent buffer".to_string(),
+			));
+		};
+		let img = DynamicImage::ImageRgba8(rgba);
+		let created_width = target_width.min(img.width());
+		let created_height = target_height.min(img.height());
+		let thumbnail = img.resize_to_fill(created_width, created_height, FilterType::CatmullRom);
+		let encoder = WebPEncoder::new_lossless(out);
+		thumbnail.write_with_encoder(encoder)?;
+		Ok(Some((created_width, created_height)))
+	}
+
+	/// [`microthumb::ByteSource`] that fetches and decrypts 1 MiB chunks of a
+	/// remote file on demand, keeping only the last two — so a thumbnail served
+	/// by an embedded preview costs one chunk of download, not the file. Sync by
+	/// contract (microthumb runs inside `spawn_blocking`); each miss bridges to
+	/// the async chunk fetch via `Handle::block_on`, which is legal there.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub struct RemoteChunkSource<'a> {
+		client: &'a crate::auth::unauth::UnauthClient,
+		file: &'a dyn crate::fs::file::traits::File,
+		handle: tokio::runtime::Handle,
+		/// Checked before every fetch: cancellation surfaces as
+		/// `ErrorKind::Interrupted`, which unwinds the decode through its normal
+		/// error path at chunk granularity — the same points an async decoder
+		/// would get to cancel at.
+		cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+		len: u64,
+		slots: [Option<(u64, Vec<u8>)>; 2],
+		next_evict: usize,
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	impl<'a> RemoteChunkSource<'a> {
+		pub fn new(
+			client: &'a crate::auth::unauth::UnauthClient,
+			file: &'a dyn crate::fs::file::traits::File,
+			handle: tokio::runtime::Handle,
+			cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+		) -> Self {
+			RemoteChunkSource {
+				client,
+				file,
+				handle,
+				cancel,
+				len: file.size(),
+				slots: [None, None],
+				next_evict: 0,
 			}
 		}
-		#[cfg(not(feature = "heif-decoder"))]
-		{
-			// heic check above will prevent this from being called
-			unsafe { std::hint::unreachable_unchecked() }
+
+		fn chunk(&mut self, index: u64) -> std::io::Result<&Vec<u8>> {
+			// Two fixed slots instead of a map: header + payload locality is all
+			// the demuxers need, and eviction keeps the source at ≤2 MiB.
+			if let Some(slot) = self
+				.slots
+				.iter()
+				.position(|s| s.as_ref().is_some_and(|(i, _)| *i == index))
+			{
+				return Ok(&self.slots[slot].as_ref().expect("just matched").1);
+			}
+			if self
+				.cancel
+				.as_ref()
+				.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+			{
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::Interrupted,
+					"thumbnail cancelled",
+				));
+			}
+			let start = index * crate::consts::CHUNK_SIZE_U64;
+			let end = (start + crate::consts::CHUNK_SIZE_U64).min(self.len);
+			let (client, file) = (self.client, self.file);
+			let data = self
+				.handle
+				.block_on(async move {
+					use futures::AsyncReadExt;
+					let mut reader = crate::fs::file::read::FileReaderBuilder::new(client, file)
+						.with_start(start)
+						.with_end(end)
+						.build();
+					let mut data = Vec::with_capacity((end - start) as usize);
+					reader.read_to_end(&mut data).await?;
+					Ok::<_, Error>(data)
+				})
+				.map_err(std::io::Error::other)?;
+			let slot = self.next_evict;
+			self.next_evict = (self.next_evict + 1) % self.slots.len();
+			self.slots[slot] = Some((index, data));
+			Ok(&self.slots[slot].as_ref().expect("just stored").1)
 		}
-	} else {
-		let reader = ImageReader::new(image_reader).with_guessed_format()?;
-		let mut decoder = reader.into_decoder()?;
-		let (width, height) = decoder.dimensions();
-		if u64::from(width) * u64::from(height) > max_source_pixels {
-			return Ok(None);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	impl ByteSource for RemoteChunkSource<'_> {
+		fn len(&self) -> u64 {
+			self.len
 		}
-		let orientation = decoder.orientation()?;
-		let mut image = DynamicImage::from_decoder(decoder)?;
-		image.apply_orientation(orientation);
-		image
-	};
-	let created_width = target_width.min(img.width());
-	let created_height = target_height.min(img.height());
-	let thumbnail = img.resize_to_fill(created_width, created_height, FilterType::CatmullRom);
-	let encoder = WebPEncoder::new_lossless(out);
-	thumbnail.write_with_encoder(encoder)?;
-	Ok(Some((created_width, created_height)))
+
+		fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+			if offset >= self.len {
+				return Ok(0);
+			}
+			let index = offset / crate::consts::CHUNK_SIZE_U64;
+			let within = (offset % crate::consts::CHUNK_SIZE_U64) as usize;
+			let chunk = self.chunk(index)?;
+			if within >= chunk.len() {
+				return Ok(0);
+			}
+			// May be short at a chunk boundary; readers loop per the Read contract.
+			let n = buf.len().min(chunk.len() - within);
+			buf[..n].copy_from_slice(&chunk[within..within + n]);
+			Ok(n)
+		}
+	}
 }
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use bounded::{DEFAULT_THUMBNAIL_MEM_BUDGET, RemoteChunkSource, make_thumbnail};
 
 #[cfg(test)]
 mod tests {
@@ -248,16 +385,19 @@ mod tests {
 	}
 
 	#[test]
-	fn refuses_sources_above_the_pixel_budget() {
+	fn refuses_sources_above_the_memory_budget() {
+		// A budget too small even for PNG's row buffers: the pipeline must
+		// answer None (no thumbnail) rather than decode past its ceiling.
 		let bytes = png_bytes(100, 80);
 		let mut out = Vec::new();
+		let len = bytes.len() as u64;
 		let result = make_thumbnail(
 			Some("image/png"),
-			bytes.len() as u64,
-			Cursor::new(&bytes),
+			len,
+			Cursor::new(bytes),
 			32,
 			32,
-			100 * 80 - 1,
+			1024,
 			&mut out,
 		)
 		.unwrap();
@@ -266,16 +406,17 @@ mod tests {
 	}
 
 	#[test]
-	fn makes_a_thumbnail_at_exactly_the_pixel_budget() {
+	fn makes_a_thumbnail_within_the_default_budget() {
 		let bytes = png_bytes(100, 80);
 		let mut out = Vec::new();
+		let len = bytes.len() as u64;
 		let result = make_thumbnail(
 			Some("image/png"),
-			bytes.len() as u64,
-			Cursor::new(&bytes),
+			len,
+			Cursor::new(bytes),
 			32,
 			32,
-			100 * 80,
+			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
 			&mut out,
 		)
 		.unwrap();
@@ -287,13 +428,14 @@ mod tests {
 	fn never_upscales_small_sources() {
 		let bytes = png_bytes(16, 16);
 		let mut out = Vec::new();
+		let len = bytes.len() as u64;
 		let result = make_thumbnail(
 			Some("image/png"),
-			bytes.len() as u64,
-			Cursor::new(&bytes),
+			len,
+			Cursor::new(bytes),
 			64,
 			64,
-			u64::MAX,
+			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
 			&mut out,
 		)
 		.unwrap();
