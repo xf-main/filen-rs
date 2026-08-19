@@ -628,8 +628,7 @@ async fn share_dir() {
 	let file = client.make_file_builder("a.txt", sub_dir.uuid()).unwrap();
 	let sub_file = client.upload_file(file, b"").await.unwrap();
 
-	let (_lock1, _lock2, num_shared_out, num_shared_in) =
-		test_utils::set_up_contact(client, share_client).await;
+	let (_lock1, _lock2) = test_utils::set_up_contact(client, share_client).await;
 
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
@@ -646,18 +645,29 @@ async fn share_dir() {
 		.list_out_shared::<fn(u64, Option<u64>)>(None, None)
 		.await
 		.unwrap();
-	assert_eq!(shared_dirs_out.len(), num_shared_out + 1);
-	assert!(
+	// uuid-scoped asserts only: the share account's global share count is mutated by other CI
+	// legs (compat fixture rebuilds) outside the "test:contact" lock, so len()-based asserts
+	// race (nightly 2026-08-14). Counting exactly one row for OUR dir stays race-free and
+	// still catches a duplicated share.
+	assert_eq!(
 		shared_dirs_out
 			.iter()
-			.any(|d| d.get_dir().uuid() == dir.uuid())
+			.filter(|d| d.get_dir().uuid() == dir.uuid())
+			.count(),
+		1
 	);
 
 	let (shared_dirs_in, _) = share_client
 		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
 		.await
 		.unwrap();
-	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
+	assert_eq!(
+		shared_dirs_in
+			.iter()
+			.filter(|d| d.get_dir().uuid() == dir.uuid())
+			.count(),
+		1
+	);
 
 	let shared_dir_in = shared_dirs_in
 		.iter()
@@ -760,7 +770,6 @@ async fn share_dir() {
 		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
 		.await
 		.unwrap();
-	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
 
 	let shared_dir_in = shared_dirs_in
 		.iter()

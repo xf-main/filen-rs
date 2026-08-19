@@ -172,7 +172,7 @@ async fn lock_chats(
 	let lock1 = lock_chat(client).await;
 	let lock2 = lock_chat(share_client).await;
 
-	let (lock3, lock4, _, _) = set_up_contact(client, share_client).await;
+	let (lock3, lock4) = set_up_contact(client, share_client).await;
 	(lock1, lock2, lock3, lock4)
 }
 

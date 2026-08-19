@@ -164,7 +164,7 @@ pub static SHARE_RESOURCES: Resources = Resources {
 pub async fn set_up_contact_no_add<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
-) -> (Arc<ResourceLock>, Arc<ResourceLock>, usize, usize) {
+) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
 	let lock1 = client
 		.acquire_lock_with_default("test:contact")
 		.await
@@ -270,23 +270,18 @@ pub async fn set_up_contact_no_add<'a>(
 	if std::env::var("SHORT_CONTACT_SETUP").as_deref() != Ok("1") {
 		tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 	}
-	let (out_dirs, _) = client
-		.list_out_shared(None, None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap_or_default();
-	let (in_dirs, _) = share_client
-		.list_in_shared_root(None::<&fn(u64, Option<u64>)>)
-		.await
-		.unwrap();
-	(lock1, lock2, out_dirs.len(), in_dirs.len())
+	// No share-count snapshot here on purpose: the share account is shared by every CI leg, and
+	// compat fixture rebuilds legitimately remove and re-create their share outside the
+	// "test:contact" lock, so any count taken now can drift before a test asserts on it (nightly
+	// 2026-08-14). Tests must assert membership of their own uuids instead.
+	(lock1, lock2)
 }
 
 pub async fn set_up_contact<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
-) -> (Arc<ResourceLock>, Arc<ResourceLock>, usize, usize) {
-	let (lock1, lock2, num_shared_out, num_shared_in) =
-		set_up_contact_no_add(client, share_client).await;
+) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
+	let (lock1, lock2) = set_up_contact_no_add(client, share_client).await;
 
 	let request_uuid = client
 		.send_contact_request(share_client.email())
@@ -302,7 +297,7 @@ pub async fn set_up_contact<'a>(
 		.await
 		.unwrap();
 
-	(lock1, lock2, num_shared_out, num_shared_in)
+	(lock1, lock2)
 }
 
 pub async fn await_event<F, T>(
