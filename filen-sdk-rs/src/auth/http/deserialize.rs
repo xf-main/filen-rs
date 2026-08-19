@@ -25,6 +25,19 @@ where
 	T::deserialize(&mut deserializer)
 }
 
+/// A decode failure that ran out of bytes means the transport handed us a truncated body (the
+/// gateway never streams partial documents), so redriving the request is the fix. A
+/// malformed-but-complete body fails on other variants and stays non-retryable.
+fn msgpack_error_is_truncation(e: &rmp_serde::decode::Error) -> bool {
+	use rmp_serde::decode::Error as DecodeError;
+	match e {
+		DecodeError::InvalidMarkerRead(io) | DecodeError::InvalidDataRead(io) => {
+			io.kind() == std::io::ErrorKind::UnexpectedEof
+		}
+		_ => false,
+	}
+}
+
 pub(crate) struct DeserializeLayer<Res> {
 	_phantom: std::marker::PhantomData<Res>,
 }
@@ -129,7 +142,9 @@ where
 						match from_msgpack_slice(res.as_ref()) {
 							Ok(resp) => resp,
 							Err(e) => {
-								return Poll::Ready(Err(RetryError::NoRetry(
+								let truncated = msgpack_error_is_truncation(&e);
+								return Poll::Ready(Err(RetryError::from_retryable(
+									truncated,
 									Error::custom_with_source(
 										ErrorKind::Response,
 										e,
@@ -145,7 +160,9 @@ where
 						match serde_json::from_slice(res.as_ref()) {
 							Ok(resp) => resp,
 							Err(e) => {
-								return Poll::Ready(Err(RetryError::NoRetry(
+								let truncated = e.classify() == serde_json::error::Category::Eof;
+								return Poll::Ready(Err(RetryError::from_retryable(
+									truncated,
 									Error::custom_with_source(
 										ErrorKind::Response,
 										e,
@@ -209,5 +226,86 @@ mod tests {
 
 		rmp_serde::from_slice::<FilenResponse<UuidHolder>>(&bytes)
 			.expect_err("binary-mode decode should reject string uuids; if this now passes, the human-readable workaround may be removable");
+	}
+
+	/// A body cut short mid-document must classify as truncation (retryable), while a
+	/// complete-but-wrong document must not — a live truncated v3/dir/content response was
+	/// surfaced as non-retryable on the 2026-08-16 nightly.
+	#[test]
+	fn msgpack_truncation_is_distinguished_from_malformed() {
+		let uuid = Uuid::new_v4();
+		let bytes = rmp_serde::to_vec(&serde_json::json!({
+			"status": true,
+			"message": "ok",
+			"code": "ok",
+			"data": { "uuid": uuid.to_string() },
+		}))
+		.unwrap();
+
+		let err = super::from_msgpack_slice::<FilenResponse<UuidHolder>>(&bytes[..bytes.len() / 2])
+			.expect_err("a half body must not decode");
+		assert!(
+			super::msgpack_error_is_truncation(&err),
+			"a mid-document EOF must classify as truncation, got: {err:?}"
+		);
+
+		let err = super::from_msgpack_slice::<FilenResponse<UuidHolder>>(
+			&rmp_serde::to_vec(&serde_json::json!({ "status": "not-a-bool" })).unwrap(),
+		)
+		.expect_err("a mistyped document must not decode");
+		assert!(
+			!super::msgpack_error_is_truncation(&err),
+			"a complete but wrong document must not classify as truncation, got: {err:?}"
+		);
+	}
+
+	/// Layer-level polarity pin: the WIRING must classify a truncated document Retry and a
+	/// malformed-but-complete one NoRetry, in both formats. The helper test above cannot catch
+	/// someone reverting the call sites back to unconditional NoRetry (the pre-fix code, which
+	/// reproduces the 2026-08-16 nightly failure with an otherwise green suite).
+	#[test]
+	fn deserialize_layer_classifies_truncation_retryable() {
+		use crate::auth::http::{ResponseType, retry::RetryError};
+
+		let run = |bytes: Vec<u8>, response_type| {
+			futures::executor::block_on(super::DeserializeFuture::<_, UuidHolder>::new(
+				std::future::ready(Ok::<_, RetryError<crate::Error>>(bytes)),
+				response_type,
+			))
+		};
+
+		let uuid = Uuid::new_v4();
+		let document = serde_json::json!({
+			"status": true,
+			"message": "ok",
+			"code": "ok",
+			"data": { "uuid": uuid.to_string() },
+		});
+
+		let msgpack = rmp_serde::to_vec(&document).unwrap();
+		match run(msgpack[..msgpack.len() / 2].to_vec(), ResponseType::Large) {
+			Err(RetryError::Retry(_)) => {}
+			other => panic!("a truncated msgpack response must be Retry, got {other:?}"),
+		}
+		match run(
+			rmp_serde::to_vec(&serde_json::json!({ "status": "not-a-bool" })).unwrap(),
+			ResponseType::Large,
+		) {
+			Err(RetryError::NoRetry(_)) => {}
+			other => panic!("a mistyped msgpack response must be NoRetry, got {other:?}"),
+		}
+
+		let json = serde_json::to_vec(&document).unwrap();
+		match run(json[..json.len() / 2].to_vec(), ResponseType::Standard) {
+			Err(RetryError::Retry(_)) => {}
+			other => panic!("a truncated json response must be Retry, got {other:?}"),
+		}
+		match run(
+			b"{\"status\": \"not-a-bool\"}".to_vec(),
+			ResponseType::Standard,
+		) {
+			Err(RetryError::NoRetry(_)) => {}
+			other => panic!("a mistyped json response must be NoRetry, got {other:?}"),
+		}
 	}
 }

@@ -151,6 +151,10 @@ mod boxed {
 				while let Some(chunk_res) = stream.next().await {
 					let chunk = match chunk_res {
 						Ok(c) => c,
+						// NOTE: opposite polarity from the native pipeline (which fails fast
+						// on timeouts and retries other transport loss) and no truncation
+						// check — the truncated-body class is intentionally unhandled on
+						// wasm; see full.rs's wasm arm.
 						Err(e) => {
 							if e.is_timeout() {
 								return Err(RetryError::Retry(e.into()));
@@ -221,6 +225,10 @@ mod native {
 			collected: Vec<u8>,
 			last_update_time: Instant,
 			real_content_length: Option<u64>,
+			// The transport-level declared length (Content-Length via the body's size hint), NOT
+			// `X-Cl`: `real_content_length` is Filen's application header and does not describe
+			// the wire body.
+			expected: Option<u64>,
 		},
 	}
 
@@ -282,12 +290,14 @@ mod native {
 										Some("failed to allocate memory for response body"),
 									))
 								})?;
+							let expected = body.size_hint().exact();
 							this.state
 								.set(DownloadWithCallbackFutureState::ReadingBody {
 									body,
 									collected,
 									last_update_time: Instant::now(),
 									real_content_length,
+									expected,
 								});
 						}
 						Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -298,6 +308,7 @@ mod native {
 						collected,
 						last_update_time,
 						real_content_length,
+						expected,
 					} => loop {
 						match body.as_mut().poll_frame(cx) {
 							Poll::Ready(Some(Ok(frame))) => {
@@ -325,10 +336,31 @@ mod native {
 								// A mid-body read timeout must fail fast, not retry: the request
 								// timeout classification (see execute_request) treats timeouts as
 								// non-retryable, and retrying a stalled stream would burn another
-								// full read timeout per attempt.
-								return Poll::Ready(Err(RetryError::NoRetry(Error::from(e))));
+								// full read timeout per attempt. Every other mid-body failure
+								// (connection reset, incomplete framing — and, over-broadly but
+								// bounded by MAX_RETRIES, decompression errors) is classified as
+								// transient transport loss and redriven.
+								return Poll::Ready(Err(RetryError::from_retryable(
+									!e.is_timeout(),
+									Error::from(e),
+								)));
 							}
 							Poll::Ready(None) => {
+								// Clean EOF short of the declared length = truncated body.
+								// DEFENSIVE today: reqwest's `http2` feature is off in this
+								// workspace and h1 surfaces truncation as an error above (see
+								// full.rs for the full rationale).
+								if let Some(expected) = *expected
+									&& (collected.len() as u64) < expected
+								{
+									return Poll::Ready(Err(RetryError::Retry(Error::custom(
+										ErrorKind::Response,
+										format!(
+											"response body truncated: got {} of {expected} bytes",
+											collected.len()
+										),
+									))));
+								}
 								if let Some(callback) = this.callback {
 									callback(collected.len() as u64, *real_content_length);
 								}
@@ -403,5 +435,51 @@ mod tests {
 		let response = response_with_body(vec![7u8; 5000], "5000");
 		let body = run(response, None).expect("an uncapped download must succeed");
 		assert_eq!(body.len(), 5000);
+	}
+
+	/// Same polarity pin as full.rs's connection-loss test, for THIS pipeline: the large-response
+	/// endpoints (v3/dir/content and friends) and chunk downloads flow through
+	/// `DownloadWithCallbackFuture`, so a truncated body here must classify Retry — this is the
+	/// pipeline the 2026-08-16 nightly failure actually took.
+	#[tokio::test]
+	async fn mid_body_connection_loss_is_retryable() {
+		use tokio::{
+			io::{AsyncReadExt, AsyncWriteExt},
+			net::TcpListener,
+		};
+
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).await;
+			// Promise 100 bytes, send only a few, then close the connection so the body read
+			// ends in a transport error rather than a timeout.
+			let head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npart";
+			socket.write_all(head.as_bytes()).await.unwrap();
+			socket.flush().await.unwrap();
+		});
+
+		let client = crate::auth::http::ClientConfig::default()
+			.build_reqwest_client()
+			.unwrap();
+		let response = client.get(format!("http://{addr}/")).send().await.unwrap();
+
+		let fut = DownloadWithCallbackFuture::new(
+			std::future::ready(Ok::<_, RetryError<Error>>(response)),
+			None::<&NoCallback>,
+			None,
+		);
+		match fut.await {
+			Err(RetryError::Retry(_)) => {}
+			Err(RetryError::NoRetry(e)) => {
+				panic!("a connection lost mid-body must be Retry, but was NoRetry: {e}")
+			}
+			Ok(body) => panic!(
+				"a body truncated by connection loss must not be accepted (got {} bytes)",
+				body.len()
+			),
+		}
 	}
 }
