@@ -1307,7 +1307,10 @@ pub async fn test_trash_item_nonexistent_file() {
 	let result = db.trash_item(nonexistent_path).await;
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
-	assert!(error_message.contains("does not point to an item"));
+	// The walk completed against the server and found nothing at the final
+	// component: a typed not-found (mapped to .noSuchItem on iOS), not a
+	// retried remote error.
+	assert!(error_message.contains("no longer resolves to an item"));
 }
 
 #[shared_test_runtime]
@@ -1325,7 +1328,10 @@ pub async fn test_trash_item_nonexistent_directory() {
 	let result = db.trash_item(nonexistent_path).await;
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
-	assert!(error_message.contains("does not point to an item"));
+	// The walk completed against the server and found nothing at the final
+	// component: a typed not-found (mapped to .noSuchItem on iOS), not a
+	// retried remote error.
+	assert!(error_message.contains("no longer resolves to an item"));
 }
 
 #[shared_test_runtime]
@@ -1497,7 +1503,10 @@ pub async fn test_trash_item_already_trashed_file() {
 	let result = db.trash_item(file_path).await;
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
-	assert!(error_message.contains("does not point to an item"));
+	// The walk completed against the server and found nothing at the final
+	// component: a typed not-found (mapped to .noSuchItem on iOS), not a
+	// retried remote error.
+	assert!(error_message.contains("no longer resolves to an item"));
 }
 
 #[shared_test_runtime]
@@ -1694,7 +1703,10 @@ pub async fn test_move_item_nonexistent_item() {
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
-	assert!(error_message.contains("does not point to an item"));
+	// The walk completed against the server and found nothing at the final
+	// component: a typed not-found (mapped to .noSuchItem on iOS), not a
+	// retried remote error.
+	assert!(error_message.contains("no longer resolves to an item"));
 }
 
 #[shared_test_runtime]
@@ -2505,7 +2517,10 @@ pub async fn test_rename_item_nonexistent_file() {
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
-	assert!(error_message.contains("does not point to an item"));
+	// The walk completed against the server and found nothing at the final
+	// component: a typed not-found (mapped to .noSuchItem on iOS), not a
+	// retried remote error.
+	assert!(error_message.contains("no longer resolves to an item"));
 }
 
 #[shared_test_runtime]

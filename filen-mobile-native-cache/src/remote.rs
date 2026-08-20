@@ -636,6 +636,21 @@ impl AuthCacheState {
 		&self,
 		id: &FfiId,
 	) -> Result<(Option<DBFile>, DBFile), CacheError> {
+		// Identity-form (`stable/`) ids resolve row-direct (see `resolve_stable_object`):
+		// serving bytes through a rebuilt display path can hand out a same-named sibling's
+		// content.
+		if id.0.starts_with(STABLE_PREFIX) {
+			let old_file = match self.select_object_by_id(id)? {
+				Some(DBObject::File(file)) => Some(file),
+				_ => None,
+			};
+			return match self.resolve_stable_object(id).await? {
+				DBObject::File(file) => Ok((old_file, file)),
+				_ => Err(CacheError::remote(format!(
+					"Id {id} does not point to a file"
+				))),
+			};
+		}
 		let file_path = self.canonicalize_id(id)?;
 		let path_values = file_path.as_path()?;
 		let old_file = match sql::select_object_at_path(&self.conn(), &path_values)? {
@@ -812,7 +827,7 @@ impl AuthCacheState {
 	/// [`AuthCacheState::canonicalize_id`] would build from it: that id names one row, while a
 	/// path names a place, and same-named siblings share a place. Every other id form describes a
 	/// location and is walked as one.
-	fn select_object_by_id(&self, id: &FfiId) -> Result<Option<DBObject>, CacheError> {
+	pub(crate) fn select_object_by_id(&self, id: &FfiId) -> Result<Option<DBObject>, CacheError> {
 		let conn = self.conn();
 		if id.0.starts_with(STABLE_PREFIX) {
 			let uuid = resolve_uuid_or_stable(&conn, &id.0)?;
@@ -952,6 +967,15 @@ impl AuthCacheState {
 		&self,
 		id: FfiId,
 	) -> Result<Option<FfiObject>, CacheError> {
+		Ok(self.resolve_object_refreshed(&id).await?.map(Into::into))
+	}
+
+	/// The item an id names as a [`DBObject`], refreshed from the server — the body of
+	/// [`Self::update_and_query_item`], reused row-direct by the id-addressed operations.
+	pub(crate) async fn resolve_object_refreshed(
+		&self,
+		id: &FfiId,
+	) -> Result<Option<DBObject>, CacheError> {
 		debug!("Updating and querying item: {}", id.0);
 		// An id that resolves to no row of ours is usually one we retired: the providers only ever
 		// ask about identifiers they learned from this cache, so it named an item that has since
@@ -965,17 +989,29 @@ impl AuthCacheState {
 		// and the replica then asks about that parent by uuid — answering `None` there would
 		// report a directory that plainly exists as deleted. So ask the server, once, and let only
 		// its not-found stand as the deletion.
-		let obj = match self.select_object_by_id(&id)? {
+		let obj = match self.select_object_by_id(id)? {
 			Some(obj) => obj,
-			None => return self.resolve_unknown_id(&id).await,
+			None => return self.resolve_unknown_id(id).await,
 		};
 		match obj {
 			DBObject::File(file) => self.refresh_file(file).await,
 			DBObject::Dir(dir) => self.refresh_dir(dir).await,
 			// A root is not something the server retires or moves; keeping its usage figures
 			// current is update_roots_info's job.
-			DBObject::Root(root) => Ok(Some(DBObject::Root(root).into())),
+			DBObject::Root(root) => Ok(Some(DBObject::Root(root))),
 		}
+	}
+
+	/// The one row an identity-form (`stable/`) id names, resolved ROW-DIRECT and refreshed from
+	/// the server — never through a rebuilt display path. A path names a place, and same-named
+	/// siblings share a place: the server permits exact-name collisions (the dedup hash is
+	/// client-supplied), and a decrypted name can be empty or contain '/' — a display-path walk
+	/// then lands the operation on the WRONG row (or fails the round-trip entirely). The
+	/// id-addressed destructive and byte-serving operations resolve through this instead.
+	async fn resolve_stable_object(&self, id: &FfiId) -> Result<DBObject, CacheError> {
+		self.resolve_object_refreshed(id)
+			.await?
+			.ok_or_else(|| CacheError::DoesNotExist(format!("No item found for id: {id}").into()))
 	}
 
 	/// The item an unknown identity-form id names, learned from the server (see
@@ -992,7 +1028,7 @@ impl AuthCacheState {
 	/// upsert a refresh uses, which leaves it exactly as a listing would have — including a parent
 	/// we may still know nothing about, and which the next query resolves the same way, one level
 	/// per ask.
-	async fn resolve_unknown_id(&self, id: &FfiId) -> Result<Option<FfiObject>, CacheError> {
+	async fn resolve_unknown_id(&self, id: &FfiId) -> Result<Option<DBObject>, CacheError> {
 		let (addressed_stable, bare) = match id.0.strip_prefix(STABLE_PREFIX) {
 			Some(rest) => (true, rest),
 			None => (false, id.0.as_str()),
@@ -1004,7 +1040,7 @@ impl AuthCacheState {
 			Ok(remote_dir) => {
 				debug!("Learned unlisted dir {uuid} from the server");
 				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
-				return Ok(Some(DBObject::Dir(dir).into()));
+				return Ok(Some(DBObject::Dir(dir)));
 			}
 			// Not a directory the server knows — for the stable namespace that does not yet mean
 			// gone: the id may name a file lineage, probed below.
@@ -1031,7 +1067,7 @@ impl AuthCacheState {
 		};
 		debug!("Learned unlisted file lineage {stable_uuid} from the server");
 		let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
-		Ok(Some(DBObject::File(file).into()))
+		Ok(Some(DBObject::File(file)))
 	}
 
 	/// The file behind a row, refreshed to its live head.
@@ -1042,7 +1078,7 @@ impl AuthCacheState {
 	/// there is only ever one answer, and it is the head — so it is upserted unconditionally, and
 	/// the stable tier lands it on this very row. A trashed head is still this item and comes back
 	/// as one, carrying the parent a restore would put it back in.
-	async fn refresh_file(&self, file: DBFile) -> Result<Option<FfiObject>, CacheError> {
+	async fn refresh_file(&self, file: DBFile) -> Result<Option<DBObject>, CacheError> {
 		let head = match self.client.get_file_by_stable_uuid(file.stable_uuid).await {
 			Ok(head) => head,
 			Err(e) if e.kind() == ErrorKind::FileNotFound => {
@@ -1051,10 +1087,10 @@ impl AuthCacheState {
 			Err(e) => return Err(e.into()),
 		};
 		let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
-		Ok(Some(DBObject::File(file).into()))
+		Ok(Some(DBObject::File(file)))
 	}
 
-	async fn refresh_dir(&self, dir: DBDir) -> Result<Option<FfiObject>, CacheError> {
+	async fn refresh_dir(&self, dir: DBDir) -> Result<Option<DBObject>, CacheError> {
 		let remote_dir = match self.client.get_dir(dir.uuid).await {
 			Ok(remote_dir) => remote_dir,
 			Err(e) if e.kind() == ErrorKind::FolderNotFound => {
@@ -1063,7 +1099,7 @@ impl AuthCacheState {
 			Err(e) => return Err(e.into()),
 		};
 		let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
-		Ok(Some(DBObject::Dir(dir).into()))
+		Ok(Some(DBObject::Dir(dir)))
 	}
 
 	/// Drops an item the server says it no longer has, bytes first.
@@ -1073,7 +1109,7 @@ impl AuthCacheState {
 	/// dropping them along with the item is the point — the row delete that follows is what
 	/// retires the id for every replica, and a slot left behind would be a cached copy of
 	/// something nothing names any more.
-	pub(crate) async fn forget_item(&self, obj: DBObject) -> Result<Option<FfiObject>, CacheError> {
+	pub(crate) async fn forget_item(&self, obj: DBObject) -> Result<Option<DBObject>, CacheError> {
 		// An edit that has not reached the server outranks the server's answer: those bytes exist
 		// nowhere else, and a drain can still land them. Deleting the row here would take the only
 		// copy with it. The item stays until the drain resolves it, one way or the other.
@@ -1092,7 +1128,7 @@ impl AuthCacheState {
 				"Item {} is gone from the server but still holds an unuploaded edit, keeping it",
 				obj.uuid()
 			);
-			return Ok(Some(obj.into()));
+			return Ok(Some(obj));
 		}
 		debug!("Item {} is gone from the server, dropping it", obj.uuid());
 		self.io_delete_local(obj.uuid()).await?;
@@ -1340,20 +1376,26 @@ impl AuthCacheState {
 		path: FfiId,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Trashing item at path: {}", path.0);
-		let path = self.canonicalize_id(&path)?;
-		let path_values: PathFfiId<'_> = path.as_path()?;
-		let obj = match self.update_items_in_path(&path_values).await? {
-			UpdateItemsInPath::Complete(dbobject) => dbobject,
-			// Server-confirmed gone (transport failures propagate above): trashing an item that
-			// no longer exists must answer `.noSuchItem`, not a retried "unreachable".
-			UpdateItemsInPath::Partial(_, _) => {
-				return Err(CacheError::DoesNotExist(
-					format!(
-						"Path {} no longer resolves to an item",
-						path_values.full_path
-					)
-					.into(),
-				));
+		// `stable/<id>` names ONE row: resolve it row-direct (see `resolve_stable_object`)
+		// instead of walking a rebuilt display path that can land on a same-named sibling.
+		let obj = if path.0.starts_with(STABLE_PREFIX) {
+			self.resolve_stable_object(&path).await?
+		} else {
+			let path = self.canonicalize_id(&path)?;
+			let path_values: PathFfiId<'_> = path.as_path()?;
+			match self.update_items_in_path(&path_values).await? {
+				UpdateItemsInPath::Complete(dbobject) => dbobject,
+				// Server-confirmed gone (transport failures propagate above): trashing an item
+				// that no longer exists must answer `.noSuchItem`, not a retried "unreachable".
+				UpdateItemsInPath::Partial(_, _) => {
+					return Err(CacheError::DoesNotExist(
+						format!(
+							"Path {} no longer resolves to an item",
+							path_values.full_path
+						)
+						.into(),
+					));
+				}
 			}
 		};
 
@@ -1422,6 +1464,15 @@ impl AuthCacheState {
 
 		// we do this first to make sure we have a valid restore target
 		let parent = match to {
+			// An identity-form target resolves row-direct, like every other id-addressed
+			// operation.
+			Some(to_id) if to_id.0.starts_with(STABLE_PREFIX) => {
+				let dir = DBDirObject::try_from(self.resolve_stable_object(&to_id).await?)
+					.map_err(|e| {
+						CacheError::remote(format!("Id {to_id} does not point to a directory: {e}"))
+					})?;
+				Some((dir, to_id))
+			}
 			Some(to_path) => {
 				let to_path = self.canonicalize_id(&to_path)?.into_owned();
 				let to_pvs: PathFfiId<'_> = to_path.as_path()?;
@@ -1474,23 +1525,36 @@ impl AuthCacheState {
 			}
 		};
 
-		if let Some((parent, parent_path)) = parent
+		if let Some((parent, _parent_path)) = parent
 			&& object.certain_parent() != parent.uuid()
 		{
-			let new_path = parent_path.join(&object.uuid().to_string());
 			let item = self.inner_move_item(object, parent).await?;
+			// A display path for the restored location when the cache can build one (the path
+			// CTE already starts at the root). Joining the caller's target id with a uuid
+			// produced a string valid in NO id namespace for identity-form targets
+			// (`stable/<dir>/<uuid>`); the fallback is the item's own identity form instead.
+			let id = sql::recursive_select_path_from_uuid(&self.conn(), item.uuid())?
+				.map(FfiId)
+				.unwrap_or_else(|| match &item {
+					DBNonRootObject::File(file) => {
+						FfiId(format!("{STABLE_PREFIX}{}", file.stable_uuid))
+					}
+					DBNonRootObject::Dir(dir) => FfiId(format!("{STABLE_PREFIX}{}", dir.uuid)),
+				});
 			return Ok(ObjectWithPathResponse {
 				object: DBObject::from(item).into(),
-				id: new_path,
+				id,
 			});
 		}
 
+		// The path CTE already starts at the root; prepending the root uuid again produced a
+		// doubled first component.
 		sql::recursive_select_path_from_uuid(&self.conn(), object.uuid())?
 			.ok_or_else(|| {
 				CacheError::remote(format!("Failed to get path for object with UUID {uuid}"))
 			})
 			.map(|s| ObjectWithPathResponse {
-				id: FfiId(format!("{}{}", self.client.root().uuid(), s)),
+				id: FfiId(s),
 				object: DBObject::from(object).into(),
 			})
 	}
@@ -1501,13 +1565,20 @@ impl AuthCacheState {
 		new_parent: FfiId,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Moving item {} to new parent {}", item.0, new_parent.0);
-		let item = self.canonicalize_id(&item)?;
-		let new_parent = self.canonicalize_id(&new_parent)?.into_owned();
-		let item_pvs: PathFfiId<'_> = item.as_path()?;
-		let new_parent_pvs: PathFfiId<'_> = new_parent.as_path()?;
-
+		// Identity-form (`stable/`) ids resolve row-direct on BOTH sides (see
+		// `resolve_stable_object`); only the legacy path forms still walk a display path.
 		let (obj, new_parent_dir) = futures::try_join!(
 			async {
+				if item.0.starts_with(STABLE_PREFIX) {
+					return DBNonRootObject::try_from(self.resolve_stable_object(&item).await?)
+						.map_err(|e| {
+							CacheError::remote(format!(
+								"Id {item} does not point to a non-root item: {e}"
+							))
+						});
+				}
+				let item = self.canonicalize_id(&item)?;
+				let item_pvs: PathFfiId<'_> = item.as_path()?;
 				let obj = match self.update_items_in_path(&item_pvs).await? {
 					UpdateItemsInPath::Complete(obj) => {
 						DBNonRootObject::try_from(obj).map_err(|e| {
@@ -1532,6 +1603,16 @@ impl AuthCacheState {
 				Ok(obj)
 			},
 			async {
+				if new_parent.0.starts_with(STABLE_PREFIX) {
+					return DBDirObject::try_from(self.resolve_stable_object(&new_parent).await?)
+						.map_err(|e| {
+							CacheError::remote(format!(
+								"Id {new_parent} does not point to a directory: {e}"
+							))
+						});
+				}
+				let new_parent = self.canonicalize_id(&new_parent)?;
+				let new_parent_pvs: PathFfiId<'_> = new_parent.as_path()?;
 				match self.update_items_in_path(&new_parent_pvs).await? {
 					UpdateItemsInPath::Complete(obj) => DBDirObject::try_from(obj).map_err(|e| {
 						CacheError::remote(format!(
@@ -1554,12 +1635,23 @@ impl AuthCacheState {
 		// trashed elsewhere lands here. The plain move endpoint is not defined for trashed
 		// items — route through the restore flow, which restores and then moves.
 		if obj.parent().is_some_and(|parent| parent.is_trash()) {
-			return self.restore_item(&item.0, Some(new_parent)).await;
+			// Delegate with the RESOLVED row's uuid, not the caller's raw id: restore_item
+			// parses a bare uuid (or stable/ form), and a legacy path-form id would die in the
+			// parse after this branch already resolved it.
+			return self
+				.restore_item(&obj.uuid().to_string(), Some(new_parent))
+				.await;
 		}
 		let obj = self.inner_move_item(obj, new_parent_dir).await?;
+		// A display path for the new location when the cache can build one (the path CTE
+		// already starts at the root); else the caller's own id, which stays valid — identity
+		// survives a move.
+		let id = sql::recursive_select_path_from_uuid(&self.conn(), obj.uuid())?
+			.map(FfiId)
+			.unwrap_or(item);
 		Ok(ObjectWithPathResponse {
 			object: DBObject::from(obj).into(),
-			id: new_parent.join(item_pvs.name_or_uuid),
+			id,
 		})
 	}
 
@@ -1569,33 +1661,46 @@ impl AuthCacheState {
 		new_name: String,
 	) -> Result<Option<ObjectWithPathResponse>, CacheError> {
 		debug!("Renaming item {} to {}", item.0, new_name);
-		let item = self.canonicalize_id(&item)?.into_owned();
-		let item_pvs: PathFfiId<'_> = item.as_path()?;
-		if item_pvs.name_or_uuid.is_empty() {
-			return Err(CacheError::remote(format!(
-				"Cannot rename item: {}",
-				item.0
-			)));
-		} else if item_pvs.name_or_uuid == new_name {
-			return Ok(None);
-		}
-		self.update_dir_children(&item.parent()).await?;
-		let obj = match sql::select_object_at_path(&self.conn(), &item_pvs)? {
-			Some(obj) => DBNonRootObject::try_from(obj).map_err(|e| {
-				CacheError::remote(format!(
-					"Path {} does not point to a non-root item: {}",
-					item_pvs.full_path, e
-				))
-			})?,
-			None => {
-				// The parent was relisted just above, so a missing row is server-confirmed
-				// gone from this path — `.noSuchItem`, not a retried "unreachable".
-				return Err(CacheError::DoesNotExist(
-					format!("Path {} no longer resolves to an item", item_pvs.full_path).into(),
-				));
+		// Identity-form (`stable/`) ids resolve row-direct (see `resolve_stable_object`): the
+		// old walk relisted the parent and re-selected by display path, which lands on a
+		// same-named sibling when names collide.
+		let obj = if item.0.starts_with(STABLE_PREFIX) {
+			let obj = DBNonRootObject::try_from(self.resolve_stable_object(&item).await?).map_err(
+				|e| CacheError::remote(format!("Id {item} does not point to a non-root item: {e}")),
+			)?;
+			// The replay of an already-applied rename: nothing to do, and not an error.
+			if obj.name() == Some(new_name.as_str()) {
+				return Ok(None);
+			}
+			obj
+		} else {
+			let canonical = self.canonicalize_id(&item)?.into_owned();
+			let item_pvs: PathFfiId<'_> = canonical.as_path()?;
+			if item_pvs.name_or_uuid.is_empty() {
+				return Err(CacheError::remote(format!(
+					"Cannot rename item: {}",
+					canonical.0
+				)));
+			} else if item_pvs.name_or_uuid == new_name {
+				return Ok(None);
+			}
+			self.update_dir_children(&canonical.parent()).await?;
+			match sql::select_object_at_path(&self.conn(), &item_pvs)? {
+				Some(obj) => DBNonRootObject::try_from(obj).map_err(|e| {
+					CacheError::remote(format!(
+						"Path {} does not point to a non-root item: {}",
+						item_pvs.full_path, e
+					))
+				})?,
+				None => {
+					// The parent was relisted just above, so a missing row is server-confirmed
+					// gone from this path — `.noSuchItem`, not a retried "unreachable".
+					return Err(CacheError::DoesNotExist(
+						format!("Path {} no longer resolves to an item", item_pvs.full_path).into(),
+					));
+				}
 			}
 		};
-		let new_path = item.parent().join(&new_name);
 		let obj = match obj {
 			DBNonRootObject::Dir(dbdir) => {
 				let mut remote_dir: RemoteDirectory = dbdir.into();
@@ -1616,19 +1721,31 @@ impl AuthCacheState {
 				DBObject::File(file)
 			}
 		};
+		// A display path for the renamed item when the cache can build one (the path CTE
+		// already starts at the root); else the caller's own id, which stays valid — identity
+		// survives a rename.
+		let id = sql::recursive_select_path_from_uuid(&self.conn(), obj.uuid())?
+			.map(FfiId)
+			.unwrap_or(item);
 		Ok(Some(ObjectWithPathResponse {
 			object: obj.into(),
-			id: new_path,
+			id,
 		}))
 	}
 
 	pub(crate) async fn clear_local_cache(&self, item: FfiId) -> Result<(), CacheError> {
-		let item = self.canonicalize_id(&item)?;
-		let pvs = item.as_path()?;
-		debug!("Clearing local cache for item: {}", pvs.full_path);
-		let obj = match sql::select_object_at_path(&self.conn(), &pvs)? {
-			Some(obj) => obj,
-			None => return Ok(()),
+		debug!("Clearing local cache for item: {}", item.0);
+		// A purely local operation: an identity-form id selects its row directly (no server
+		// refresh needed and no display-path rebuild that could hit a same-named sibling).
+		let obj = if item.0.starts_with(STABLE_PREFIX) {
+			self.select_object_by_id(&item)?
+		} else {
+			let item = self.canonicalize_id(&item)?;
+			let pvs = item.as_path()?;
+			sql::select_object_at_path(&self.conn(), &pvs)?
+		};
+		let Some(obj) = obj else {
+			return Ok(());
 		};
 		self.io_delete_local(obj.uuid()).await?;
 		Ok(())
@@ -1740,6 +1857,18 @@ impl AuthCacheState {
 
 	pub(crate) async fn delete_item(&self, item: FfiId) -> Result<(), CacheError> {
 		debug!("Deleting object at path: {}", item.0);
+		// Identity-form (`stable/`) ids resolve row-direct (see `resolve_stable_object`) — a
+		// PERMANENT delete through a rebuilt display path landing on a same-named sibling is the
+		// worst possible wrong-row outcome. An id the server no longer knows deletes nothing and
+		// succeeds, matching the Trash/Recents arm's tolerance below.
+		if item.0.starts_with(STABLE_PREFIX) {
+			let obj = match self.resolve_stable_object(&item).await {
+				Ok(obj) => Some(obj),
+				Err(CacheError::DoesNotExist(_)) => None,
+				Err(e) => return Err(e),
+			};
+			return self.inner_delete_item(obj).await;
+		}
 		let item = self.canonicalize_id(&item)?;
 		let pvs = item.as_parsed()?;
 		let obj = match pvs {
@@ -1766,6 +1895,11 @@ impl AuthCacheState {
 				})
 			}
 		};
+		self.inner_delete_item(obj).await
+	}
+
+	/// The delete every resolution branch funnels into; `None` (nothing to delete) succeeds.
+	async fn inner_delete_item(&self, obj: Option<DBObject>) -> Result<(), CacheError> {
 		let Some(obj) = obj else {
 			return Ok(());
 		};
@@ -1780,6 +1914,7 @@ impl AuthCacheState {
 				let uuid = remote_dir.uuid();
 				self.client.delete_dir_permanently(remote_dir).await?;
 				sql::delete_item(&mut self.conn(), uuid)?;
+				debug!("Successfully deleted dir {uuid}");
 			}
 			DBObject::File(file) => {
 				self.io_delete_local(file.uuid).await?;
@@ -1787,9 +1922,9 @@ impl AuthCacheState {
 				let uuid = remote_file.uuid();
 				self.client.delete_file_permanently(remote_file).await?;
 				sql::delete_item(&mut self.conn(), uuid)?;
+				debug!("Successfully deleted file {uuid}");
 			}
 		}
-		debug!("Successfully deleted item at path: {}", item.0);
 		Ok(())
 	}
 
@@ -1798,12 +1933,36 @@ impl AuthCacheState {
 		item: FfiId,
 		favorite_rank: i64,
 	) -> Result<ObjectWithPathResponse, CacheError> {
-		let item = self.canonicalize_id(&item)?;
-		let pvs = item.as_parsed()?;
 		debug!(
 			"Setting favorite rank for item: {}, rank: {}",
 			item.0, favorite_rank
 		);
+		// Identity-form (`stable/`) ids select their row directly — a display-path rebuild can
+		// hit a same-named sibling. No server refresh: the favorite call itself is the
+		// authoritative operation, keyed on the row's uuid.
+		if item.0.starts_with(STABLE_PREFIX) {
+			let obj = self.select_object_by_id(&item)?.ok_or_else(|| {
+				CacheError::DoesNotExist(format!("No item found for id: {item}").into())
+			})?;
+			let obj = self.inner_set_favorite_rank(obj, favorite_rank).await?;
+			// Echo the same id family the display-path resolution produced: the trash form for
+			// a trashed item (further operations address it there), the bare uuid for a root,
+			// the caller's own identity form otherwise.
+			let id = match &obj {
+				DBObject::File(file) if file.parent.is_trash() => {
+					FfiId(format!("trash/{}", file.uuid))
+				}
+				DBObject::Dir(dir) if dir.parent.is_trash() => FfiId(format!("trash/{}", dir.uuid)),
+				DBObject::Root(root) => FfiId(root.uuid.to_string()),
+				_ => item,
+			};
+			return Ok(ObjectWithPathResponse {
+				object: obj.into(),
+				id,
+			});
+		}
+		let item = self.canonicalize_id(&item)?;
+		let pvs = item.as_parsed()?;
 		let obj = match pvs {
 			ParsedFfiId::Trash(uuid_id) | ParsedFfiId::Recents(uuid_id) => DBObject::select(
 				&self.conn(),
@@ -1827,6 +1986,19 @@ impl AuthCacheState {
 			}
 		}
 		.ok_or_else(|| CacheError::remote(format!("No item found at path: {}", item.0)))?;
+		let obj = self.inner_set_favorite_rank(obj, favorite_rank).await?;
+		Ok(ObjectWithPathResponse {
+			object: obj.into(),
+			id: item.into_owned(),
+		})
+	}
+
+	/// The favorite update every resolution branch funnels into.
+	async fn inner_set_favorite_rank(
+		&self,
+		obj: DBObject,
+		favorite_rank: i64,
+	) -> Result<DBObject, CacheError> {
 		let obj = match obj {
 			DBObject::File(mut dbfile) if favorite_rank != dbfile.favorite_rank => {
 				if (favorite_rank > 0) != (dbfile.favorite_rank > 0) {
@@ -1861,10 +2033,7 @@ impl AuthCacheState {
 			}
 			obj => obj,
 		};
-		Ok(ObjectWithPathResponse {
-			object: obj.into(),
-			id: item.into_owned(),
-		})
+		Ok(obj)
 	}
 
 	async fn inner_download_file_if_changed(

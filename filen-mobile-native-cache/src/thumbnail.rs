@@ -224,22 +224,25 @@ impl AuthCacheState {
 		requested_width: u32,
 		requested_height: u32,
 	) -> ThumbnailResult {
-		let path = match self.canonicalize_id(path) {
-			Ok(path) => path,
-			Err(e) => return ThumbnailResult::Err(e),
-		};
-		let pvs = match path.as_parsed() {
-			Ok(pvs) => pvs,
-			Err(e) => return ThumbnailResult::Err(e),
-		};
-		let file = {
-			let conn: std::sync::MutexGuard<'_, rusqlite::Connection> = self.conn();
-			match sql::select_object_at_parsed_id(&conn, &pvs) {
-				Ok(Some(DBObject::File(file))) => file,
-				Ok(Some(_)) => return ThumbnailResult::NoThumbnail,
-				Ok(None) => return ThumbnailResult::NotFound,
+		// An identity-form (`stable/`) id selects its row directly: rebuilding a display path
+		// and re-resolving it can hand back a same-named sibling's bytes as this id's thumbnail.
+		let selected = if path.0.starts_with(crate::local::STABLE_PREFIX) {
+			self.select_object_by_id(path)
+		} else {
+			let path = match self.canonicalize_id(path) {
+				Ok(path) => path,
+				Err(e) => return ThumbnailResult::Err(e),
+			};
+			match path.as_parsed() {
+				Ok(pvs) => sql::select_object_at_parsed_id(&self.conn(), &pvs),
 				Err(e) => return ThumbnailResult::Err(e),
 			}
+		};
+		let file = match selected {
+			Ok(Some(DBObject::File(file))) => file,
+			Ok(Some(_)) => return ThumbnailResult::NoThumbnail,
+			Ok(None) => return ThumbnailResult::NotFound,
+			Err(e) => return ThumbnailResult::Err(e),
 		};
 
 		let remote_file = match file.try_into() {

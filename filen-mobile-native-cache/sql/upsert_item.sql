@@ -30,14 +30,22 @@ WITH target AS (
 			-- The only tier a dir or root can resolve through, and a last
 			-- resort for files the server never told us a stable id for —
 			-- identity is never inferred from names when a stable id is
-			-- available.
+			-- available. That rule is enforced with the `?7 IS NULL` guard:
+			-- a record CARRYING a stable id that missed both id tiers is a
+			-- different item that happens to share the name (the server
+			-- permits exact-name collisions — the dedup hash is
+			-- client-supplied), and adopting the same-named row would steal
+			-- its identity, flip its ids on every listing, and tombstone a
+			-- live item each time. Such a record inserts fresh instead; the
+			-- name-owner's own fate is the listing sweep's to decide.
 			(
 				SELECT items.id
 				FROM items
 				LEFT JOIN files_meta ON items.id = files_meta.id
 				LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 				WHERE
-					items.parent = ?2
+					?7 IS NULL
+					AND items.parent = ?2
 					AND items.trashed = FALSE
 					-- Type-scoped like the other tiers: a same-named item of a
 					-- different type is a different object, never this one.

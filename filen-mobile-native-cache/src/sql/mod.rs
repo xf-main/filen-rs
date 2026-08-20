@@ -2137,17 +2137,19 @@ mod change_tracking_tests {
 		assert!(retired(&conn).is_empty());
 	}
 
-	/// The `(parent, name)` tier resolves an incoming record onto a row that answers to a
-	/// different pair of ids and overwrites both in place. No DELETE ever fires, so without this
-	/// trigger the overwritten stable id would simply go stale — a phantom the replica keeps
-	/// forever.
+	/// The `(parent, name)` tier is a last resort for records carrying NO stable id. A record
+	/// that HAS one and missed both id tiers is a DIFFERENT item that happens to share the name
+	/// (the server permits exact-name collisions — the dedup hash is client-supplied): it must
+	/// insert fresh. Adopting the same-named row stole its identity, flipped the row's ids on
+	/// every subsequent listing of the twins, and emitted an authoritative tombstone for a live
+	/// item each time.
 	#[test]
-	fn the_name_tier_upsert_retires_the_id_it_overwrites() {
+	fn a_stable_id_record_never_steals_a_same_named_row() {
 		let conn = db();
 		let parent = uuid(9);
 		add_file(&conn, uuid(1), stable(2), parent, "a.txt");
 
-		// Another file that took over the name, arriving with ids the cache has never held.
+		// Another file at the same name, arriving with ids the cache has never held.
 		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
 		item::upsert_file_item_with_stmts(
 			uuid(3),
@@ -2160,7 +2162,14 @@ mod change_tracking_tests {
 		.unwrap();
 		drop(stmt);
 
-		assert_eq!(retired(&conn), vec![(2, uuid(2))]);
+		// Both rows exist — id_of panics on a missing one.
+		id_of(&conn, uuid(1));
+		id_of(&conn, uuid(3));
+		assert_eq!(
+			retired(&conn),
+			[],
+			"no identity was stolen, so nothing is retired; the old row's fate belongs to the sweep"
+		);
 	}
 
 	/// A versioning-disabled edit lands as a re-minted uuid on an unchanged stable id. That is the
