@@ -8,7 +8,6 @@ use filen_sdk_rs::{
 	io::FilenMetaExt,
 };
 use futures::StreamExt;
-use image::ImageError;
 use tokio::sync::OwnedRwLockReadGuard;
 use tracing::debug;
 use uuid::Uuid;
@@ -94,27 +93,35 @@ impl AuthCacheState {
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
 			Err(e) => return Err(e.into()),
 		}
-		let image_file = match tokio::fs::File::open(&file_path).await {
-			Ok(file) => file,
+		// Bytes come through a microthumb ByteSource either way: the cached
+		// local file when one exists, the remote chunks directly otherwise.
+		// The remote source fetches lazily, so an embedded-preview hit costs
+		// one or two chunks of download — and thumbnail work no longer
+		// populates the file cache at all (a Files.app grid burst used to
+		// download every photo in full just to shrink it). The deliberate
+		// cost of that trade: browsing a folder and then OPENING a photo now
+		// downloads its bytes twice — once (partially) for the thumbnail,
+		// once in full for the open — where the old path had them cached.
+		// Do not "fix" this back without re-weighing the burst case.
+		let local_file = match tokio::fs::File::open(&file_path).await {
+			Ok(file) => Some(file),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				// The same bandwidth ceiling the download path enforced: the
+				// lazy source makes small and medium files cheap, this keeps
+				// enormous ones off the network entirely.
 				if file.size() > MAX_THUMBNAIL_SOURCE_BYTES {
 					debug!(
-						"File too large to download for a thumbnail ({} bytes): {}",
+						"File too large to thumbnail from the network ({} bytes): {}",
 						file.size(),
 						file_path.display()
 					);
 					return Ok(None);
 				}
 				debug!(
-					"Thumbnail file not found, downloading: {}",
+					"No cached bytes; thumbnailing off the remote chunks: {}",
 					file_path.display()
 				);
-				// Same serialisation the regular download path takes: without it a concurrent
-				// clear can evict what this download just wrote, and two downloads of one file
-				// interleave their writes into the same tmp path.
-				let _local_file_guard = self.lock_local_file(file.uuid()).await;
-				let path = self.download_file_io(file, None).await?;
-				tokio::fs::File::open(&path).await?
+				None
 			}
 			Err(e) => {
 				debug!(
@@ -148,10 +155,52 @@ impl AuthCacheState {
 			path: Some(tmp_path.clone()),
 		};
 
-		let (os_file, mut tmp_file) = futures::join!(image_file.into_std(), tmp_file.into_std());
+		let mut tmp_file = tmp_file.into_std().await;
 
-		let mime = file.mime().map(|m| m.to_string());
-		let size = file.size();
+		// A batch cancel aborts this future, but the blocking closure keeps
+		// running detached — detached network fetches on the remote path, a
+		// decode hogging the single gate permit on the local one. The guard
+		// flips the source's cancel flag when this future drops un-disarmed,
+		// and BOTH source kinds answer their next read with Interrupted,
+		// unwinding the orphaned decode at the same granularity an async
+		// decoder would get instead of letting it run to completion.
+		struct CancelOnDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+		impl Drop for CancelOnDrop {
+			fn drop(&mut self) {
+				if let Some(flag) = self.0.take() {
+					flag.store(true, std::sync::atomic::Ordering::Relaxed);
+				}
+			}
+		}
+		let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let mut cancel_guard = CancelOnDrop(Some(cancel.clone()));
+
+		let (source, mem_budget): (Box<dyn filen_sdk_rs::thumbnail::ByteSource>, usize) =
+			match local_file {
+				Some(local) => (
+					Box::new(
+						filen_sdk_rs::thumbnail::FileSource::with_cancel(
+							local.into_std().await,
+							Some(cancel),
+						)
+						.map_err(CacheError::from)?,
+					),
+					filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET,
+				),
+				None => (
+					Box::new(filen_sdk_rs::thumbnail::RemoteChunkSource::new(
+						self.client.clone(),
+						file.clone(),
+						tokio::runtime::Handle::current(),
+						Some(cancel),
+					)),
+					// The source's two resident chunk slots live outside the
+					// pipeline's own accounting; hand the decode what is
+					// actually left of the budget.
+					filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET
+						.saturating_sub(filen_sdk_rs::thumbnail::REMOTE_SOURCE_RESIDENT_BYTES),
+				),
+			};
 
 		// Decode buffers, not downloads, are the memory hazard — serialize decodes
 		// process-wide. Acquired before the blocking task is spawned, so parked work
@@ -167,19 +216,18 @@ impl AuthCacheState {
 		let decode_result = tokio::task::spawn_blocking(
 			move || -> Result<Option<(u32, u32)>, filen_sdk_rs::error::Error> {
 				let _decode_permit = decode_permit;
-				let image_reader = std::io::BufReader::new(os_file);
-				filen_sdk_rs::thumbnail::make_thumbnail(
-					mime.as_deref(),
-					size,
-					image_reader,
+				filen_sdk_rs::thumbnail::make_thumbnail_from_source(
+					source,
 					target_width,
 					target_height,
-					filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET,
+					mem_budget,
 					&mut tmp_file,
 				)
 			},
 		)
 		.await;
+		// The decode is over — nothing is left for a late drop to cancel.
+		cancel_guard.0 = None;
 
 		let decode_result = match decode_result {
 			Ok(result) => result,
@@ -198,13 +246,12 @@ impl AuthCacheState {
 				tmp_guard.disarm();
 				Ok(Some(thumbnail_path))
 			}
-			// The source exceeds the decode budget; there is no thumbnail to make.
+			// Over budget, refused, or undecodable bytes — the pipeline folds
+			// them all into the cacheable "no thumbnail" verdict; what reaches
+			// this arm as Err is transport/system trouble that must stay a
+			// retryable error.
 			Ok(None) => Ok(None),
-			Err(e) => match e.downcast::<ImageError>() {
-				Ok((ImageError::Unsupported(_), _)) => Ok(None),
-				Ok((e, context)) => Err(CacheError::from(e).context(context.join(": "))),
-				Err(e) => Err(CacheError::from(e)),
-			},
+			Err(e) => Err(CacheError::from(e)),
 		}
 	}
 

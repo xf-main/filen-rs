@@ -119,5 +119,9 @@ impl PreparedDecode for PreparedSimple {
 }
 
 fn decode_err(e: image::ImageError) -> ThumbError {
-	ThumbError::Decode(format!("{e}"))
+	// Io stays Io: transport trouble must not read as corrupt bytes.
+	match e {
+		image::ImageError::IoError(io) => ThumbError::Io(io),
+		other => ThumbError::Decode(format!("{other}")),
+	}
 }

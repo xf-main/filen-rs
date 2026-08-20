@@ -244,7 +244,11 @@ impl PreparedDecode for PreparedJpeg {
 }
 
 fn decode_err(e: jpeg_decoder::Error) -> ThumbError {
-	ThumbError::Decode(format!("jpeg: {e}"))
+	// Io stays Io: transport trouble must not read as corrupt bytes.
+	match e {
+		jpeg_decoder::Error::Io(io) => ThumbError::Io(io),
+		other => ThumbError::Decode(format!("jpeg: {other}")),
+	}
 }
 
 /// Converts one decoded frame to RGBA row by row and pushes it — the row

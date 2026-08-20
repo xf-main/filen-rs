@@ -26,6 +26,14 @@ fn err(msg: &str) -> ThumbError {
 	ThumbError::Decode(format!("tiff: {msg}"))
 }
 
+fn decode_err(e: tiff::TiffError) -> ThumbError {
+	// Io stays Io: transport trouble must not read as corrupt bytes.
+	match e {
+		tiff::TiffError::IoError(io) => ThumbError::Io(io),
+		other => err(&other.to_string()),
+	}
+}
+
 /// How much of the file the EXIF probe reads: enough for the IFD chain and a
 /// front-loaded thumbnail, bounded so a hostile offset cannot balloon it.
 const EXIF_PROBE_BYTES: usize = 256 * 1024;
@@ -115,13 +123,12 @@ impl FormatDecoder for Tiff {
 			));
 		}
 
-		let mut decoder =
-			tiff::decoder::Decoder::new(SeqReader::new(src)).map_err(|e| err(&e.to_string()))?;
-		let (width, height) = decoder.dimensions().map_err(|e| err(&e.to_string()))?;
+		let mut decoder = tiff::decoder::Decoder::new(SeqReader::new(src)).map_err(decode_err)?;
+		let (width, height) = decoder.dimensions().map_err(decode_err)?;
 		if width == 0 || height == 0 {
 			return Err(err("zero dimensions"));
 		}
-		let color = decoder.colortype().map_err(|e| err(&e.to_string()))?;
+		let color = decoder.colortype().map_err(decode_err)?;
 		let per_px = match color {
 			ColorType::Gray(8) | ColorType::Gray(16) => 1usize,
 			ColorType::GrayA(8) | ColorType::GrayA(16) => 2,
@@ -132,9 +139,9 @@ impl FormatDecoder for Tiff {
 		// Tiles and strips share the chunk API; only the count differs.
 		let tiled = decoder.get_tag_unsigned::<u64>(Tag::TileWidth).is_ok();
 		let chunk_count = if tiled {
-			decoder.tile_count().map_err(|e| err(&e.to_string()))?
+			decoder.tile_count().map_err(decode_err)?
 		} else {
-			decoder.strip_count().map_err(|e| err(&e.to_string()))?
+			decoder.strip_count().map_err(decode_err)?
 		};
 		let chunk_dims = decoder.chunk_dimensions();
 		if chunk_dims.0 == 0 || chunk_dims.1 == 0 || chunk_count == 0 {
@@ -208,10 +215,7 @@ impl PreparedDecode for PreparedTiff {
 			if x0 + data_w > width || y0 + data_h > height {
 				return Err(err("chunk exceeds the image bounds"));
 			}
-			let result = self
-				.decoder
-				.read_chunk(i)
-				.map_err(|e| err(&e.to_string()))?;
+			let result = self.decoder.read_chunk(i).map_err(decode_err)?;
 			let row_samples = data_w as usize * self.per_px;
 			match result {
 				tiff::decoder::DecodingResult::U8(data) => {

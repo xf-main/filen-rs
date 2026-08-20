@@ -113,7 +113,13 @@ impl PreparedDecode for PreparedPng {
 }
 
 fn decode_err(e: png::DecodingError) -> ThumbError {
-	ThumbError::Decode(format!("png: {e}"))
+	// The decoder wraps source io errors; unwrap them so transport trouble
+	// stays a retryable error instead of reading as corrupt bytes (which the
+	// caller caches as a permanent "no thumbnail" verdict).
+	match e {
+		png::DecodingError::IoError(io) => ThumbError::Io(io),
+		other => ThumbError::Decode(format!("png: {other}")),
+	}
 }
 
 /// After `normalize_to_color8` the row is 8-bit in one of these layouts.

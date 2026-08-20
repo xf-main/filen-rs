@@ -176,7 +176,8 @@ mod bounded {
 	use super::*;
 
 	pub use microthumb::DEFAULT_MEM_BUDGET as DEFAULT_THUMBNAIL_MEM_BUDGET;
-	use microthumb::{ByteSource, ThumbError, ThumbSpec};
+	pub use microthumb::{ByteSource, FileSource};
+	use microthumb::{ThumbError, ThumbSpec};
 
 	/// [`microthumb::ByteSource`] over any `BufRead + Seek` — the local-file
 	/// path. `len` is the caller-declared size; reads past it answer 0.
@@ -199,12 +200,11 @@ mod bounded {
 		}
 	}
 
-	fn thumb_error(e: ThumbError) -> Error {
-		match e {
-			ThumbError::Io(e) => e.into(),
-			other => Error::custom(ErrorKind::ImageError, other.to_string()),
-		}
-	}
+	/// Resident bytes a [`RemoteChunkSource`] keeps for the whole decode (its
+	/// two chunk slots) — callers subtract this from the budget they hand
+	/// [`make_thumbnail_from_source`], because the pipeline's own accounting
+	/// cannot see the source's memory.
+	pub const REMOTE_SOURCE_RESIDENT_BYTES: usize = 2 * crate::consts::CHUNK_SIZE_U64 as usize;
 
 	/// Encodes a `target_width`×`target_height` webp thumbnail of `image_reader`
 	/// into `out` without ever materialising a full decoded frame: microthumb
@@ -232,14 +232,47 @@ mod bounded {
 			inner: image_reader,
 			len: image_file_size,
 		};
+		make_thumbnail_from_source(
+			Box::new(source),
+			target_width,
+			target_height,
+			mem_budget,
+			out,
+		)
+	}
+
+	/// [`make_thumbnail`] for callers that already hold a [`ByteSource`] —
+	/// notably [`RemoteChunkSource`], where lazy chunk fetches mean an
+	/// embedded-preview hit never downloads the rest of the file.
+	pub fn make_thumbnail_from_source<W>(
+		source: Box<dyn ByteSource>,
+		target_width: u32,
+		target_height: u32,
+		mem_budget: usize,
+		out: &mut W,
+	) -> Result<Option<(u32, u32)>, Error>
+	where
+		W: Write,
+	{
 		let spec = ThumbSpec {
 			target_width,
 			target_height,
 			mem_budget,
 		};
-		let Some(small) = microthumb::generate(Box::new(source), &spec).map_err(thumb_error)?
-		else {
-			return Ok(None);
+		let small = match microthumb::generate(source, &spec) {
+			Ok(Some(small)) => small,
+			Ok(None) => return Ok(None),
+			// Corrupt or refused bytes are the same cacheable "no thumbnail"
+			// verdict the sniff gives unsupported formats — parity with the
+			// old image-crate path, whose Unsupported errors the mobile layer
+			// mapped to NoThumbnail. Only transport/system errors stay hard:
+			// an offline blip must never stick a permanent "no thumbnail"
+			// verdict in the platform's cache.
+			Err(e @ (ThumbError::Decode(_) | ThumbError::Geometry)) => {
+				tracing::debug!("thumbnail decode refused: {e}");
+				return Ok(None);
+			}
+			Err(ThumbError::Io(e)) => return Err(e.into()),
 		};
 		let Some(rgba) = image::RgbaImage::from_vec(small.width, small.height, small.rgba) else {
 			return Err(Error::custom(
@@ -262,9 +295,11 @@ mod bounded {
 	/// contract (microthumb runs inside `spawn_blocking`); each miss bridges to
 	/// the async chunk fetch via `Handle::block_on`, which is legal there.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub struct RemoteChunkSource<'a> {
-		client: &'a crate::auth::unauth::UnauthClient,
-		file: &'a dyn crate::fs::file::traits::File,
+	pub struct RemoteChunkSource {
+		// Owned, so the source can move into the `spawn_blocking` closure the
+		// pipeline runs in.
+		client: std::sync::Arc<crate::auth::Client>,
+		file: crate::fs::file::RemoteFile,
 		handle: tokio::runtime::Handle,
 		/// Checked before every fetch: cancellation surfaces as
 		/// `ErrorKind::Interrupted`, which unwinds the decode through its normal
@@ -277,34 +312,32 @@ mod bounded {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	impl<'a> RemoteChunkSource<'a> {
+	impl RemoteChunkSource {
 		pub fn new(
-			client: &'a crate::auth::unauth::UnauthClient,
-			file: &'a dyn crate::fs::file::traits::File,
+			client: std::sync::Arc<crate::auth::Client>,
+			file: crate::fs::file::RemoteFile,
 			handle: tokio::runtime::Handle,
 			cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 		) -> Self {
+			let len = file.size();
 			RemoteChunkSource {
 				client,
 				file,
 				handle,
 				cancel,
-				len: file.size(),
+				len,
 				slots: [None, None],
 				next_evict: 0,
 			}
 		}
 
 		fn chunk(&mut self, index: u64) -> std::io::Result<&Vec<u8>> {
-			// Two fixed slots instead of a map: header + payload locality is all
-			// the demuxers need, and eviction keeps the source at ≤2 MiB.
-			if let Some(slot) = self
-				.slots
-				.iter()
-				.position(|s| s.as_ref().is_some_and(|(i, _)| *i == index))
-			{
-				return Ok(&self.slots[slot].as_ref().expect("just matched").1);
-			}
+			// Checked on EVERY read, cache hit included. Gating this on the
+			// fetch instead would mean a decode whose remaining reads all land
+			// in the two resident slots — anything under ~2 MiB once warm —
+			// never notices the cancel and runs to completion, while the caller
+			// documents both source kinds as answering their next read with
+			// Interrupted.
 			if self
 				.cancel
 				.as_ref()
@@ -315,17 +348,27 @@ mod bounded {
 					"thumbnail cancelled",
 				));
 			}
+			// Two fixed slots instead of a map: header + payload locality is all
+			// the demuxers need, and eviction keeps the source at ≤2 MiB.
+			if let Some(slot) = self
+				.slots
+				.iter()
+				.position(|s| s.as_ref().is_some_and(|(i, _)| *i == index))
+			{
+				return Ok(&self.slots[slot].as_ref().expect("just matched").1);
+			}
 			let start = index * crate::consts::CHUNK_SIZE_U64;
 			let end = (start + crate::consts::CHUNK_SIZE_U64).min(self.len);
-			let (client, file) = (self.client, self.file);
+			let (client, file) = (&self.client, &self.file);
 			let data = self
 				.handle
 				.block_on(async move {
 					use futures::AsyncReadExt;
-					let mut reader = crate::fs::file::read::FileReaderBuilder::new(client, file)
-						.with_start(start)
-						.with_end(end)
-						.build();
+					let mut reader =
+						crate::fs::file::read::FileReaderBuilder::new(client.unauthed(), file)
+							.with_start(start)
+							.with_end(end)
+							.build();
 					let mut data = Vec::with_capacity((end - start) as usize);
 					reader.read_to_end(&mut data).await?;
 					Ok::<_, Error>(data)
@@ -339,7 +382,7 @@ mod bounded {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	impl ByteSource for RemoteChunkSource<'_> {
+	impl ByteSource for RemoteChunkSource {
 		fn len(&self) -> u64 {
 			self.len
 		}
@@ -363,7 +406,10 @@ mod bounded {
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub use bounded::{DEFAULT_THUMBNAIL_MEM_BUDGET, RemoteChunkSource, make_thumbnail};
+pub use bounded::{
+	ByteSource, DEFAULT_THUMBNAIL_MEM_BUDGET, FileSource, REMOTE_SOURCE_RESIDENT_BYTES,
+	RemoteChunkSource, make_thumbnail, make_thumbnail_from_source,
+};
 
 #[cfg(test)]
 mod tests {
@@ -440,5 +486,123 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(result, Some((16, 16)));
+	}
+
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+	/// A [`super::ByteSource`] with [`super::RemoteChunkSource`]'s observable
+	/// behavior, minus the network: short reads at every chunk boundary, and a
+	/// cancel flag answered with `Interrupted` — optionally flipped by the
+	/// source itself after N reads, standing in for a batch cancel landing
+	/// mid-decode.
+	struct ChunkySource {
+		data: Vec<u8>,
+		chunk: usize,
+		cancel: Arc<AtomicBool>,
+		cancel_after_reads: Option<usize>,
+		reads: AtomicUsize,
+	}
+
+	impl super::ByteSource for ChunkySource {
+		fn len(&self) -> u64 {
+			self.data.len() as u64
+		}
+
+		fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+			let reads = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+			if self
+				.cancel_after_reads
+				.is_some_and(|threshold| reads > threshold)
+			{
+				self.cancel.store(true, Ordering::Relaxed);
+			}
+			if self.cancel.load(Ordering::Relaxed) {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::Interrupted,
+					"thumbnail cancelled",
+				));
+			}
+			let Ok(offset) = usize::try_from(offset) else {
+				return Ok(0);
+			};
+			if offset >= self.data.len() {
+				return Ok(0);
+			}
+			let to_boundary = self.chunk - (offset % self.chunk);
+			let n = buf.len().min(to_boundary).min(self.data.len() - offset);
+			buf[..n].copy_from_slice(&self.data[offset..offset + n]);
+			Ok(n)
+		}
+	}
+
+	#[test]
+	fn short_reads_at_chunk_boundaries_still_thumbnail() {
+		// A 1 KiB chunk size forces hundreds of boundary-shortened reads
+		// through the same read_at contract RemoteChunkSource answers with.
+		let source = ChunkySource {
+			data: png_bytes(300, 200),
+			chunk: 1024,
+			cancel: Arc::new(AtomicBool::new(false)),
+			cancel_after_reads: None,
+			reads: AtomicUsize::new(0),
+		};
+		let mut out = Vec::new();
+		let result = super::make_thumbnail_from_source(
+			Box::new(source),
+			32,
+			32,
+			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
+			&mut out,
+		)
+		.unwrap();
+		assert_eq!(result, Some((32, 32)));
+		assert!(!out.is_empty());
+	}
+
+	#[test]
+	fn a_cancel_mid_decode_is_a_hard_error_not_a_cached_verdict() {
+		// The flag flips after the header reads succeed, the way a batch
+		// cancel lands mid-decode. Interrupted must surface as Err — never as
+		// Ok(None), which the platform would cache as "no thumbnail" forever.
+		let source = ChunkySource {
+			data: png_bytes(300, 200),
+			chunk: 1024,
+			cancel: Arc::new(AtomicBool::new(false)),
+			cancel_after_reads: Some(3),
+			reads: AtomicUsize::new(0),
+		};
+		let mut out = Vec::new();
+		let result = super::make_thumbnail_from_source(
+			Box::new(source),
+			32,
+			32,
+			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
+			&mut out,
+		);
+		assert!(result.is_err(), "expected a hard error, got {result:?}");
+	}
+
+	#[test]
+	fn corrupt_bytes_are_the_cacheable_no_thumbnail_verdict() {
+		// Sniffable as JPEG, undecodable past the marker: the same cacheable
+		// None the sniff gives unsupported formats — not an error the caller
+		// retries forever.
+		let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+		bytes.extend_from_slice(&[0x00; 64]);
+		let len = bytes.len() as u64;
+		let mut out = Vec::new();
+		let result = make_thumbnail(
+			Some("image/jpeg"),
+			len,
+			Cursor::new(bytes),
+			32,
+			32,
+			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
+			&mut out,
+		)
+		.unwrap();
+		assert_eq!(result, None);
+		assert!(out.is_empty());
 	}
 }
