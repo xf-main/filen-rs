@@ -1114,6 +1114,7 @@ fn finalize_resync_drops_a_server_deleted_root() {
 			per_root_raw: Vec::new(),
 			file_root_heads: Vec::new(),
 			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
 			deleted_roots: vec![b.uuid],
 			any_transient: false,
 			remote_under_lock: 100,
@@ -1164,6 +1165,7 @@ fn finalize_resync_all_transient_failure_preserves_watermark_and_flag() {
 			per_root_raw: Vec::new(),
 			file_root_heads: Vec::new(),
 			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
 			deleted_roots: Vec::new(),
 			any_transient: true,
 			remote_under_lock: 100,
@@ -3209,6 +3211,68 @@ fn a_live_file_root_head_still_applies_as_a_change() {
 	assert!(
 		seen[1].contains("Changed"),
 		"the live head is a change, not a trash: {seen:?}"
+	);
+}
+
+/// A lineage whose uuid was re-minted while the engine was not listening (an offline edit on a
+/// versioning-disabled account) sits cached under its PREDECESSOR uuid. A live head applied keyed
+/// only on its own (new) uuid would insert a second row next to the stale one — a duplicate the
+/// resync itself created, with the stale row still served by search. The predecessor must be
+/// superseded, exactly as the socket path's `Trashed { new_uuid: Some }` arm does.
+#[test]
+fn a_live_head_supersedes_the_lineages_cached_predecessor_row() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (_seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	// The same lineage, re-minted under a new uuid with new content.
+	let mut edited = cache_file(11, state.root_uuid, 107);
+	edited.stable_uuid = file.stable_uuid;
+	state
+		.apply_file_root_heads(vec![head_of(&edited, ParentUuid::Uuid(state.root_uuid))])
+		.unwrap();
+
+	assert!(
+		!item_exists(&state, file.uuid),
+		"the predecessor row is superseded, not left behind as a stale duplicate"
+	);
+	assert!(item_exists(&state, edited.uuid), "the head's row is cached");
+	assert_eq!(
+		state.uuids_of_stable(file.stable_uuid).unwrap(),
+		vec![edited.uuid],
+		"one row per lineage"
+	);
+}
+
+/// The trashed variant of the same offline re-mint: the head names the re-minted uuid, the cache
+/// still holds the predecessor. A delete keyed only on the head's uuid no-ops past the cached row
+/// and the trashed lineage keeps being served as live.
+#[test]
+fn a_trashed_head_removes_the_lineages_predecessor_rows_too() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (_seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	let mut trashed = cache_file(11, state.root_uuid, 100);
+	trashed.stable_uuid = file.stable_uuid;
+	state
+		.apply_file_root_heads(vec![head_of(&trashed, ParentUuid::Trash(state.root_uuid))])
+		.unwrap();
+
+	assert!(
+		!item_exists(&state, file.uuid),
+		"the predecessor row is gone — a trashed lineage must not be served live"
+	);
+	assert_eq!(
+		state.uuids_of_stable(file.stable_uuid).unwrap(),
+		Vec::<Uuid>::new(),
+		"no row of the lineage survives its trash"
 	);
 }
 

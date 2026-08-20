@@ -175,6 +175,18 @@ impl CacheState {
 		Ok(())
 	}
 
+	/// Clear the durable `needs_resync` flag OUTSIDE a watermark commit. Only for a caller that set
+	/// the flag itself to cover its own targeted work and completed all of it (the worker is
+	/// single-threaded, so nothing can have flagged a new gap in between); a full resync clears the
+	/// flag atomically with its watermark advance in `commit_resync_watermark` instead.
+	pub(crate) fn clear_needs_resync(&self) -> Result<(), Box<CacheError>> {
+		self.db
+			.prepare_cached(super::statements::CACHE_META_SET)
+			.and_then(|mut stmt| stmt.execute(params![super::statements::NEEDS_RESYNC_KEY, 0_i64]))
+			.map_err(|e| db_err(e, "clearing needs_resync"))?;
+		Ok(())
+	}
+
 	/// Whether a resync has been durably requested. Read by both the per-drain `maybe_run_resync` and the
 	/// startup gap-check; cleared atomically with the watermark advance in [`commit_resync_synthetics`].
 	pub(crate) fn needs_resync(&self) -> Result<bool, Box<CacheError>> {

@@ -144,8 +144,11 @@ struct ResyncListing {
 	deleted_file_roots: Vec<StableUuid>,
 	/// Roots the server reported definitively gone — `finalize_resync` evicts their subtrees.
 	deleted_roots: Vec<Uuid>,
-	/// At least one root failed with a transient (non-not-found) error this pass.
+	/// At least one DIR root failed with a transient (non-not-found) error this pass.
 	any_transient: bool,
+	/// FILE lineages whose head fetch failed transiently; folded into the failure ledger by
+	/// `finalize_resync` (the island that builds this has no `&mut self`).
+	file_transient: Vec<StableUuid>,
 	/// The drive snapshot id read under the lock; the watermark advances to it on a clean apply.
 	remote_under_lock: u64,
 }
@@ -153,9 +156,20 @@ struct ResyncListing {
 /// The outcome of one pass of per-lineage head fetches: the heads that resolved, and the lineages
 /// the server reported definitively gone. Everything else was skipped (see
 /// [`fetch_file_root_heads`](CacheState::fetch_file_root_heads)).
+/// How many consecutive transient head-fetch failures a lineage may contribute to
+/// `needs_resync` before it is quarantined; see `note_head_fetch_round`.
+const MAX_HEAD_FETCH_TRANSIENT_RETRIES: u32 = 3;
+
 struct FileRootHeads {
 	heads: Vec<RemoteFile>,
 	deleted: Vec<StableUuid>,
+	/// Lineages whose fetch failed with a NON-not-found (network/server) error and were
+	/// skipped. Callers fold these into the per-lineage failure ledger
+	/// ([`CacheState::note_head_fetch_round`]): a bounded number of consecutive failures keeps
+	/// `needs_resync` set so a later pass re-fetches the lineage (its offline-window change has
+	/// no listing diff to re-detect it), while a lineage that keeps failing is quarantined so it
+	/// cannot wedge the engine in an endless every-head resync loop.
+	transient: Vec<StableUuid>,
 }
 
 pub(crate) struct CacheState {
@@ -190,6 +204,10 @@ pub(crate) struct CacheState {
 	/// The stable → current-uuid mapping is NOT duplicated here: `files.stable_uuid` already
 	/// carries it (see `uuids_of_stable` / `stable_of_uuid`).
 	file_roots: HashMap<StableUuid, RootRegistrations>,
+	/// Consecutive head-fetch failures per tracked lineage; see
+	/// [`note_head_fetch_round`](Self::note_head_fetch_round). Cleared by a successful
+	/// fetch, a definitive not-found, or a fresh registration.
+	head_fetch_failures: HashMap<StableUuid, u32>,
 	/// Client + runtime handle for the write-locked resync island. `None` in unit tests.
 	resync: Option<ResyncDeps>,
 	/// Deadline of the one-shot retry timer armed by a NON-converged resync attempt (lock
@@ -244,6 +262,7 @@ impl CacheState {
 			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			file_roots: HashMap::new(),
+			head_fetch_failures: HashMap::new(),
 			resync: None,
 			resync_retry: None,
 			read_tasks: None,
@@ -280,6 +299,7 @@ impl CacheState {
 			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			file_roots: HashMap::new(),
+			head_fetch_failures: HashMap::new(),
 			resync: None,
 			resync_retry: None,
 			read_tasks: None,
@@ -314,6 +334,7 @@ impl CacheState {
 			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			file_roots: HashMap::new(),
+			head_fetch_failures: HashMap::new(),
 			resync: None,
 			resync_retry: None,
 			read_tasks: None,
@@ -550,6 +571,7 @@ impl CacheState {
 			// Starts EMPTY (nothing cached); registrations arrive via `AddSyncRoot` control messages.
 			sync_roots: HashMap::new(),
 			file_roots: HashMap::new(),
+			head_fetch_failures: HashMap::new(),
 			resync: Some(ResyncDeps { client }),
 			resync_retry: None,
 			read_tasks: Some(read_task_receiver),
@@ -1357,32 +1379,73 @@ impl CacheState {
 		self.db
 			.execute_batch("BEGIN")
 			.map_err(|e| db_err(e, "begin file-root refresh"))?;
-		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
-		let events = trashed
-			.into_iter()
-			.map(|head| {
-				CacheEventType::File(FileEvent::Trashed {
-					uuid: head.uuid,
+		// Rolls the open transaction back, durably flags a resync, and PROPAGATES: returning `Ok`
+		// here would let a caller's watermark commit atomically clear the flag this failure just
+		// set, erasing the retry. The mark stays as a belt for callers that never reach a commit.
+		macro_rules! abort_refresh {
+			($err:expr) => {{
+				let _ = self.db.execute_batch("ROLLBACK");
+				self.mark_needs_resync_surfacing_errors();
+				return Err($err);
+			}};
+		}
+		// Resolve each lineage's CACHED uuids first: a uuid re-minted while we were not listening
+		// (an edit on a versioning-disabled account) leaves the cache holding the lineage under
+		// one or more PREDECESSOR uuids. Applied keyed only on the head's uuid, a live head would
+		// insert a duplicate row next to the stale one, and a trashed head's delete would no-op
+		// past it — the trashed lineage kept being served as live. Mirror the socket path:
+		// supersede predecessors into the live head's uuid before applying it, and trash every
+		// cached predecessor alongside a trashed head.
+		let mut events: Vec<CacheEventType> = Vec::new();
+		for head in trashed {
+			let mut uuids = match self.uuids_of_stable(head.stable_uuid) {
+				Ok(uuids) => uuids,
+				Err(e) => abort_refresh!(db_err(e, "resolving a trashed head's cached rows")),
+			};
+			if !uuids.contains(&head.uuid) {
+				uuids.push(head.uuid);
+			}
+			for uuid in uuids {
+				events.push(CacheEventType::File(FileEvent::Trashed {
+					uuid,
 					stable_uuid: head.stable_uuid,
 					new_uuid: None,
-				})
-			})
-			.chain(
-				files
-					.into_iter()
-					.map(|file| CacheEventType::File(FileEvent::Changed(file))),
-			);
+				}));
+			}
+		}
+		for file in files {
+			let cached = match self.uuids_of_stable(file.stable_uuid) {
+				Ok(cached) => cached,
+				Err(e) => abort_refresh!(db_err(e, "resolving a live head's cached rows")),
+			};
+			for stale in cached
+				.into_iter()
+				.filter(|cached_uuid| *cached_uuid != file.uuid)
+			{
+				if let Err(e) = self.supersede_file_uuid(stale, file.uuid) {
+					abort_refresh!(db_err(e, "superseding a tracked lineage's predecessor row"));
+				}
+			}
+			events.push(CacheEventType::File(FileEvent::Changed(file)));
+		}
+		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
 		for event in events {
 			let event = CacheEvent { id: None, event };
 			let event_for_dispatch = Arc::new(event.clone());
 			// Cheap for the `Changed` heads (no pre-snapshot target → no query); the `Trashed` ones
 			// need it to reach the dir root the file is being removed from.
 			let pre = self.pre_snapshot(&event.event);
-			if let Err(errors) = self.apply_event(event.event, EventTrust::TrustedSynthetic) {
-				let _ = self.db.execute_batch("ROLLBACK");
+			if let Err(mut errors) = self.apply_event(event.event, EventTrust::TrustedSynthetic) {
+				let first = errors.pop();
 				self.surface_errors(errors);
-				self.mark_needs_resync_surfacing_errors();
-				return Ok(());
+				match first {
+					Some(first) => abort_refresh!(Box::new(first)),
+					// `apply_event` never errors with an empty vec; guard anyway.
+					None => abort_refresh!(db_err(
+						rusqlite::Error::InvalidQuery,
+						"file-root head apply failed without a cause"
+					)),
+				}
 			}
 			let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre);
 			if !owners.is_empty() {
@@ -1405,9 +1468,10 @@ impl CacheState {
 	///   a permanently-deleted lineage and one that never existed) → the lineage is gone for good,
 	///   so it is reaped, mirroring what `deleted_roots` does for a dir root. A TRASHED lineage is
 	///   NOT this case: the endpoint still returns its head;
-	/// - anything else → logged and SKIPPED, not counted transient: file roots are kept fresh by
-	///   socket events, and letting one unreachable lineage hold back the watermark would wedge the
-	///   engine in a permanent resync-retry loop.
+	/// - anything else → logged, SKIPPED, and counted TRANSIENT: the caller keeps `needs_resync`
+	///   set (the watermark still advances, so the gap-check never wedges on it) and the
+	///   drain-paced retry re-fetches the lineage instead of silently dropping whatever
+	///   offline-window change it carried.
 	async fn fetch_file_root_heads(
 		client: &Arc<Client>,
 		file_roots: &[StableUuid],
@@ -1420,6 +1484,7 @@ impl CacheState {
 		let mut fetched = FileRootHeads {
 			heads: Vec::with_capacity(file_roots.len()),
 			deleted: Vec::new(),
+			transient: Vec::new(),
 		};
 		let mut results =
 			futures::stream::iter(file_roots.iter().map(|stable| async move {
@@ -1435,6 +1500,7 @@ impl CacheState {
 				}
 				Err(e) => {
 					tracing::debug!("resync: skipping file root {stable} (fetch failed: {e})");
+					fetched.transient.push(stable);
 				}
 			}
 		}
@@ -1493,6 +1559,41 @@ impl CacheState {
 		}
 	}
 
+	/// Folds one head-fetch round into the per-lineage failure ledger and answers whether the
+	/// round counts as TRANSIENT (keep `needs_resync` set / the retry armed). Successes and
+	/// definitive not-founds clear their lineage. A lineage failing past the cap is QUARANTINED
+	/// — logged once, and no longer allowed to hold the flag hostage: `needs_resync` re-runs a
+	/// FULL every-head pass on every drain, so one persistently erroring lineage (a 5xx, a
+	/// deserialization failure) would otherwise wedge the engine in an endless resync loop. A
+	/// later successful fetch, or re-registering the lineage, lifts the quarantine.
+	fn note_head_fetch_round(
+		&mut self,
+		ok: &[RemoteFile],
+		deleted: &[StableUuid],
+		transient: &[StableUuid],
+	) -> bool {
+		for file in ok {
+			self.head_fetch_failures.remove(&file.stable_uuid);
+		}
+		for stable in deleted {
+			self.head_fetch_failures.remove(stable);
+		}
+		let mut any_transient = false;
+		for stable in transient {
+			let count = self.head_fetch_failures.entry(*stable).or_insert(0);
+			*count += 1;
+			if *count <= MAX_HEAD_FETCH_TRANSIENT_RETRIES {
+				any_transient = true;
+			} else if *count == MAX_HEAD_FETCH_TRANSIENT_RETRIES + 1 {
+				tracing::warn!(
+					"file root {stable} failed {count} consecutive head fetches; quarantining \
+					 it from the resync-retry loop until a fetch succeeds"
+				);
+			}
+		}
+		any_transient
+	}
+
 	/// Record the durable `needs_resync` flag; if even that write fails, surface it best-effort (the
 	/// next session's startup gap-check is the backstop). The bare `if let Err(e) = mark_needs_resync()
 	/// { surface_errors(vec![*e]) }` shape recurs across the drain/resync paths; this names it.
@@ -1543,7 +1644,8 @@ impl CacheState {
 	/// Returns `true` if a `Shutdown` was encountered (the caller drains and exits; messages queued
 	/// behind the Shutdown are intentionally not processed).
 	async fn process_control_burst(&mut self, first: CacheControlMessage) -> bool {
-		let mut added_new_root = false;
+		let mut added_new_dir_root = false;
+		let mut new_file_roots: Vec<StableUuid> = Vec::new();
 		let mut message = Some(first);
 		while let Some(msg) = message {
 			match msg {
@@ -1553,17 +1655,18 @@ impl CacheState {
 					registration_id,
 					callback,
 					ack,
-				} => {
-					added_new_root |= match key {
-						RootKey::Dir(uuid) => {
-							self.handle_add_sync_root(uuid, registration_id, callback, ack)
-								.await
+				} => match key {
+					RootKey::Dir(uuid) => {
+						added_new_dir_root |= self
+							.handle_add_sync_root(uuid, registration_id, callback, ack)
+							.await;
+					}
+					RootKey::File(stable) => {
+						if self.handle_add_file_sync_root(stable, registration_id, callback, ack) {
+							new_file_roots.push(stable);
 						}
-						RootKey::File(stable) => {
-							self.handle_add_file_sync_root(stable, registration_id, callback, ack)
-						}
-					};
-				}
+					}
+				},
 				CacheControlMessage::RemoveRegistration {
 					key,
 					registration_id,
@@ -1576,7 +1679,7 @@ impl CacheState {
 			}
 			message = self.control_receiver.try_recv();
 		}
-		if added_new_root {
+		if added_new_dir_root {
 			// Durably schedule the convergence FIRST: the adds were already acked Ok, and a
 			// transient resync failure returns Ok after only a log — without the flag the new
 			// root(s) would silently stay unpopulated for the session (live events for them are
@@ -1587,11 +1690,91 @@ impl CacheState {
 			// every root. Resyncing only the new roots could advance the watermark past a pending gap
 			// in an existing root and clear `needs_resync`, masking it. Redundant listings of
 			// already-current roots are accepted in v1; a per-root-bookmark skip is a future
-			// optimization.
+			// optimization. (The full pass also covers `new_file_roots`, so no separate populate.)
 			tracing::debug!("sync root(s) added; resyncing to populate");
 			self.run_resync_surfacing_errors().await;
+		} else if !new_file_roots.is_empty() {
+			self.populate_new_file_roots(new_file_roots).await;
 		}
 		false
+	}
+
+	/// Populate ONLY a burst's newly-tracked file lineages: one head fetch per NEW lineage,
+	/// applied exactly like a resync's heads. Running the full `run_resync` here fetched the head
+	/// of EVERY registered file root, making each registration burst cost O(N) requests — with a
+	/// ~1000-file materialised working set, every thumbnail- or download-driven add re-fetched all
+	/// ~1000 heads through the shared rate budget, back-to-back for as long as the user browsed. A
+	/// file lineage's whole state is its single head record, so fetching just the new ones
+	/// populates them without touching anything else — and the watermark is deliberately left
+	/// alone: nothing here reconciles a gap, so nothing may advance past one. Gap-heal and shed
+	/// resyncs still take the full every-root pass via `run_resync`.
+	async fn populate_new_file_roots(&mut self, new_file_roots: Vec<StableUuid>) {
+		let Some(deps) = self.resync.clone() else {
+			tracing::warn!(
+				"file-root populate requested but client/runtime deps are absent (test construction?); skipping"
+			);
+			return;
+		};
+		// The burst snapshot can outlive the registrations it named: a same-burst remove (or an
+		// eviction racing the burst) must not have its head re-fetched and re-upserted through
+		// the TrustedSynthetic membership bypass.
+		let new_file_roots: Vec<StableUuid> = new_file_roots
+			.into_iter()
+			.filter(|stable| self.file_roots.contains_key(stable))
+			.collect();
+		if new_file_roots.is_empty() {
+			return;
+		}
+		// A durable resync is already pending: run the FULL pass instead — it heals the flagged
+		// gap AND populates the adds in one go, while a targeted populate that cleared the flag
+		// afterwards would mask the gap.
+		match self.needs_resync() {
+			Ok(true) => {
+				tracing::debug!(
+					"file root(s) added with a resync already pending; running the full pass"
+				);
+				self.run_resync_surfacing_errors().await;
+				return;
+			}
+			Ok(false) => {}
+			// FAIL OPEN like the gap-check: an unreadable flag must not let the success path
+			// below clear a durable request it never observed.
+			Err(e) => {
+				self.surface_one(e);
+				self.run_resync_surfacing_errors().await;
+				return;
+			}
+		}
+		// Durably cover the populate FIRST, exactly like the full pass: the adds were already
+		// acked Ok, so a crash or transient failure below must leave a flag that re-drives the
+		// work — without it the new lineages would silently stay unpopulated for the session.
+		self.mark_needs_resync_surfacing_errors();
+		tracing::debug!(
+			"file root(s) added; fetching {} new head(s)",
+			new_file_roots.len()
+		);
+		let heads = Self::fetch_file_root_heads(&deps.client, &new_file_roots).await;
+		let any_transient =
+			self.note_head_fetch_round(&heads.heads, &heads.deleted, &heads.transient);
+		self.reap_deleted_file_roots(heads.deleted);
+		let applied = match self.apply_file_root_heads(heads.heads) {
+			Ok(()) => true,
+			Err(e) => {
+				self.surface_one(e);
+				false
+			}
+		};
+		if applied && !any_transient {
+			// The worker is single-threaded: nothing between the cover mark above and here can
+			// have flagged a real gap, so clearing only un-does that mark.
+			if let Err(e) = self.clear_needs_resync() {
+				self.surface_one(e);
+			}
+		} else {
+			// Leave the flag set — the drain-paced `maybe_run_resync` (or the retry timer on a
+			// quiet account) re-runs the full pass, which re-fetches these lineages too.
+			self.arm_resync_retry();
+		}
 	}
 
 	/// Handle `AddSyncRoot`: register `(registration_id, callback)` for `uuid`, validating the
@@ -1708,6 +1891,9 @@ impl CacheState {
 			None => {
 				self.file_roots
 					.insert(stable_uuid, vec![(registration_id, callback)]);
+				// A fresh registration is fresh interest: lift any quarantine so the populate
+				// gets its full retry budget.
+				self.head_fetch_failures.remove(&stable_uuid);
 				true
 			}
 		};
@@ -1806,6 +1992,8 @@ impl CacheState {
 			return Ok(false);
 		}
 		self.file_roots.remove(&stable_uuid);
+		// The failure ledger entry goes with the registration, or it leaks forever.
+		self.head_fetch_failures.remove(&stable_uuid);
 		if !evict {
 			return Ok(false);
 		}
@@ -2223,12 +2411,18 @@ impl CacheState {
 			let converged = match deps.client.get_last_event_ids().await {
 				Ok(ids) => {
 					let heads = Self::fetch_file_root_heads(&deps.client, &file_roots).await;
+					// A transiently-skipped head keeps `needs_resync` SET through the commit
+					// (`mark_resync`) while the watermark still advances, so the drain-paced
+					// retry re-fetches the skipped lineage instead of dropping its
+					// offline-window change on the floor — bounded per lineage by the ledger.
+					let any_transient =
+						self.note_head_fetch_round(&heads.heads, &heads.deleted, &heads.transient);
 					self.reap_deleted_file_roots(heads.deleted);
 					match self
 						.apply_file_root_heads(heads.heads)
-						.and_then(|()| self.commit_resync_watermark(ids.drive, false))
+						.and_then(|()| self.commit_resync_watermark(ids.drive, any_transient))
 					{
-						Ok(()) => true,
+						Ok(()) => !any_transient,
 						Err(e) => {
 							// The head apply or the watermark write failed; keep the durable flag
 							// set (best-effort — it is the same DB) so the armed retry actually
@@ -2432,6 +2626,11 @@ impl CacheState {
 				deleted_file_roots: file_heads.deleted,
 				deleted_roots,
 				any_transient,
+				// A transiently-skipped file-root head keeps `needs_resync` set exactly like a
+				// transiently-skipped dir root: its offline-window change has no listing diff to
+				// re-detect it, so only the durable flag brings the retry. Folded into the
+				// bounded per-lineage ledger in `finalize_resync`.
+				file_transient: file_heads.transient,
 				remote_under_lock,
 			})
 		};
@@ -2516,8 +2715,11 @@ impl CacheState {
 			deleted_file_roots,
 			deleted_roots,
 			any_transient,
+			file_transient,
 			remote_under_lock,
 		} = listing;
+		let any_transient = any_transient
+			| self.note_head_fetch_round(&file_root_heads, &deleted_file_roots, &file_transient);
 		// Same rule as `deleted_roots`, for lineages: a not-found is definitive, so reap
 		// unconditionally and before the commit decision below.
 		self.reap_deleted_file_roots(deleted_file_roots);
