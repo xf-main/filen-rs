@@ -555,7 +555,13 @@ pub(crate) trait DBDirTrait: Sync + Send {
 
 pub(crate) trait DBDirExt {
 	fn update_dir_last_listed_now(&mut self, conn: &Connection) -> Result<()>;
-	fn update_children<I, I1>(&mut self, conn: &mut Connection, dirs: I, files: I1) -> Result<()>
+	fn update_children<I, I1>(
+		&mut self,
+		conn: &mut Connection,
+		dirs: I,
+		files: I1,
+		spare: &[Uuid],
+	) -> Result<()>
 	where
 		I: IntoIterator<Item = RemoteDirectory>,
 		I1: IntoIterator<Item = RemoteFile>;
@@ -586,12 +592,18 @@ where
 		Ok(())
 	}
 
-	fn update_children<I, I1>(&mut self, conn: &mut Connection, dirs: I, files: I1) -> Result<()>
+	fn update_children<I, I1>(
+		&mut self,
+		conn: &mut Connection,
+		dirs: I,
+		files: I1,
+		spare: &[Uuid],
+	) -> Result<()>
 	where
 		I: IntoIterator<Item = RemoteDirectory>,
 		I1: IntoIterator<Item = RemoteFile>,
 	{
-		crate::sql::update_items_with_parent(conn, dirs, files, self.uuid())
+		crate::sql::update_items_with_parent(conn, dirs, files, self.uuid(), spare)
 	}
 
 	fn select_children(

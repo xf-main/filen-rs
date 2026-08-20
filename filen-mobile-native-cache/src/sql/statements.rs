@@ -26,6 +26,7 @@ pub(crate) const DELETE_STALE_WITH_PARENT: &str =
 	include_str!("../../sql/delete_stale_with_parent.sql");
 pub(crate) const UNMARK_STALE_PENDING_WITH_PARENT: &str =
 	include_str!("../../sql/unmark_stale_pending_with_parent.sql");
+pub(crate) const UNMARK_STALE_UUID: &str = include_str!("../../sql/unmark_stale_uuid.sql");
 pub(crate) const MARK_STALE_TRASHED: &str = include_str!("../../sql/mark_stale_trashed.sql");
 pub(crate) const DELETE_STALE_TRASHED: &str = include_str!("../../sql/delete_stale_trashed.sql");
 pub(crate) const UNMARK_STALE_PENDING_TRASHED: &str =
@@ -34,6 +35,8 @@ pub(crate) const SELECT_POS_NOT_IN_UUIDS: &str =
 	include_str!("../../sql/select_pos_not_in_uuids.sql");
 pub(crate) const MARK_PENDING_UPLOAD: &str = include_str!("../../sql/mark_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD: &str = include_str!("../../sql/clear_pending_upload.sql");
+pub(crate) const CLEAR_PENDING_UPLOAD_BY_UUID: &str =
+	include_str!("../../sql/clear_pending_upload_by_uuid.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD_SUBTREE: &str =
 	include_str!("../../sql/clear_pending_upload_subtree.sql");
 pub(crate) const SELECT_PENDING_UPLOADS: &str =

@@ -1,4 +1,5 @@
 use std::{
+	collections::HashSet,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Instant,
@@ -17,8 +18,21 @@ use filen_sdk_rs::{
 	},
 };
 use filen_types::fs::{ParentUuid, StableUuid, Uuid};
+use futures::StreamExt;
 use rusqlite::OptionalExtension;
 use tracing::debug;
+
+/// How many reconcile probes (`reconcile_missing_subdirs` / `reconcile_missing_trashed`) run
+/// concurrently. Small: these fire on enumeration paths that gate a listing.
+const RECONCILE_PROBE_CONCURRENCY: usize = 8;
+
+/// Above this many missing rows, probing each is abandoned and the fresh listing is trusted
+/// as-is (the pre-probe behaviour): hundreds of rows vanishing at once is a genuine bulk
+/// delete or emptied trash, and a per-row round-trip storm would gate every presentation of
+/// the container — with a killed run making no durable progress and repeating the storm.
+/// (`reconcile_missing_trashed` instead probes a bounded chunk and SPARES the remainder, so
+/// repeated presentations converge — a bulk restore must never read as an emptied trash.)
+const RECONCILE_PROBE_CAP: usize = 64;
 
 use crate::{
 	CacheError,
@@ -436,12 +450,135 @@ impl AuthCacheState {
 			.list_trash(None::<&fn(u64, Option<u64>)>)
 			.await?;
 		debug!("Updating trash with {dirs:?} dirs and {files:?} files");
-		sql::update_trashed_items(&mut self.conn(), dirs, files)?;
+		// A cached trashed item absent from the fresh trash listing was either RESTORED on
+		// another device or permanently deleted. The sweep treats absence as deletion — an
+		// authoritative tombstone for a file that may be alive and well under its restored
+		// parent. Disambiguate first: an item the server still knows is upserted under its live
+		// parent (the restore lands immediately), a definitive not-found is left for the sweep,
+		// and an unverifiable one is spared this round.
+		let spare = self.reconcile_missing_trashed(&dirs, &files).await?;
+		sql::update_trashed_items(&mut self.conn(), dirs, files, &spare)?;
 		self.last_trash_update
 			.write()
 			.unwrap()
 			.replace(Instant::now());
 		Ok(())
+	}
+
+	/// The trash-listing counterpart of [`Self::reconcile_missing_subdirs`]: cached trashed rows
+	/// missing from the fresh trash listing are asked about by identity — a dir by its uuid, a
+	/// file by its whole-life id (a restore does not re-mint either).
+	async fn reconcile_missing_trashed(
+		&self,
+		listed_dirs: &[RemoteDirectory],
+		listed_files: &[RemoteFile],
+	) -> Result<Vec<Uuid>, CacheError> {
+		let cached = sql::select_trash(&self.conn(), None)?;
+		if cached.is_empty() {
+			return Ok(Vec::new());
+		}
+		let listed: HashSet<Uuid> = listed_dirs
+			.iter()
+			.map(|dir| dir.uuid())
+			.chain(listed_files.iter().map(|file| file.uuid()))
+			.collect();
+		let mut missing: Vec<DBNonRootObject> = cached
+			.into_iter()
+			.filter(|item| !listed.contains(&item.uuid()))
+			.collect();
+		if missing.is_empty() {
+			return Ok(Vec::new());
+		}
+		// Above the cap, probe a BOUNDED chunk and SPARE the remainder rather than trusting the
+		// listing: from here, a bulk restore-from-trash and an emptied trash produce the same
+		// signature, and trusting the listing would tombstone every restored item. Sparing
+		// converges instead — each presentation resolves another chunk.
+		let mut spare: Vec<Uuid> = Vec::new();
+		if missing.len() > RECONCILE_PROBE_CAP {
+			tracing::warn!(
+				"{} cached trashed rows vanished from one trash listing; probing {} of them and \
+				 sparing the rest this round",
+				missing.len(),
+				RECONCILE_PROBE_CAP
+			);
+			spare.extend(
+				missing[RECONCILE_PROBE_CAP..]
+					.iter()
+					.map(|item| item.uuid()),
+			);
+			missing.truncate(RECONCILE_PROBE_CAP);
+		}
+		enum Probe {
+			Dir(Result<RemoteDirectory, filen_sdk_rs::error::Error>),
+			File(Result<RemoteFile, filen_sdk_rs::error::Error>),
+		}
+		let probed: Vec<(Uuid, Probe)> =
+			futures::stream::iter(missing.into_iter().map(|item| async move {
+				let uuid = item.uuid();
+				match item {
+					DBNonRootObject::Dir(_) => (uuid, Probe::Dir(self.client.get_dir(uuid).await)),
+					DBNonRootObject::File(file) => (
+						uuid,
+						Probe::File(self.client.get_file_by_stable_uuid(file.stable_uuid).await),
+					),
+				}
+			}))
+			.buffer_unordered(RECONCILE_PROBE_CONCURRENCY)
+			.collect()
+			.await;
+		for (uuid, probe) in probed {
+			match probe {
+				// Every Ok answer is SPARED as well as applied: the sweep that follows re-marks
+				// everything in its scope and deletes what the fresh listing does not contain —
+				// which is exactly these rows. Without the spare, the probe's own proof of life
+				// was upserted and then swept, tombstoning an item the server just confirmed
+				// exists. A row the upsert moved out of the sweep's scope ignores the unmark.
+				Probe::Dir(Ok(remote_dir)) => {
+					debug!("trashed dir {uuid} is alive on the server; keeping it");
+					DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
+					spare.push(uuid);
+				}
+				Probe::File(Ok(head)) => {
+					debug!("trashed file {uuid} is alive on the server; keeping it");
+					// Spare the row the upsert just wrote, not the uuid we probed with: the
+					// upsert's stable tier can re-mint the row's uuid, and the unmark matches
+					// by uuid only — sparing the stale uuid would sweep the row the probe just
+					// proved alive.
+					let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
+					spare.push(file.uuid);
+				}
+				Probe::Dir(Err(e)) if e.kind() == ErrorKind::FolderNotFound => {
+					// The lineage is permanently gone, and any unsent edit below it has lost
+					// its upload target. The descendant markers are also what spare this dir
+					// from the sweep every round — left in place, the phantom never converges:
+					// re-spared, re-probed, and re-failed on every refresh forever.
+					let released = sql::clear_pending_upload_subtree(&self.conn(), uuid)?;
+					debug!(
+						"trashed dir {uuid} is permanently gone; released {released} pending \
+						 marker(s) below it for the sweep"
+					);
+				}
+				Probe::File(Err(e)) if e.kind() == ErrorKind::FileNotFound => {
+					// The lineage is permanently gone — an unsent edit's upload target no longer
+					// exists, so the marker's promise is undeliverable. Release it, or the
+					// pending guard would spare this row every round forever: a phantom nothing
+					// can drain (the drain skips trashed rows), restore, or delete. The staged
+					// bytes stay in the slot until the budget sweep reclaims them. Released on
+					// the probed row itself: the stable-scoped clear prefers a live duplicate,
+					// which is exactly the row whose marker must survive.
+					let released = sql::clear_pending_upload_by_uuid(&self.conn(), uuid)?;
+					debug!(
+						"trashed file {uuid} is permanently gone; released {released} pending \
+						 marker(s) for the sweep"
+					);
+				}
+				Probe::Dir(Err(e)) | Probe::File(Err(e)) => {
+					debug!("could not verify missing trashed item {uuid} ({e}); sparing it");
+					spare.push(uuid);
+				}
+			}
+		}
+		Ok(spare)
 	}
 
 	pub(crate) async fn update_and_query_dir_children(
@@ -1200,6 +1337,17 @@ impl AuthCacheState {
 			}
 		};
 
+		// Already in the trash: the replay of a trash another device (or a prior attempt)
+		// applied — the stable branch above refreshes to the live head, so a trashed item
+		// arrives here as one. Idempotent success, mirroring restore_item's guard in the
+		// opposite direction; erroring instead read as a transient failure the system
+		// retried without bound.
+		if obj.parent().is_some_and(|parent| parent.is_trash()) {
+			return Ok(ObjectWithPathResponse {
+				id: FfiId(format!("trash/{}", obj.uuid())),
+				object: obj.into(),
+			});
+		}
 		let obj = match obj {
 			DBObject::Root(root) => {
 				return Err(CacheError::remote(format!(
@@ -1221,7 +1369,9 @@ impl AuthCacheState {
 				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 				// The local bytes are gone, so there is nothing left to upload — and the drain
 				// skips trashed rows, so a marker left here would never be retried nor cleared.
-				sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+				// Cleared on the row the upsert just wrote: the stable-scoped clear prefers a
+				// live duplicate over this freshly-trashed row.
+				sql::clear_pending_upload_by_uuid(&self.conn(), file.uuid)?;
 				DBObject::File(file)
 			}
 		};
@@ -1367,6 +1517,13 @@ impl AuthCacheState {
 			}
 		)?;
 
+		// A move of a TRASHED item is a restore: iOS decides .move vs .restore(to:) from an
+		// unrefreshed local read, so a drag on a device that has not yet learned the item was
+		// trashed elsewhere lands here. The plain move endpoint is not defined for trashed
+		// items — route through the restore flow, which restores and then moves.
+		if obj.parent().is_some_and(|parent| parent.is_trash()) {
+			return self.restore_item(&item.0, Some(new_parent)).await;
+		}
 		let obj = self.inner_move_item(obj, new_parent_dir).await?;
 		Ok(ObjectWithPathResponse {
 			object: DBObject::from(obj).into(),
@@ -1798,9 +1955,96 @@ impl AuthCacheState {
 			.client
 			.list_dir(&DirType::from(&*dir), None::<&fn(u64, Option<u64>)>)
 			.await?;
+		// A subdirectory absent from this listing is not necessarily deleted: another device may
+		// have MOVED it. The sweep treats absence as deletion, and its recursive cascade would
+		// tombstone the entire subtree — an authoritative delete of every descendant's replica,
+		// healed only by re-browsing each level of the moved tree. Ask the server which it was
+		// before the sweep runs.
+		let spare = self.reconcile_missing_subdirs(dir.uuid(), &dirs).await?;
 		let mut conn = self.conn();
 		dir.update_dir_last_listed_now(&conn)?;
-		dir.update_children(&mut conn, dirs, files)?;
+		dir.update_children(&mut conn, dirs, files, &spare)?;
 		Ok(())
+	}
+
+	/// Reconciles the cached child directories of `parent` that a fresh listing no longer
+	/// contains, before the listing's sweep runs: a dir the server still knows is re-parented in
+	/// place (it was moved — its subtree keeps hanging off it, no tombstones), a dir the server
+	/// definitively does not know is left for the sweep to delete, and a dir that cannot be
+	/// verified (network/server failure) is returned for the sweep to SPARE this round — the
+	/// destructive guess is the one this exists to avoid. Files are not probed: a single moved
+	/// file's tombstone has no cascade behind it, and tracked (materialised) files follow their
+	/// lineage through the working set anyway.
+	///
+	/// The common case is an empty candidate list and zero probes; a re-parented dir whose new
+	/// parent the cache does not know yet resolves like any unknown id, one level per ask.
+	async fn reconcile_missing_subdirs(
+		&self,
+		parent: Uuid,
+		listed: &[RemoteDirectory],
+	) -> Result<Vec<Uuid>, CacheError> {
+		let cached = sql::select_child_dir_uuids(&self.conn(), parent)?;
+		if cached.is_empty() {
+			return Ok(Vec::new());
+		}
+		let listed_uuids: HashSet<Uuid> = listed.iter().map(|dir| dir.uuid()).collect();
+		let missing: Vec<Uuid> = cached
+			.into_iter()
+			.filter(|uuid| !listed_uuids.contains(uuid))
+			.collect();
+		if missing.is_empty() {
+			return Ok(Vec::new());
+		}
+		if missing.len() > RECONCILE_PROBE_CAP {
+			tracing::warn!(
+				"{} subdirectories vanished from one listing of {parent}; trusting the listing \
+				 (bulk delete) instead of probing each",
+				missing.len()
+			);
+			return Ok(Vec::new());
+		}
+		let probed: Vec<(Uuid, Result<RemoteDirectory, filen_sdk_rs::error::Error>)> =
+			futures::stream::iter(
+				missing
+					.into_iter()
+					.map(|uuid| async move { (uuid, self.client.get_dir(uuid).await) }),
+			)
+			.buffer_unordered(RECONCILE_PROBE_CONCURRENCY)
+			.collect()
+			.await;
+		let mut spare = Vec::new();
+		for (uuid, result) in probed {
+			match result {
+				// Spared as well as applied: the sweep that follows re-marks everything under
+				// `parent` and deletes what the fresh listing lacks. A dir the probe just proved
+				// alive UNDER THIS SAME PARENT (created or moved in after the listing snapshot)
+				// would otherwise be upserted and then swept — an authoritative tombstone for a
+				// live subtree. A dir the upsert re-parented elsewhere ignores the unmark.
+				Ok(remote_dir) => {
+					debug!("dir {uuid} is alive on the server; keeping it");
+					DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
+					spare.push(uuid);
+				}
+				// The one answer that means gone — the sweep deletes and tombstones it.
+				// Release any pending markers below it first, exactly as the trashed
+				// counterpart does: those markers are what spare this dir from the
+				// sweep every round, so leaving them makes the phantom permanent —
+				// re-probed and re-failed on every refresh, and re-minted onto a new
+				// directory if the name is ever reused. The edits they stood for lost
+				// their upload target when the server dropped the lineage.
+				Err(e) if e.kind() == ErrorKind::FolderNotFound => {
+					let released = sql::clear_pending_upload_subtree(&self.conn(), uuid)?;
+					debug!(
+						"dir {uuid} is permanently gone; released {released} pending marker(s) \
+						 below it for the sweep"
+					);
+				}
+				Err(e) => {
+					debug!("could not verify missing dir {uuid} ({e}); sparing it this round");
+					spare.push(uuid);
+				}
+			}
+		}
+		Ok(spare)
 	}
 }

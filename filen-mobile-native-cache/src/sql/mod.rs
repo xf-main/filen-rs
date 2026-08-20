@@ -274,6 +274,33 @@ pub(crate) fn clear_pending_upload(
 	Ok(())
 }
 
+/// Drops the pending-upload marker from exactly the row `uuid` names.
+///
+/// The stable-scoped `clear_pending_upload` prefers the live half of a duplicate stable pair;
+/// callers that have already resolved which row they mean (a probe answer, a fresh upsert) go
+/// through this instead so the release cannot land on the wrong row.
+pub(crate) fn clear_pending_upload_by_uuid(
+	conn: &Connection,
+	uuid: Uuid,
+) -> Result<usize, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(CLEAR_PENDING_UPLOAD_BY_UUID)?;
+	stmt.execute([uuid])
+}
+
+/// Drops the pending-upload markers from a row and everything deleting it would take with it,
+/// without deleting anything.
+///
+/// For lineages the server has confirmed permanently gone: the descendant markers are what spare
+/// the doomed row from the stale sweeps every round, so releasing the subtree is what lets the
+/// sweep finally reap it. Same walk as the release folded into `delete_item`.
+pub(crate) fn clear_pending_upload_subtree(
+	conn: &Connection,
+	item_uuid: Uuid,
+) -> Result<usize, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(CLEAR_PENDING_UPLOAD_SUBTREE)?;
+	stmt.execute([item_uuid])
+}
+
 /// Whether any file below `dir_uuid` still has an edit that has not reached the server.
 ///
 /// Scoped to the descendants a delete of that directory's row would take with it, which is what
@@ -426,12 +453,14 @@ pub(crate) fn update_recents(
 
 /// Refreshes the cached children of a single directory: everything currently under `parent`
 /// (excluding trashed items) is marked stale, the fresh listing is upserted, and whatever stayed
-/// stale is deleted.
+/// stale is deleted. `spare` rows are exempted from the deletion — the caller asked the server
+/// what became of them and got no definitive answer (see `reconcile_missing_subdirs`).
 pub(crate) fn update_items_with_parent<I, I1>(
 	conn: &mut Connection,
 	dirs: I,
 	files: I1,
 	parent: Uuid,
+	spare: &[Uuid],
 ) -> Result<(), rusqlite::Error>
 where
 	I: IntoIterator<Item = RemoteDirectory>,
@@ -443,6 +472,8 @@ where
 		stmt.execute([parent])?;
 
 		upsert_dirs_and_files(&tx, dirs, files)?;
+
+		unmark_spared(&tx, spare)?;
 
 		// "Gone from this listing" must never destroy the only record of an
 		// unsent edit: spare marker-holding rows and the dirs sheltering them
@@ -460,10 +491,12 @@ where
 /// Refreshes the cached trash listing. Trashed items keep their original `parent`, so the sweep
 /// is scoped by the `trashed` flag rather than by a parent uuid. Each item's own parent is
 /// `ParentUuid::Trash`, which the upsert decomposes back into `(original parent, trashed = 1)`.
+/// `spare` rows are exempted from the deletion, as in [`update_items_with_parent`].
 pub(crate) fn update_trashed_items<I, I1>(
 	conn: &mut Connection,
 	dirs: I,
 	files: I1,
+	spare: &[Uuid],
 ) -> Result<(), rusqlite::Error>
 where
 	I: IntoIterator<Item = RemoteDirectory>,
@@ -476,6 +509,8 @@ where
 
 		upsert_dirs_and_files(&tx, dirs, files)?;
 
+		unmark_spared(&tx, spare)?;
+
 		// "Gone from the trash listing" must never destroy the only record of an
 		// unsent edit, exactly like the parent-scoped sweep above: spare
 		// marker-holding rows and the trashed dirs sheltering them.
@@ -487,6 +522,37 @@ where
 	}
 	tx.commit()?;
 	Ok(())
+}
+
+/// Clears the stale mark on rows a sweep must not delete this round.
+fn unmark_spared(tx: &rusqlite::Transaction<'_>, spare: &[Uuid]) -> Result<(), rusqlite::Error> {
+	if spare.is_empty() {
+		return Ok(());
+	}
+	let mut stmt = tx.prepare_cached(UNMARK_STALE_UUID)?;
+	for uuid in spare {
+		stmt.execute([uuid])?;
+	}
+	Ok(())
+}
+
+/// The uuids of the non-trashed child DIRECTORIES of `parent` — the candidates a listing-driven
+/// sweep would cascade through.
+pub(crate) fn select_child_dir_uuids(
+	conn: &Connection,
+	parent: Uuid,
+) -> Result<Vec<Uuid>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(SELECT_UUID_TYPE_NAME_BY_PARENT)?;
+	// Columns are (uuid, type, display_name); type 1 = dir.
+	let rows = stmt.query_map([parent], |row| {
+		Ok((row.get::<_, Uuid>(0)?, row.get::<_, i64>(1)?))
+	})?;
+	rows.filter_map(|row| match row {
+		Ok((uuid, 1)) => Some(Ok(uuid)),
+		Ok(_) => None,
+		Err(e) => Some(Err(e)),
+	})
+	.collect()
 }
 
 /// Whether an incoming trashed record would land on a row that is not it.
@@ -1202,6 +1268,37 @@ mod pending_upload_tests {
 		);
 	}
 
+	/// The reconcile release acts on a row it has already resolved — the probed trashed
+	/// phantom. The stable-scoped clear tie-breaks toward the live duplicate, which is
+	/// exactly the row whose marker must survive; the by-uuid clear must hit only the
+	/// named row, whichever side of the tie-break it sits on.
+	#[test]
+	fn clearing_by_uuid_hits_exactly_the_named_row() {
+		let conn = db();
+		add_file(&conn, uuid(1), stable(9), uuid(0), "a.txt");
+		mark_pending_upload(&conn, stable(9), 100).unwrap();
+		// The abuse-shaped trashed sibling sharing the stable id, with its own marker —
+		// the row the stable-scoped clear would pass over.
+		conn.execute(
+			"INSERT INTO items (uuid, stable_uuid, parent, type, trashed, pending_upload_at)
+			 VALUES (?1, ?2, ?3, 2, TRUE, 50);",
+			rusqlite::params![uuid(2), stable(9), uuid(0)],
+		)
+		.unwrap();
+
+		clear_pending_upload_by_uuid(&conn, uuid(2)).unwrap();
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(2)),
+			None,
+			"the named row's marker is cleared"
+		);
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(1)),
+			Some(100),
+			"the live duplicate's marker must survive"
+		);
+	}
+
 	/// `upsert_item` resolves the target row by uuid, then stable id, then `(parent, name)`. The
 	/// `local_data` COALESCE chain re-runs those three tiers independently, and COALESCE also skips
 	/// a tier whose matched row simply has a NULL `local_data` — so a row matched by stable id can
@@ -1362,6 +1459,7 @@ mod trashed_listing_tests {
 				"edited.txt",
 			)],
 			parent,
+			&[],
 		)
 		.unwrap();
 		mark_pending_upload(conn, stable, MARKED_AT).unwrap();
@@ -1386,6 +1484,7 @@ mod trashed_listing_tests {
 				ParentUuid::Trash(parent),
 				"edited.txt",
 			)],
+			&[],
 		)
 		.unwrap();
 
@@ -1422,6 +1521,7 @@ mod trashed_listing_tests {
 				ParentUuid::Trash(parent),
 				"edited.txt",
 			)],
+			&[],
 		)
 		.unwrap();
 
@@ -1458,6 +1558,7 @@ mod trashed_listing_tests {
 				ParentUuid::Trash(parent),
 				"edited.txt",
 			)],
+			&[],
 		)
 		.unwrap();
 
@@ -1489,6 +1590,7 @@ mod trashed_listing_tests {
 				"report.txt",
 			)],
 			parent,
+			&[],
 		)
 		.unwrap();
 		mark_pending_upload(&conn, stable(1), MARKED_AT).unwrap();
@@ -1503,6 +1605,7 @@ mod trashed_listing_tests {
 				remote_file(uuid(1), stable(1), ParentUuid::Uuid(parent), "renamed.txt"),
 			],
 			parent,
+			&[],
 		)
 		.unwrap();
 
@@ -1751,11 +1854,11 @@ mod change_tracking_tests {
 			]
 		};
 
-		update_items_with_parent(&mut conn, [], listing(), parent).unwrap();
+		update_items_with_parent(&mut conn, [], listing(), parent, &[]).unwrap();
 		let after_first = anchor(&conn);
 		let stamps = (seq_of(&conn, uuid(1)), seq_of(&conn, uuid(3)));
 
-		update_items_with_parent(&mut conn, [], listing(), parent).unwrap();
+		update_items_with_parent(&mut conn, [], listing(), parent, &[]).unwrap();
 
 		assert_eq!(
 			anchor(&conn),
@@ -2638,7 +2741,7 @@ mod change_tracking_tests {
 		add_file(&conn, uuid(1), stable(1), parent, "report.txt");
 		mark_pending_upload(&conn, stable(1), 12_345).unwrap();
 
-		update_items_with_parent(&mut conn, [], [], parent).unwrap();
+		update_items_with_parent(&mut conn, [], [], parent, &[]).unwrap();
 
 		assert_eq!(
 			select_pending_uploads(&conn).unwrap(),
@@ -2666,7 +2769,7 @@ mod change_tracking_tests {
 		add_file(&conn, uuid(4), stable(4), uuid(2), "clean.txt");
 		mark_pending_upload(&conn, stable(3), 12_345).unwrap();
 
-		update_items_with_parent(&mut conn, [], [], parent).unwrap();
+		update_items_with_parent(&mut conn, [], [], parent, &[]).unwrap();
 
 		// The whole sheltering chain survives — id_of panics on a missing row.
 		id_of(&conn, uuid(1));
@@ -2675,6 +2778,44 @@ mod change_tracking_tests {
 		id_of(&conn, uuid(4));
 		assert_eq!(select_pending_uploads(&conn).unwrap(), vec![stable(3)]);
 		assert_eq!(retired(&conn), []);
+	}
+
+	/// The parent-scoped twin of `a_trashed_childs_marker_spares_itself_but_not_its_dead_parent`:
+	/// a marker under a TRASHED intermediate directory must not spare the untrashed ancestor
+	/// above it. Deleting that ancestor cascades only through untrashed children, so it could
+	/// never have reached the marker — and sparing it anyway made a permanently-deleted
+	/// directory unreapable, re-probed by the reconcile on every refresh.
+	#[test]
+	fn a_marker_under_a_trashed_dir_does_not_spare_the_ancestor_above_it() {
+		let mut conn = db();
+		let grandparent = uuid(9);
+		add_dir(&conn, uuid(1), grandparent, "doomed_parent");
+		add_dir(&conn, uuid(2), uuid(1), "trashed_middle");
+		add_file(&conn, uuid(3), stable(3), uuid(2), "edited.txt");
+		mark_pending_upload(&conn, stable(3), 12_345).unwrap();
+		// Only the intermediate directory is trashed; the marker-holder is not.
+		conn.execute(
+			"UPDATE items SET trashed = TRUE WHERE uuid = ?1;",
+			[uuid(2)],
+		)
+		.unwrap();
+
+		// A listing of the grandparent no longer mentions the parent.
+		update_items_with_parent(&mut conn, [], [], grandparent, &[]).unwrap();
+
+		assert_eq!(
+			conn.query_row(
+				"SELECT COUNT(*) FROM items WHERE uuid = ?1;",
+				[uuid(1)],
+				|r| r.get::<_, i64>(0)
+			)
+			.unwrap(),
+			0,
+			"the ancestor must be swept: its cascade stops at the trashed child"
+		);
+		// The marker itself is untouched — it was never in that cascade's path.
+		id_of(&conn, uuid(3));
+		assert_eq!(select_pending_uploads(&conn).unwrap(), vec![stable(3)]);
 	}
 
 	/// The guard is scoped: a subtree without a pending marker anywhere below it is swept and
@@ -2686,7 +2827,7 @@ mod change_tracking_tests {
 		add_dir(&conn, uuid(1), parent, "docs");
 		add_file(&conn, uuid(2), stable(2), uuid(1), "clean.txt");
 
-		update_items_with_parent(&mut conn, [], [], parent).unwrap();
+		update_items_with_parent(&mut conn, [], [], parent, &[]).unwrap();
 
 		let mut tombstones = retired(&conn);
 		tombstones.sort();
@@ -2714,13 +2855,62 @@ mod change_tracking_tests {
 		)
 		.unwrap();
 
-		update_trashed_items(&mut conn, [], []).unwrap();
+		update_trashed_items(&mut conn, [], [], &[]).unwrap();
 
 		id_of(&conn, uuid(1));
 		assert_eq!(
 			retired(&conn),
 			[],
 			"a spared phantom must not be tombstoned"
+		);
+	}
+
+	/// The inverse scoping: a marker on an independently-TRASHED child spares the child itself,
+	/// but not its ancestors — the cascade a delete takes leaves trashed children alone, so the
+	/// parent can be reaped without ever reaching that marker. Climbing anyway left a
+	/// permanently-deleted dir spared forever: re-probed, re-failed, unreapable, while the
+	/// trashed child's own fate belongs to the trash-file probe.
+	#[test]
+	fn a_trashed_childs_marker_spares_itself_but_not_its_dead_parent() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "doomed");
+		add_file(&conn, uuid(2), stable(2), uuid(1), "edited.txt");
+		mark_pending_upload(&conn, stable(2), 12_345).unwrap();
+		// Both trashed independently: the file first, then its old parent.
+		conn.execute(
+			"UPDATE items SET trashed = TRUE WHERE uuid IN (?1, ?2);",
+			rusqlite::params![uuid(1), uuid(2)],
+		)
+		.unwrap();
+
+		// Neither appears in the fresh trash listing: the dir was permanently
+		// deleted elsewhere; the file's absence is not yet explained.
+		update_trashed_items(&mut conn, [], [], &[]).unwrap();
+
+		assert!(
+			conn.query_row(
+				"SELECT COUNT(*) FROM items WHERE uuid = ?1;",
+				[uuid(1)],
+				|r| r.get::<_, i64>(0)
+			)
+			.unwrap() == 0,
+			"the dead dir must be reaped — no cascade from it can reach the trashed child"
+		);
+		id_of(&conn, uuid(2));
+		// Asserted on the column, not via select_pending_uploads: the drain's
+		// selection deliberately skips trashed rows.
+		let marker: Option<i64> = conn
+			.query_row(
+				"SELECT pending_upload_at FROM items WHERE uuid = ?1;",
+				[uuid(2)],
+				|r| r.get(0),
+			)
+			.unwrap();
+		assert_eq!(
+			marker,
+			Some(12_345),
+			"the trashed child and its marker survive on their own"
 		);
 	}
 
@@ -2739,7 +2929,7 @@ mod change_tracking_tests {
 		)
 		.unwrap();
 
-		update_trashed_items(&mut conn, [], []).unwrap();
+		update_trashed_items(&mut conn, [], [], &[]).unwrap();
 
 		id_of(&conn, uuid(1));
 		id_of(&conn, uuid(2));
@@ -2760,13 +2950,29 @@ mod change_tracking_tests {
 		)
 		.unwrap();
 
-		update_trashed_items(&mut conn, [], []).unwrap();
+		update_trashed_items(&mut conn, [], [], &[]).unwrap();
 
 		assert_eq!(
 			retired(&conn),
 			[(2, uuid(1))],
 			"a clean trashed row is swept and tombstoned as before"
 		);
+	}
+
+	/// A row the caller spared — its server-side fate could not be verified before the sweep —
+	/// survives the round whole, cascade and all, instead of being destructively guessed about.
+	#[test]
+	fn the_stale_sweep_spares_rows_the_caller_could_not_verify() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "maybe-moved");
+		add_file(&conn, uuid(2), stable(2), uuid(1), "child.txt");
+
+		update_items_with_parent(&mut conn, [], [], parent, &[uuid(1)]).unwrap();
+
+		id_of(&conn, uuid(1));
+		id_of(&conn, uuid(2));
+		assert_eq!(retired(&conn), [], "a spared subtree emits no tombstones");
 	}
 
 	/// The delete cascade fires from paths with no per-row visibility in Rust (it is a trigger

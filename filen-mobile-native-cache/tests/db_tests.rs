@@ -5375,6 +5375,65 @@ pub async fn test_trashing_a_marked_file_does_not_strand_its_marker() {
 	);
 }
 
+// A dir trashed here and permanently deleted elsewhere still sheltered an unsent edit. The
+// probe's FolderNotFound answer must release the subtree's markers, or the pending guard
+// re-spares the phantom on every refresh: a trash entry nothing can drain, restore, or
+// delete, plus a wasted probe, forever.
+#[shared_test_runtime]
+pub async fn test_a_dead_dirs_phantom_converges_despite_a_pending_edit_below_it() {
+	let (db, rss) = get_db_resources().await;
+
+	let dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "doomed")
+		.await
+		.unwrap();
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("edited.txt", dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let dir_path = test_dir_path.join("doomed");
+	db.update_dir_children(dir_path.clone()).await.unwrap();
+
+	mark_pending_upload(&db, &dir_path.join("edited.txt")).await;
+
+	// The trash entry exists locally; the other device then empties the trash.
+	let dir_uuid = dir.uuid();
+	db.trash_item(dir_path).await.unwrap();
+	rss.client.delete_dir_permanently(dir).await.unwrap();
+
+	// The permanent delete reaches the trash listing asynchronously; until it does the
+	// dir is not "missing" and no probe fires. Poll for that propagation — once the
+	// listing drops the dir, a single pass must reap the phantom. Pre-fix the phantom
+	// NEVER converges (the pending guard re-spares it every round), so the poll
+	// separates server lag from the bug.
+	let phantom: FfiId = format!("trash/{dir_uuid}").into();
+	let mut reaped = false;
+	for _ in 0..30 {
+		db.update_trash().await.unwrap();
+
+		if db.query_item(&phantom).unwrap().is_none() {
+			reaped = true;
+			break;
+		}
+
+		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+	}
+	assert!(
+		reaped,
+		"the released subtree must let the sweep reap the phantom"
+	);
+}
+
 // An app that persisted a file's `uuid` before the stable-id migration must keep resolving it after
 // the server re-mints that uuid. `resolve_uuid_or_stable` covers this by falling back to a
 // stable-id match once the exact uuid match misses — the branch every uuid-string entry point
