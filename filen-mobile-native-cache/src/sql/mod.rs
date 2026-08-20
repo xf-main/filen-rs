@@ -536,6 +536,19 @@ fn unmark_spared(tx: &rusqlite::Transaction<'_>, spare: &[Uuid]) -> Result<(), r
 	Ok(())
 }
 
+/// The non-trashed child `name` names under `parent`, as the cache holds it.
+pub(crate) fn select_child_by_name(
+	conn: &Connection,
+	parent: Uuid,
+	name: &str,
+) -> Result<Option<object::DBObject>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(SELECT_ITEM_BY_PARENT_NAME)?;
+	stmt.query_one((parent, name), item::RawDBItem::from_row)
+		.optional()?
+		.map(|item| item.into_db_object(conn))
+		.transpose()
+}
+
 /// The uuids of the non-trashed child DIRECTORIES of `parent` — the candidates a listing-driven
 /// sweep would cascade through.
 pub(crate) fn select_child_dir_uuids(

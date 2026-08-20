@@ -26,6 +26,11 @@ use tracing::debug;
 /// concurrently. Small: these fire on enumeration paths that gate a listing.
 const RECONCILE_PROBE_CONCURRENCY: usize = 8;
 
+/// How recently a parent's listing must have run for `update_and_query_child` to reuse it
+/// instead of relisting. Short on purpose: it exists to coalesce the per-child relists of a
+/// reimport burst, not to serve stale listings.
+const ADOPT_RELIST_TTL_MS: i64 = 10_000;
+
 /// Above this many missing rows, probing each is abandoned and the fresh listing is trusted
 /// as-is (the pre-probe behaviour): hundreds of rows vanishing at once is a genuine bulk
 /// delete or emptied trash, and a per-row round-trip storm would gate every presentation of
@@ -238,6 +243,22 @@ impl FilenMobileCacheState {
 	pub async fn update_and_query_item(&self, id: FfiId) -> Result<Option<FfiObject>, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.update_and_query_item(id).await
+		})
+		.await
+	}
+
+	/// The child `name` names under `parent`, refreshed from the server — `None` when the fresh
+	/// listing has no such child. This is the match step a reimport needs: the system re-creates
+	/// every cached item with `.mayAlreadyExist`, and the provider must ADOPT the existing server
+	/// item for that (parent, name) instead of re-uploading whatever bytes this replica holds —
+	/// an upload silently replaces the server head, rolling back edits made elsewhere.
+	pub async fn update_and_query_child(
+		&self,
+		parent: FfiId,
+		name: String,
+	) -> Result<Option<FfiObject>, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.update_and_query_child(parent, name).await
 		})
 		.await
 	}
@@ -1068,6 +1089,39 @@ impl AuthCacheState {
 		debug!("Learned unlisted file lineage {stable_uuid} from the server");
 		let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
 		Ok(Some(DBObject::File(file)))
+	}
+
+	/// The child `name` names under `parent` as of a fresh-enough listing of `parent` (see
+	/// [`FilenMobileCacheState::update_and_query_child`]).
+	///
+	/// Row-direct, like every other id-addressed operation: the parent id resolves straight to
+	/// its row (probing the server for an unknown one — a reimport typically runs against a
+	/// FRESH cache, where a display-path build would throw instead of asking), and the child is
+	/// selected by `(parent uuid, name)` rather than re-walking a rebuilt display path whose
+	/// LIMIT-1 components land on same-named siblings.
+	pub(crate) async fn update_and_query_child(
+		&self,
+		parent: FfiId,
+		name: String,
+	) -> Result<Option<FfiObject>, CacheError> {
+		let Some(parent_obj) = self.resolve_object_refreshed(&parent).await? else {
+			return Ok(None);
+		};
+		let mut parent_dir = DBDirObject::try_from(parent_obj).map_err(|e| {
+			CacheError::remote(format!("Id {parent} does not point to a directory: {e}"))
+		})?;
+		// Skip the relist when one just ran: a reimport fires one create per cached child, and
+		// relisting the same parent for each would be O(N²) network work — with every extra
+		// relist another sweep window. A just-written listing is current enough for the adopt
+		// decision, whose own hash comparison still guards content.
+		let last_listed = match &parent_dir {
+			DBDirObject::Dir(dir) => dir.last_listed,
+			DBDirObject::Root(root) => root.last_listed,
+		};
+		if chrono::Utc::now().timestamp_millis() - last_listed > ADOPT_RELIST_TTL_MS {
+			self.inner_update_dir(&mut parent_dir).await?;
+		}
+		Ok(sql::select_child_by_name(&self.conn(), parent_dir.uuid(), &name)?.map(Into::into))
 	}
 
 	/// The file behind a row, refreshed to its live head.
