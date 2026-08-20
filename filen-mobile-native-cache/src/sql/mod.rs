@@ -444,6 +444,12 @@ where
 
 		upsert_dirs_and_files(&tx, dirs, files)?;
 
+		// "Gone from this listing" must never destroy the only record of an
+		// unsent edit: spare marker-holding rows and the dirs sheltering them
+		// (they stay behind as phantoms until the drain sends the edit).
+		let mut stmt = tx.prepare_cached(UNMARK_STALE_PENDING_WITH_PARENT)?;
+		stmt.execute([parent])?;
+
 		let mut stmt = tx.prepare_cached(DELETE_STALE_WITH_PARENT)?;
 		stmt.execute([parent])?;
 	}
@@ -469,6 +475,12 @@ where
 		stmt.execute([])?;
 
 		upsert_dirs_and_files(&tx, dirs, files)?;
+
+		// "Gone from the trash listing" must never destroy the only record of an
+		// unsent edit, exactly like the parent-scoped sweep above: spare
+		// marker-holding rows and the trashed dirs sheltering them.
+		let mut stmt = tx.prepare_cached(UNMARK_STALE_PENDING_TRASHED)?;
+		stmt.execute([])?;
 
 		let mut stmt = tx.prepare_cached(DELETE_STALE_TRASHED)?;
 		stmt.execute([])?;
@@ -2611,6 +2623,211 @@ mod change_tracking_tests {
 			page(5, 2),
 			[],
 			"an offset past the end is empty, not an error"
+		);
+	}
+
+	/// A file with an unsent edit that vanished from its parent's listing (deleted or moved
+	/// remotely by another device) must survive the stale sweep: the row and its marker are the
+	/// only record linking those bytes to an upload obligation, and the launch drain finds them
+	/// nowhere else. The tombstone trigger's guard alone only suppresses the feed record — it
+	/// does not keep the row alive.
+	#[test]
+	fn the_stale_sweep_spares_a_pending_row_missing_from_the_listing() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_file(&conn, uuid(1), stable(1), parent, "report.txt");
+		mark_pending_upload(&conn, stable(1), 12_345).unwrap();
+
+		update_items_with_parent(&mut conn, [], [], parent).unwrap();
+
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![stable(1)],
+			"the pending-upload marker must survive the sweep"
+		);
+		assert_eq!(
+			retired(&conn),
+			[],
+			"a spared phantom must not be tombstoned"
+		);
+	}
+
+	/// The ancestor variant: the pending file sits below a directory that vanished from the
+	/// swept listing. Deleting the directory would cascade to the whole subtree and take the
+	/// marker with it, so the sheltering chain is kept as phantoms instead — `forget_item`
+	/// already refuses the equivalent single-item deletion for exactly this reason.
+	#[test]
+	fn the_stale_sweep_spares_a_directory_sheltering_a_pending_descendant() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "docs");
+		add_dir(&conn, uuid(2), uuid(1), "reports");
+		add_file(&conn, uuid(3), stable(3), uuid(2), "draft.txt");
+		add_file(&conn, uuid(4), stable(4), uuid(2), "clean.txt");
+		mark_pending_upload(&conn, stable(3), 12_345).unwrap();
+
+		update_items_with_parent(&mut conn, [], [], parent).unwrap();
+
+		// The whole sheltering chain survives — id_of panics on a missing row.
+		id_of(&conn, uuid(1));
+		id_of(&conn, uuid(2));
+		id_of(&conn, uuid(3));
+		id_of(&conn, uuid(4));
+		assert_eq!(select_pending_uploads(&conn).unwrap(), vec![stable(3)]);
+		assert_eq!(retired(&conn), []);
+	}
+
+	/// The guard is scoped: a subtree without a pending marker anywhere below it is swept and
+	/// tombstoned exactly as before.
+	#[test]
+	fn the_stale_sweep_still_deletes_clean_subtrees() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "docs");
+		add_file(&conn, uuid(2), stable(2), uuid(1), "clean.txt");
+
+		update_items_with_parent(&mut conn, [], [], parent).unwrap();
+
+		let mut tombstones = retired(&conn);
+		tombstones.sort();
+		assert_eq!(
+			tombstones,
+			[(1, uuid(1)), (2, uuid(2))],
+			"a clean subtree is swept and tombstoned as before"
+		);
+	}
+
+	/// The TRASH sweep's counterpart of the pending guard: a file trashed remotely (the flag
+	/// flips via the upsert, which never touches `pending_upload_at`, so the marker rides into
+	/// the trash) and then absent from the fresh trash listing must survive the sweep — the
+	/// tombstone trigger's own pending guard would suppress the tombstone too, so deletion here
+	/// erased the only record of the unsent edit with no replica ever told.
+	#[test]
+	fn the_trash_sweep_spares_a_pending_row_missing_from_the_listing() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_file(&conn, uuid(1), stable(1), parent, "edited.txt");
+		mark_pending_upload(&conn, stable(1), 12_345).unwrap();
+		conn.execute(
+			"UPDATE items SET trashed = TRUE WHERE uuid = ?1;",
+			[uuid(1)],
+		)
+		.unwrap();
+
+		update_trashed_items(&mut conn, [], []).unwrap();
+
+		id_of(&conn, uuid(1));
+		assert_eq!(
+			retired(&conn),
+			[],
+			"a spared phantom must not be tombstoned"
+		);
+	}
+
+	/// The ancestor variant for the trash: a trashed directory sheltering an unsent edit below
+	/// it survives the sweep whole — deleting it would cascade to the marker.
+	#[test]
+	fn the_trash_sweep_spares_a_trashed_dir_sheltering_a_pending_descendant() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "docs");
+		add_file(&conn, uuid(2), stable(2), uuid(1), "draft.txt");
+		mark_pending_upload(&conn, stable(2), 12_345).unwrap();
+		conn.execute(
+			"UPDATE items SET trashed = TRUE WHERE uuid = ?1;",
+			[uuid(1)],
+		)
+		.unwrap();
+
+		update_trashed_items(&mut conn, [], []).unwrap();
+
+		id_of(&conn, uuid(1));
+		id_of(&conn, uuid(2));
+		assert_eq!(select_pending_uploads(&conn).unwrap(), vec![stable(2)]);
+		assert_eq!(retired(&conn), []);
+	}
+
+	/// The guard is scoped: a clean trashed row absent from the listing is swept and tombstoned
+	/// exactly as before.
+	#[test]
+	fn the_trash_sweep_still_deletes_clean_rows() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_file(&conn, uuid(1), stable(1), parent, "clean.txt");
+		conn.execute(
+			"UPDATE items SET trashed = TRUE WHERE uuid = ?1;",
+			[uuid(1)],
+		)
+		.unwrap();
+
+		update_trashed_items(&mut conn, [], []).unwrap();
+
+		assert_eq!(
+			retired(&conn),
+			[(2, uuid(1))],
+			"a clean trashed row is swept and tombstoned as before"
+		);
+	}
+
+	/// The delete cascade fires from paths with no per-row visibility in Rust (it is a trigger
+	/// for a reason), so it needs its own guard: a pending child survives its parent's deletion
+	/// as an orphan phantom — the marker keeps the drain able to find it — instead of dying with
+	/// the subtree.
+	#[test]
+	fn the_delete_cascade_spares_pending_children() {
+		let conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "docs");
+		add_file(&conn, uuid(2), stable(2), uuid(1), "dirty.txt");
+		add_file(&conn, uuid(3), stable(3), uuid(1), "clean.txt");
+		mark_pending_upload(&conn, stable(2), 12_345).unwrap();
+
+		conn.execute("DELETE FROM items WHERE uuid = ?1;", [uuid(1)])
+			.unwrap();
+
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![stable(2)],
+			"the pending child must survive the cascade"
+		);
+		id_of(&conn, uuid(2));
+		let mut tombstones = retired(&conn);
+		tombstones.sort();
+		assert_eq!(
+			tombstones,
+			[(1, uuid(1)), (2, uuid(3))],
+			"the dir and its clean child are tombstoned; the pending child is not"
+		);
+	}
+
+	/// Same guard for the uuid-overwrite cascade (the server reassigned a directory's uuid).
+	#[test]
+	fn the_uuid_overwrite_cascade_spares_pending_children() {
+		let conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "docs");
+		add_file(&conn, uuid(2), stable(2), uuid(1), "dirty.txt");
+		add_file(&conn, uuid(3), stable(3), uuid(1), "clean.txt");
+		mark_pending_upload(&conn, stable(2), 12_345).unwrap();
+
+		conn.execute(
+			"UPDATE items SET uuid = ?1 WHERE uuid = ?2;",
+			rusqlite::params![uuid(7), uuid(1)],
+		)
+		.unwrap();
+
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![stable(2)],
+			"the pending child must survive the cascade"
+		);
+		id_of(&conn, uuid(2));
+		let mut tombstones = retired(&conn);
+		tombstones.sort();
+		assert_eq!(
+			tombstones,
+			[(1, uuid(1)), (2, uuid(3))],
+			"the dir's retired uuid and its clean child are tombstoned; the pending child is not"
 		);
 	}
 }

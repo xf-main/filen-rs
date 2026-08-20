@@ -175,8 +175,14 @@ BEGIN
 	-- Trashed items are keyed off their original parent; they must survive the
 	-- parent's churn (they live in the trash listing, not under the parent) so
 	-- exclude them here.
+	--
+	-- A child holding a pending-upload marker survives too, as an orphan
+	-- phantom: the marker is the only record linking its unsent bytes to an
+	-- upload obligation, and the drain scans exactly these markers. Only files
+	-- carry markers, so the cascade still recurses through subdirectories —
+	-- a marked file is spared at whichever depth the recursion reaches it.
 	DELETE FROM items
-	WHERE parent = old.uuid AND trashed = FALSE;
+	WHERE parent = old.uuid AND trashed = FALSE AND pending_upload_at IS NULL;
 END;
 
 CREATE TRIGGER cascade_on_delete_delete_children
@@ -184,8 +190,9 @@ AFTER DELETE ON items
 FOR EACH ROW
 WHEN old.type != 2 -- Ensure it's not a file
 BEGIN
+	-- Same pending-upload guard as the uuid-overwrite cascade above.
 	DELETE FROM items
-	WHERE parent = old.uuid AND trashed = FALSE;
+	WHERE parent = old.uuid AND trashed = FALSE AND pending_upload_at IS NULL;
 END;
 
 -- A uuid arriving with a different type than the row that currently holds it

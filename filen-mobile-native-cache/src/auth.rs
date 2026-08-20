@@ -47,7 +47,11 @@ pub const DB_FILE_NAME: &str = "native_cache.db";
 // 4 - add the change-tracking substrate: `items.change_seq` + `items.materialised_at`, the
 //     `tombstones` and `change_meta` tables, and the triggers that maintain them. A replica
 //     syncing against a pre-4 database would see an empty history, so start everyone fresh.
-const CACHE_VERSION: u64 = 4;
+// 5 - pending-upload guards on the stale sweep and both delete cascades: rows holding an unsent
+//     edit (and the dirs sheltering them) survive listing-driven deletion as phantoms instead of
+//     losing the marker the launch drain relies on. (The init.sql hash change alone would force
+//     the reinit; the bump records why.)
+const CACHE_VERSION: u64 = 5;
 
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,
