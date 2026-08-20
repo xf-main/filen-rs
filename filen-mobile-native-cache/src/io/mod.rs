@@ -10,7 +10,8 @@ use std::{
 use crate::{
 	auth::{
 		AUTH_CLEANUP_INTERVAL, AuthCacheState, AuthStatus, CacheState, DB_FILE_NAME,
-		FilenMobileCacheState, update_saved_db_state_cache_cleanup_time,
+		FilenMobileCacheState, UnauthCacheState, UnauthReason,
+		update_saved_db_state_cache_cleanup_time,
 	},
 	sql::{self, item::RawDBItem},
 	traits::ProgressCallback,
@@ -29,7 +30,10 @@ use filen_types::{
 	fs::{Uuid, UuidStr},
 };
 use futures::{StreamExt, stream::FuturesUnordered};
-use tokio::{fs::DirEntry, sync::mpsc::UnboundedReceiver};
+use tokio::{
+	fs::DirEntry,
+	sync::{OwnedRwLockReadGuard, mpsc::UnboundedReceiver},
+};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{debug, error, info, trace};
 
@@ -505,6 +509,11 @@ async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
 /// reach of this sweep with room to spare.
 const STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long a trusted "disabled" reading must hold before the destructive cleanup acts on it —
+/// long enough to outlast the app's auth.json rewrite window (a delete-then-recreate measured in
+/// milliseconds), short enough that a real disable still cleans up promptly.
+const WIPE_CONFIRM_DELAY: Duration = Duration::from_secs(2);
+
 /// Removes staging files left behind by downloads and imports that died.
 ///
 /// [`cleanup_uuid_dir`] cannot do this, and runs over the same directory: it deletes only the
@@ -865,25 +874,71 @@ impl AuthCacheState {
 }
 
 impl CacheState {
-	pub(crate) async fn cleanup_cache_if_necessary(&self) {
+	/// Takes the guard by value: the Disabled arm must DROP it before its confirmation delay,
+	/// or every queued state writer (the 1s unauthenticated refresh) waits behind a pile of
+	/// sleeping cleanup tasks.
+	pub(crate) async fn cleanup_cache_if_necessary(
+		cache: OwnedRwLockReadGuard<CacheState>,
+		state: Arc<tokio::sync::RwLock<CacheState>>,
+	) {
 		debug!(
 			"Cleaning up cache (files_dir {}, db_dir {})",
-			self.files_dir.display(),
-			self.db_dir.display()
+			cache.files_dir.display(),
+			cache.db_dir.display()
 		);
-		match self.status {
+		match cache.status {
 			AuthStatus::Authenticated(ref auth_state) => {
 				debug!("Authenticated, cleaning up old files in cache directories");
 				auth_state.cleanup_cache().await;
 			}
-			_ => {
-				debug!("Not authenticated, removing all cache directories and database file");
-				let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(&self.files_dir);
+			// The destructive wipe acts ONLY on an affirmative, trusted disable. Every other
+			// unauthenticated flavour — an unreadable or undecryptable auth.json, a missing DEK
+			// before first unlock, an enabled file whose config failed to build — leaves the
+			// cache (DB, anchors, pending-upload markers) intact: those states say "unknown" or
+			// "not right now", not "the user turned the provider off", and wiping on them forced
+			// a full re-import over a blip.
+			AuthStatus::Unauthenticated(UnauthCacheState {
+				reason: UnauthReason::Disabled,
+			}) => {
+				// Single-flight: every unauthenticated FFI call launches a cleanup task, and a
+				// Disabled confirmation sleeps below — without the gate they pile up, each
+				// redundantly re-decrypting auth.json while holding a state read guard.
+				let Ok(_permit) = cache.disabled_wipe_gate.clone().try_acquire_owned() else {
+					return;
+				};
+				let (auth_file, dek) = cache.wipe_confirmation_handles();
+				drop(cache);
+				// Even a trusted disable gets re-confirmed after a delay: the app's historical
+				// auth.json rewrite deleted-then-recreated the file, and a read landing in that
+				// gap is indistinguishable from a real disable until the rewrite completes.
+				tokio::time::sleep(WIPE_CONFIRM_DELAY).await;
+				if !crate::auth::confirm_disabled(&auth_file, dek.as_ref()).await {
+					debug!("Disable did not hold on re-read; leaving the cache intact");
+					return;
+				}
+				// RE-ACQUIRE the state guard for the destructive phase and re-check the status
+				// under it: the confirmation is point-in-time, and a re-enable landing during a
+				// multi-second recursive delete would otherwise recreate the directories and DB
+				// underneath the still-running unlink — destroying staged pending-upload bytes
+				// and unlinking a database a fresh connection just opened. Holding the read
+				// guard across the deletes makes the auth refresh (a writer) wait instead.
+				let cache = state.read_owned().await;
+				if !matches!(
+					cache.status,
+					AuthStatus::Unauthenticated(UnauthCacheState {
+						reason: UnauthReason::Disabled,
+					})
+				) {
+					debug!("State changed during the wipe confirmation; leaving the cache intact");
+					return;
+				}
+				debug!("Confirmed disabled, removing all cache directories and database file");
+				let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(&cache.files_dir);
 				// The DBs live at db_dir (== files_dir unless the platform relocated them, see
 				// CacheState::db_dir). Remove the WAL sidecars along with each DB — a leftover
 				// -wal carries the most recent decrypted names and must not survive logout.
-				let db_file = self.db_dir.join(DB_FILE_NAME);
-				let sdk_cache = self.db_dir.join(crate::search::SDK_CACHE_DB_NAME);
+				let db_file = cache.db_dir.join(DB_FILE_NAME);
+				let sdk_cache = cache.db_dir.join(crate::search::SDK_CACHE_DB_NAME);
 				futures::join!(
 					remove_dir_all_if_exists(&cache_dir),
 					remove_dir_all_if_exists(&tmp_dir),
@@ -928,6 +983,9 @@ impl CacheState {
 					}
 				);
 			}
+			AuthStatus::Unauthenticated(_) => {
+				debug!("Not authenticated but not confirmed disabled; leaving the cache intact");
+			}
 		};
 	}
 }
@@ -936,15 +994,17 @@ impl FilenMobileCacheState {
 	pub(crate) async fn async_launch_cleanup_task(&self) {
 		trace!("Launching cleanup task asynchronously");
 		let cache = self.async_get_cache_state_owned().await;
+		let state = self.state.clone();
 		crate::env::get_runtime().spawn(async move {
-			cache.cleanup_cache_if_necessary().await;
+			CacheState::cleanup_cache_if_necessary(cache, state).await;
 		});
 	}
 	pub(crate) fn sync_launch_cleanup_task(&self) {
 		trace!("Launching cleanup task synchronously");
 		let cache = self.sync_get_cache_state_owned();
+		let state = self.state.clone();
 		crate::env::get_runtime().spawn(async move {
-			cache.cleanup_cache_if_necessary().await;
+			CacheState::cleanup_cache_if_necessary(cache, state).await;
 		});
 	}
 }

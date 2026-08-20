@@ -79,13 +79,22 @@ pub struct AuthCacheState {
 	pub(crate) file_locks: crate::file_locks::FileLocks,
 }
 
-enum UnauthReason {
+pub(crate) enum UnauthReason {
+	/// A TRUSTED read said the provider is off: auth.json decrypted fine with
+	/// `providerEnabled: false`, or the file is genuinely absent (`disable()` deletes it, and a
+	/// never-enabled install never wrote one). The only reason the destructive cleanup may act on.
 	Disabled,
 	Unauthenticated,
+	/// auth.json exists but could not be read or decrypted — a transient IO failure, a
+	/// pre-first-unlock launch whose DEK the keychain would not release, a torn write. Fails
+	/// closed like `Unauthenticated`, but is NEVER grounds for the destructive cleanup: the
+	/// file's actual contents are unknown, and unknown must not read as disabled — that wiped
+	/// the whole cache (DB, anchors, pending-upload markers) over a blip.
+	Unavailable,
 }
 
-struct UnauthCacheState {
-	reason: UnauthReason,
+pub(crate) struct UnauthCacheState {
+	pub(crate) reason: UnauthReason,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -112,6 +121,11 @@ pub(crate) struct CacheState {
 	// document storage inside the app group) is.
 	pub(crate) db_dir: PathBuf,
 	last_update: std::sync::RwLock<Option<Instant>>,
+	/// Single-flight gate for the delayed disabled-state wipe confirmation: every
+	/// unauthenticated FFI call launches a cleanup task, and each Disabled confirmation sleeps
+	/// before re-reading auth.json — without the gate those pile up, each redundantly
+	/// re-decrypting the file. Arc so the task can hold it after dropping the state guard.
+	pub(crate) disabled_wipe_gate: Arc<tokio::sync::Semaphore>,
 	/// Who to tell when working-set tracking changed something. Lives out here rather than on the
 	/// authenticated state so it survives a re-auth, which replaces `status` wholesale.
 	pub(crate) working_set_listener:
@@ -121,7 +135,8 @@ pub(crate) struct CacheState {
 #[derive(uniffi::Object)]
 pub struct FilenMobileCacheState {
 	pub(crate) state: Arc<tokio::sync::RwLock<CacheState>>,
-	state_write_coordinator: tokio::sync::Mutex<()>,
+	// Arc so the spawned disable-check can hold it too — every writer must go through it.
+	state_write_coordinator: Arc<tokio::sync::Mutex<()>>,
 	// allows spawning async tasks to check if the auth file has been updated
 	// to disable the provider, will always check if currently disabled
 	allow_auth_disable: bool,
@@ -301,9 +316,26 @@ fn db_from_dir(
 			"Database hash matches, using existing database: {}",
 			db_path.display()
 		);
-		let conn = Connection::open(db_path)?;
-		configure_conn(&conn)?;
-		Ok((conn, Some(saved_state)))
+		match Connection::open(&db_path).and_then(|conn| {
+			configure_conn(&conn)?;
+			Ok(conn)
+		}) {
+			Ok(conn) => Ok((conn, Some(saved_state))),
+			// A corrupt or not-a-database file would otherwise fail every query forever: this
+			// reuse branch never re-inits on its own, and (on iOS) the disabled wipe is
+			// unreachable once the domain is gone — effectively reinstall-only. The cache is
+			// authoritative for nothing, so rebuild it.
+			Err(rusqlite::Error::SqliteFailure(e, msg))
+				if matches!(
+					e.code,
+					rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+				) =>
+			{
+				tracing::error!("cached database unusable ({e:?}: {msg:?}); reinitializing");
+				Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
+			}
+			Err(e) => Err(e.into()),
+		}
 	}
 }
 
@@ -318,25 +350,30 @@ pub struct AuthFile {
 	pub max_cache_files_budget: Option<u64>,
 }
 
-fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
+/// `None` means the file's contents are UNKNOWN (unreadable, undecryptable, or unparseable) —
+/// distinct from the trusted default an absent file yields, because callers must fail closed on
+/// unknown without ever treating it as an affirmative disable.
+fn parse_auth_file(result: Result<String, std::io::Error>) -> Option<AuthFile> {
 	match result {
 		Ok(content) => {
 			let auth_file: serde_json::Result<AuthFile> = serde_json::from_str(&content);
 			match auth_file {
-				Ok(auth_file) => auth_file,
+				Ok(auth_file) => Some(auth_file),
 				Err(e) => {
 					tracing::error!("Failed to parse auth file, error: {e}");
-					AuthFile::default()
+					None
 				}
 			}
 		}
+		// A genuinely absent file is a TRUSTED disabled state: `disable()` deletes auth.json,
+		// and a never-enabled install never wrote one.
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 			info!("Auth file not found");
-			AuthFile::default()
+			Some(AuthFile::default())
 		}
 		Err(e) => {
 			tracing::error!("Failed to read auth file, error: {e}");
-			AuthFile::default()
+			None
 		}
 	}
 }
@@ -372,11 +409,14 @@ fn decrypt_auth_bytes(bytes: &[u8], dek: Option<&EncryptionKey>) -> Result<Strin
 	})
 }
 
-fn sync_get_auth_file(path: &Path, dek: Option<&EncryptionKey>) -> AuthFile {
+fn sync_get_auth_file(path: &Path, dek: Option<&EncryptionKey>) -> Option<AuthFile> {
 	parse_auth_file(std::fs::read(path).and_then(|bytes| decrypt_auth_bytes(&bytes, dek)))
 }
 
-async fn async_get_auth_file(path: &Path, dek: Option<&EncryptionKey>) -> AuthFile {
+pub(crate) async fn async_get_auth_file(
+	path: &Path,
+	dek: Option<&EncryptionKey>,
+) -> Option<AuthFile> {
 	parse_auth_file(
 		tokio::fs::read(path)
 			.await
@@ -384,7 +424,34 @@ async fn async_get_auth_file(path: &Path, dek: Option<&EncryptionKey>) -> AuthFi
 	)
 }
 
-fn update_state(state: &mut CacheState, auth_file: AuthFile) {
+impl CacheState {
+	/// Clones of the handles the delayed disable confirmation needs, so [`confirm_disabled`]
+	/// can run after the state read guard has been dropped.
+	pub(crate) fn wipe_confirmation_handles(&self) -> (Arc<PathBuf>, Option<EncryptionKey>) {
+		(self.auth_file.clone(), self.dek)
+	}
+}
+
+/// Re-reads auth.json and answers whether a TRUSTED read (still) says the provider is off.
+/// The destructive cleanup calls this — after [`crate::io`]'s confirm delay — before wiping
+/// anything: an unreadable file, or one that came back enabled, aborts the wipe.
+pub(crate) async fn confirm_disabled(auth_file: &Path, dek: Option<&EncryptionKey>) -> bool {
+	matches!(
+		async_get_auth_file(auth_file, dek).await,
+		Some(auth_file) if !auth_file.provider_enabled
+	)
+}
+
+fn update_state(state: &mut CacheState, auth_file: Option<AuthFile>) {
+	let Some(auth_file) = auth_file else {
+		debug!("Auth file unavailable; failing closed without treating it as a disable");
+		state.status = AuthStatus::Unauthenticated(UnauthCacheState {
+			reason: UnauthReason::Unavailable,
+		});
+		let mut last_update = state.last_update.write().unwrap();
+		last_update.replace(Instant::now());
+		return;
+	};
 	if auth_file.provider_enabled {
 		match auth_file.sdk_config {
 			Some(config) => {
@@ -448,12 +515,22 @@ impl FilenMobileCacheState {
 					let auth_file_path = state.auth_file.clone();
 					let dek = state.dek;
 					let state_arc = self.state.clone();
+					let coordinator = self.state_write_coordinator.clone();
 
 					// run the update but do it async
 					crate::env::get_runtime().spawn(async move {
 						let auth_file = async_get_auth_file(&auth_file_path, dek.as_ref()).await;
-						if !auth_file.provider_enabled || auth_file.sdk_config.is_none() {
-							update_state(&mut *state_arc.write().await, auth_file);
+						// Only a TRUSTED read demotes an authenticated session: an unavailable
+						// file is no evidence of a logout, and demoting on it tore down a
+						// session whose credentials were already validated over a read blip.
+						if let Some(auth_file) = auth_file
+							&& (!auth_file.provider_enabled || auth_file.sdk_config.is_none())
+						{
+							// Behind the same coordinator every other writer takes, so the
+							// coordinated try_read/try_write fast paths stay truthful (their
+							// expects assume no uncoordinated writer exists).
+							let _coordinator_guard = coordinator.lock().await;
+							update_state(&mut *state_arc.write().await, Some(auth_file));
 						}
 					});
 				}
@@ -755,6 +832,9 @@ impl FilenMobileCacheState {
 					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
 						"Unauthenticated: sync_execute_authed".into(),
 					)),
+					UnauthReason::Unavailable => Err(CacheError::Unauthenticated(
+						"Auth state unavailable: sync_execute_authed".into(),
+					)),
 				}
 			}
 		}
@@ -791,6 +871,9 @@ impl FilenMobileCacheState {
 					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
 						"Unauthenticated: async_execute_authed_owned".into(),
 					)),
+					UnauthReason::Unavailable => Err(CacheError::Unauthenticated(
+						"Auth state unavailable: async_execute_authed_owned".into(),
+					)),
 				}
 			}
 		}
@@ -821,6 +904,9 @@ impl FilenMobileCacheState {
 					)),
 					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
 						"Unauthenticated: sync_execute_authed_owned".into(),
+					)),
+					UnauthReason::Unavailable => Err(CacheError::Unauthenticated(
+						"Auth state unavailable: sync_execute_authed_owned".into(),
 					)),
 				}
 			}
@@ -874,9 +960,10 @@ impl FilenMobileCacheState {
 				files_dir: PathBuf::from(files_dir),
 				db_dir: PathBuf::from(db_dir),
 				last_update: std::sync::RwLock::new(None),
+				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
 				working_set_listener: Mutex::new(None),
 			})),
-			state_write_coordinator: tokio::sync::Mutex::new(()),
+			state_write_coordinator: Arc::new(tokio::sync::Mutex::new(())),
 			allow_auth_disable: true,
 		};
 		new.sync_launch_cleanup_task();
@@ -901,9 +988,10 @@ impl FilenMobileCacheState {
 				files_dir: PathBuf::from(files_dir),
 				db_dir: PathBuf::from(files_dir),
 				last_update: std::sync::RwLock::new(None),
+				disabled_wipe_gate: Arc::new(tokio::sync::Semaphore::new(1)),
 				working_set_listener: Mutex::new(None),
 			})),
-			state_write_coordinator: tokio::sync::Mutex::new(()),
+			state_write_coordinator: Arc::new(tokio::sync::Mutex::new(())),
 			allow_auth_disable: false,
 		})
 	}
