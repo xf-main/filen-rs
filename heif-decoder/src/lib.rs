@@ -110,6 +110,51 @@ impl ImageHandle<'_> {
 	}
 }
 
+impl<'a> ImageHandle<'a> {
+	fn width(&self) -> c_int {
+		unsafe { heif_image_handle_get_width(self.inner) }
+	}
+
+	fn height(&self) -> c_int {
+		unsafe { heif_image_handle_get_height(self.inner) }
+	}
+
+	/// Pixel count, or `None` when libheif reports non-positive dimensions.
+	fn pixel_count(&self) -> Option<u64> {
+		let (width, height) = (self.width(), self.height());
+		if width <= 0 || height <= 0 {
+			return None;
+		}
+		Some(width as u64 * height as u64)
+	}
+
+	fn covers(&self, target_width: u32, target_height: u32) -> bool {
+		self.width() as i64 >= target_width as i64 && self.height() as i64 >= target_height as i64
+	}
+
+	/// The first embedded thumbnail, if any ("usually 0 or 1" per libheif).
+	fn first_thumbnail(&self) -> Option<ImageHandle<'a>> {
+		let count = unsafe { heif_image_handle_get_number_of_thumbnails(self.inner) };
+		if count <= 0 {
+			return None;
+		}
+		let mut id: heif_item_id = 0;
+		let filled = unsafe { heif_image_handle_get_list_of_thumbnail_IDs(self.inner, &mut id, 1) };
+		if filled < 1 {
+			return None;
+		}
+		let mut handle = std::ptr::null_mut();
+		let result = unsafe { heif_image_handle_get_thumbnail(self.inner, id, &mut handle) };
+		if result.code != heif_error_code_heif_error_Ok || handle.is_null() {
+			return None;
+		}
+		Some(ImageHandle {
+			inner: handle,
+			_lifetime: PhantomData,
+		})
+	}
+}
+
 impl Drop for ImageHandle<'_> {
 	fn drop(&mut self) {
 		unsafe { heif_image_handle_release(self.inner) };
@@ -239,6 +284,53 @@ pub fn try_get_rgba_image_from_reader<T: Read + Seek>(
 	let image_handle = ImageHandle::new(&context)?;
 	let out_image = OutImage::new(&image_handle)?;
 	out_image.make_rgba()
+}
+
+/// Decodes an RGBA image suitable as a `target_width`×`target_height` thumbnail
+/// source without ever decoding more than `max_pixels` pixels (the decode
+/// briefly holds ~8 bytes per pixel: libheif's RGBA buffer plus the returned
+/// copy). Preference order:
+///
+/// 1. an embedded thumbnail that covers the target (iPhone HEICs always carry
+///    one, and it is orders of magnitude cheaper than the primary image),
+/// 2. the primary image, when it fits the budget,
+/// 3. an undersized embedded thumbnail — better than nothing when the primary
+///    is over budget,
+/// 4. `Ok(None)`: nothing fits the budget and the caller should skip the
+///    thumbnail rather than decode an arbitrarily large image.
+pub fn try_get_rgba_thumbnail_from_reader<T: Read + Seek>(
+	reader: T,
+	file_size: u64,
+	target_width: u32,
+	target_height: u32,
+	max_pixels: u64,
+) -> Result<Option<RgbaImage>, HeifError> {
+	let mut heif_reader = HeifReader::new(reader, file_size);
+	let context = HeicContext::from_reader(&mut heif_reader)?;
+	let primary = ImageHandle::new(&context)?;
+	let thumbnail = ImageHandle::first_thumbnail(&primary).filter(|thumb| {
+		thumb
+			.pixel_count()
+			.is_some_and(|pixels| pixels <= max_pixels)
+	});
+
+	let handle = if let Some(thumb) = &thumbnail
+		&& thumb.covers(target_width, target_height)
+	{
+		thumb
+	} else if primary
+		.pixel_count()
+		.is_some_and(|pixels| pixels <= max_pixels)
+	{
+		&primary
+	} else if let Some(thumb) = &thumbnail {
+		thumb
+	} else {
+		return Ok(None);
+	};
+
+	let out_image = OutImage::new(handle)?;
+	out_image.make_rgba().map(Some)
 }
 
 struct HeifReader<T>

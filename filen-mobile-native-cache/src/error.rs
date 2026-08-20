@@ -91,6 +91,10 @@ impl CacheError {
 		CacheError::IO(ErrorContext(err.into()))
 	}
 
+	pub fn image(err: impl Into<Cow<'static, str>>) -> Self {
+		CacheError::Image(ErrorContext(err.into()))
+	}
+
 	pub fn context(self, context: impl Into<Cow<'static, str>>) -> Self {
 		match self {
 			CacheError::SQL(err) => CacheError::SQL(ErrorContext(

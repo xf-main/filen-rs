@@ -7,10 +7,11 @@ use filen_sdk_rs::{
 	},
 	io::FilenMetaExt,
 };
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::StreamExt;
 use image::ImageError;
 use tokio::sync::OwnedRwLockReadGuard;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
 	CacheError,
@@ -18,6 +19,60 @@ use crate::{
 	ffi::FfiId,
 	sql::{self, object::DBObject},
 };
+
+/// Sources larger than this are not worth downloading just to thumbnail them.
+const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Upper bound on the pixels a single decode may materialise. Chosen ABOVE the
+/// common phone sensors — 12 MP is 4032×3024 = 12,192,768 and 16 MP sensors run
+/// to ~15.9M, so a cap below that silently denies most camera photos a
+/// thumbnail (cached as "none" forever on iOS). Peak memory per decode:
+/// ~8 bytes/pixel on the HEIF path (libheif's RGBA buffer plus the returned
+/// copy, briefly) ≈ 130 MiB at this cap, ~3–4 bytes/pixel on the image-crate
+/// path — and [`DECODE_GATE`] keeps at most [`MAX_CONCURRENT_DECODES`] decodes
+/// alive, so the worst case stays bounded. HEIF sources over the cap fall back
+/// to their embedded thumbnail; other formats over it get no thumbnail.
+const MAX_THUMBNAIL_SOURCE_PIXELS: u64 = 17_000_000;
+
+/// Files.app hands over entire grid batches at once; bound how many ITEMS are
+/// in flight so a 1000-photo directory cannot queue hundreds of concurrent
+/// downloads. Wider than the decode bound: downloads are disk-streamed and
+/// cheap to overlap, and a slot waiting on a download (or a per-item lock) must
+/// not starve cache hits behind it.
+const THUMBNAIL_CONCURRENCY: usize = 4;
+
+/// How many DECODES may run at once, process-wide — the decode buffers are the
+/// memory hazard, and this gate (not the per-batch item bound) is what enforces
+/// the budget in [`MAX_THUMBNAIL_SOURCE_PIXELS`]'s arithmetic. Global on
+/// purpose: it also covers the single-item `get_thumbnail` path (Android's
+/// only route) and concurrent batches.
+const MAX_CONCURRENT_DECODES: usize = 2;
+
+/// See [`MAX_CONCURRENT_DECODES`].
+static DECODE_GATE: tokio::sync::Semaphore =
+	tokio::sync::Semaphore::const_new(MAX_CONCURRENT_DECODES);
+
+/// Removes the temp file a thumbnail encode writes into unless [`disarm`](Self::disarm)ed
+/// after the rename into place — the one cleanup covering every exit, including the future
+/// being dropped mid-await by a cancelled bulk batch.
+struct TmpFileGuard {
+	path: Option<PathBuf>,
+}
+
+impl TmpFileGuard {
+	fn disarm(mut self) {
+		self.path = None;
+	}
+}
+
+impl Drop for TmpFileGuard {
+	fn drop(&mut self) {
+		if let Some(path) = self.path.take() {
+			// Sync removal of one small local file; best-effort by design.
+			let _ = std::fs::remove_file(path);
+		}
+	}
+}
 
 impl AuthCacheState {
 	async fn get_or_make_thumbnail(
@@ -40,18 +95,26 @@ impl AuthCacheState {
 		tokio::fs::create_dir_all(&file_thumbnails_path).await?;
 		let thumbnail_path =
 			file_thumbnails_path.join(format!("{target_width}x{target_height}.webp"));
-		let thumbnail_file = tokio::fs::OpenOptions::new()
-			.append(true)
-			.create(true)
-			.open(&thumbnail_path)
-			.await?;
-		debug!("made thumbnail path: {}", thumbnail_path.display());
-		if FilenMetaExt::size(&thumbnail_file.metadata().await?) != 0 {
-			return Ok(Some(thumbnail_path));
+		match tokio::fs::metadata(&thumbnail_path).await {
+			// Zero-size files are leftovers from the pre-atomic writer; regenerate them.
+			Ok(meta) if FilenMetaExt::size(&meta) != 0 => {
+				return Ok(Some(thumbnail_path));
+			}
+			Ok(_) => {}
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+			Err(e) => return Err(e.into()),
 		}
 		let image_file = match tokio::fs::File::open(&file_path).await {
 			Ok(file) => file,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				if file.size() > MAX_THUMBNAIL_SOURCE_BYTES {
+					debug!(
+						"File too large to download for a thumbnail ({} bytes): {}",
+						file.size(),
+						file_path.display()
+					);
+					return Ok(None);
+				}
 				debug!(
 					"Thumbnail file not found, downloading: {}",
 					file_path.display()
@@ -73,14 +136,47 @@ impl AuthCacheState {
 			}
 		};
 
-		let (os_file, mut thumbnail_file) =
-			futures::join!(image_file.into_std(), thumbnail_file.into_std());
+		// Encode into a unique temp file and rename into place: the thumbnail
+		// only becomes visible once complete, so neither a cancelled task nor a
+		// concurrent request for the same size can surface (and cache) a torn
+		// file.
+		let tmp_path = file_thumbnails_path.join(format!(
+			"{target_width}x{target_height}.{}.tmp",
+			Uuid::new_v4()
+		));
+		let tmp_file = tokio::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&tmp_path)
+			.await?;
+		// One cleanup for every exit: the guard removes the temp file on drop unless
+		// the rename below disarmed it — covering the error arms, a failed rename,
+		// AND an aborted batch (cancel() drops this future mid-await while the
+		// detached blocking closure keeps writing to the already-open, now-unlinked
+		// file, which is harmless).
+		let tmp_guard = TmpFileGuard {
+			path: Some(tmp_path.clone()),
+		};
+
+		let (os_file, mut tmp_file) = futures::join!(image_file.into_std(), tmp_file.into_std());
 
 		let mime = file.mime().map(|m| m.to_string());
 		let size = file.size();
 
-		if let Err(e) =
-			tokio::task::spawn_blocking(move || -> Result<(), filen_sdk_rs::error::Error> {
+		// Decode buffers, not downloads, are the memory hazard — serialize decodes
+		// process-wide. Acquired before the blocking task is spawned, so parked work
+		// costs a future, not a blocked pool thread; MOVED INTO the closure so the
+		// permit is released when the decode actually ends — a cancelled batch drops
+		// this future while the blocking closure keeps running detached, and a permit
+		// held by the dropped future would let fresh decodes stack on the orphans.
+		// Never closed, so the expect is unreachable.
+		let decode_permit = DECODE_GATE
+			.acquire()
+			.await
+			.expect("the decode gate is never closed");
+		let decode_result = tokio::task::spawn_blocking(
+			move || -> Result<Option<(u32, u32)>, filen_sdk_rs::error::Error> {
+				let _decode_permit = decode_permit;
 				let image_reader = std::io::BufReader::new(os_file);
 				filen_sdk_rs::thumbnail::make_thumbnail(
 					mime.as_deref(),
@@ -88,21 +184,37 @@ impl AuthCacheState {
 					image_reader,
 					target_width,
 					target_height,
-					&mut thumbnail_file,
-				)?;
-				Ok(())
-			})
-			.await
-			.unwrap()
-		{
-			tokio::fs::remove_file(&thumbnail_path).await?;
-			match e.downcast::<ImageError>() {
+					MAX_THUMBNAIL_SOURCE_PIXELS,
+					&mut tmp_file,
+				)
+			},
+		)
+		.await;
+
+		let decode_result = match decode_result {
+			Ok(result) => result,
+			// A panicking decode must fail this item alone, not tear down the
+			// whole bulk batch and leave its callback unanswered.
+			Err(e) => {
+				return Err(CacheError::image(format!(
+					"thumbnail decode task failed: {e}"
+				)));
+			}
+		};
+
+		match decode_result {
+			Ok(Some(_)) => {
+				tokio::fs::rename(&tmp_path, &thumbnail_path).await?;
+				tmp_guard.disarm();
+				Ok(Some(thumbnail_path))
+			}
+			// The source exceeds the decode budget; there is no thumbnail to make.
+			Ok(None) => Ok(None),
+			Err(e) => match e.downcast::<ImageError>() {
 				Ok((ImageError::Unsupported(_), _)) => Ok(None),
 				Ok((e, context)) => Err(CacheError::from(e).context(context.join(": "))),
 				Err(e) => Err(CacheError::from(e)),
-			}
-		} else {
-			Ok(Some(thumbnail_path))
+			},
 		}
 	}
 
@@ -189,18 +301,18 @@ impl AuthCacheState {
 	) -> BulkThumbnailResponse {
 		let arc = Arc::new(this);
 		let handle = crate::env::get_runtime().spawn(async move {
-			let mut futures = FuturesUnordered::new();
-			for item in items {
-				let self_ref = arc.clone();
-				let callback_ref = callback.clone();
-				futures.push(async move {
-					let result = self_ref
-						.make_thumbnail_for_path(&item, requested_width, requested_height)
-						.await;
-					callback_ref.process(item, result);
-				});
-			}
-			while (futures.next().await).is_some() {}
+			futures::stream::iter(items)
+				.for_each_concurrent(THUMBNAIL_CONCURRENCY, |item| {
+					let self_ref = arc.clone();
+					let callback_ref = callback.clone();
+					async move {
+						let result = self_ref
+							.make_thumbnail_for_path(&item, requested_width, requested_height)
+							.await;
+						callback_ref.process(item, result);
+					}
+				})
+				.await;
 			callback.complete();
 		});
 

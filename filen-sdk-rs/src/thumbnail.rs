@@ -168,14 +168,21 @@ mod js_impls {
 	}
 }
 
+/// Encodes a `target_width`×`target_height` webp thumbnail of `image_reader`
+/// into `out`, refusing to decode sources above `max_source_pixels` (a decode
+/// materialises the full image in memory before any resize — 3–8 bytes per
+/// pixel depending on the format). `Ok(None)` means no thumbnail could be made
+/// within that budget; HEIF sources fall back to their embedded thumbnail
+/// before giving up.
 pub fn make_thumbnail<R, W>(
 	mime: Option<&str>,
 	_image_file_size: u64,
 	image_reader: R,
 	target_width: u32,
 	target_height: u32,
+	max_source_pixels: u64,
 	out: &mut W,
-) -> Result<(u32, u32), Error>
+) -> Result<Option<(u32, u32)>, Error>
 where
 	R: BufRead + Seek,
 	W: Write,
@@ -185,10 +192,16 @@ where
 	let img = if should_use_heic {
 		#[cfg(feature = "heif-decoder")]
 		{
-			DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_reader(
+			match heif_decoder::try_get_rgba_thumbnail_from_reader(
 				image_reader,
 				_image_file_size,
-			)?)
+				target_width,
+				target_height,
+				max_source_pixels,
+			)? {
+				Some(image) => DynamicImage::ImageRgba8(image),
+				None => return Ok(None),
+			}
 		}
 		#[cfg(not(feature = "heif-decoder"))]
 		{
@@ -198,6 +211,10 @@ where
 	} else {
 		let reader = ImageReader::new(image_reader).with_guessed_format()?;
 		let mut decoder = reader.into_decoder()?;
+		let (width, height) = decoder.dimensions();
+		if u64::from(width) * u64::from(height) > max_source_pixels {
+			return Ok(None);
+		}
 		let orientation = decoder.orientation()?;
 		let mut image = DynamicImage::from_decoder(decoder)?;
 		image.apply_orientation(orientation);
@@ -208,5 +225,78 @@ where
 	let thumbnail = img.resize_to_fill(created_width, created_height, FilterType::CatmullRom);
 	let encoder = WebPEncoder::new_lossless(out);
 	thumbnail.write_with_encoder(encoder)?;
-	Ok((created_width, created_height))
+	Ok(Some((created_width, created_height)))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io::Cursor;
+
+	use image::{ImageFormat, RgbImage};
+
+	use super::make_thumbnail;
+
+	fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+		let image = RgbImage::from_fn(width, height, |x, y| {
+			image::Rgb([(x % 256) as u8, (y % 256) as u8, 0])
+		});
+		let mut bytes = Vec::new();
+		image
+			.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+			.unwrap();
+		bytes
+	}
+
+	#[test]
+	fn refuses_sources_above_the_pixel_budget() {
+		let bytes = png_bytes(100, 80);
+		let mut out = Vec::new();
+		let result = make_thumbnail(
+			Some("image/png"),
+			bytes.len() as u64,
+			Cursor::new(&bytes),
+			32,
+			32,
+			100 * 80 - 1,
+			&mut out,
+		)
+		.unwrap();
+		assert_eq!(result, None);
+		assert!(out.is_empty());
+	}
+
+	#[test]
+	fn makes_a_thumbnail_at_exactly_the_pixel_budget() {
+		let bytes = png_bytes(100, 80);
+		let mut out = Vec::new();
+		let result = make_thumbnail(
+			Some("image/png"),
+			bytes.len() as u64,
+			Cursor::new(&bytes),
+			32,
+			32,
+			100 * 80,
+			&mut out,
+		)
+		.unwrap();
+		assert_eq!(result, Some((32, 32)));
+		assert!(!out.is_empty());
+	}
+
+	#[test]
+	fn never_upscales_small_sources() {
+		let bytes = png_bytes(16, 16);
+		let mut out = Vec::new();
+		let result = make_thumbnail(
+			Some("image/png"),
+			bytes.len() as u64,
+			Cursor::new(&bytes),
+			64,
+			64,
+			u64::MAX,
+			&mut out,
+		)
+		.unwrap();
+		assert_eq!(result, Some((16, 16)));
+	}
 }
