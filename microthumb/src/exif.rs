@@ -100,6 +100,78 @@ pub fn orientation(exif: &[u8]) -> u8 {
 	}
 }
 
+/// Where IFD0 lives per the 8-byte TIFF header — for callers probing a
+/// bounded prefix of a larger file, who may need a second read at that offset
+/// when the directory sits beyond their window (IFD-last files: the layout
+/// most TIFF writers, including the `tiff` crate's encoder, produce).
+pub fn ifd0_offset(exif: &[u8]) -> Option<u64> {
+	let endian = match exif.get(0..2)? {
+		b"II" => Endian::Little,
+		b"MM" => Endian::Big,
+		_ => return None,
+	};
+	if u16_at(exif, 2, endian)? != 42 {
+		return None;
+	}
+	Some(u64::from(u32_at(exif, 4, endian)?))
+}
+
+/// [`orientation`] for a separately-fetched IFD0: `header` establishes the
+/// endianness, `window` holds the directory table rebased to offset 0. Only
+/// inline (SHORT, count 1) values resolve — which the orientation tag is.
+pub fn orientation_in_window(header: &[u8], window: &[u8]) -> u8 {
+	fn walk(header: &[u8], window: &[u8]) -> Option<u32> {
+		let endian = match header.get(0..2)? {
+			b"II" => Endian::Little,
+			b"MM" => Endian::Big,
+			_ => return None,
+		};
+		Ifd::at(window, endian, 0)?.uint_value(0x0112)
+	}
+	match walk(header, window) {
+		Some(v @ 1..=8) => v as u8,
+		_ => 1,
+	}
+}
+
+/// How many strips or tiles a TIFF's IFD0 DECLARES, for callers that must
+/// bound work before handing the file to a decoder — the `tiff` crate reads
+/// the whole per-chunk offset/bytecount tables inside `Decoder::new`, under
+/// its own 256 MiB default, so by the time a caller could inspect anything
+/// the allocation has already happened.
+///
+/// `header` establishes endianness and `window` holds the directory table:
+/// pass the same buffer twice when IFD0 is inside the probe, or the rebased
+/// second window when it is not (see [`ifd0_offset`]). `None` when the tags
+/// are absent, out of line, or degenerate — the caller decides whether an
+/// unreadable declaration is worth refusing.
+pub fn tiff_chunk_count(header: &[u8], window: &[u8], ifd_at: usize) -> Option<u64> {
+	let endian = match header.get(0..2)? {
+		b"II" => Endian::Little,
+		b"MM" => Endian::Big,
+		_ => return None,
+	};
+	let ifd = Ifd::at(window, endian, ifd_at)?;
+	// Tiled: ceil(width/tile_width) * ceil(height/tile_height).
+	if let (Some(tw), Some(th)) = (ifd.uint_value(0x0142), ifd.uint_value(0x0143)) {
+		let (w, h) = (ifd.uint_value(0x0100)?, ifd.uint_value(0x0101)?);
+		if tw == 0 || th == 0 {
+			return None;
+		}
+		let across = u64::from(w).div_ceil(u64::from(tw));
+		let down = u64::from(h).div_ceil(u64::from(th));
+		return Some(across.saturating_mul(down));
+	}
+	// Stripped: ceil(ImageLength / RowsPerStrip). A missing RowsPerStrip
+	// means one strip for the whole image, per the TIFF default.
+	let height = u64::from(ifd.uint_value(0x0101)?);
+	let rows_per_strip = ifd.uint_value(0x0116).map_or(height, u64::from);
+	if rows_per_strip == 0 {
+		return None;
+	}
+	Some(height.div_ceil(rows_per_strip))
+}
+
 /// The IFD1 embedded thumbnail's JPEG bytes (JPEGInterchangeFormat /
 /// -Length), when present and structurally sane.
 pub fn embedded_thumbnail(exif: &[u8]) -> Option<&[u8]> {

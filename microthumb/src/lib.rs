@@ -28,6 +28,21 @@ pub const DEFAULT_MEM_BUDGET: usize = 12 * 1024 * 1024;
 /// `accumulator_bytes` documents.)
 const MAX_CANVAS_LONG_SIDE: u32 = 1600;
 
+/// Anti-DoS ceiling on total decode WORK, which the per-unit memory budget
+/// cannot bound on its own: the streaming decoders' peaks are per row / strip
+/// / tile, so a forged header (a 1×2³⁰ PNG, a `RowsPerStrip=1` TIFF with a
+/// huge height) passes the memory check and then runs an effectively unbounded
+/// loop. Source area caps the number of units every streaming format can emit.
+/// Deliberately GENEROUS — ~20× a 24 MP photo, far above any camera or export;
+/// this refuses degenerate forgeries, never real pictures.
+const MAX_SOURCE_AREA_PIXELS: u64 = 512_000_000;
+
+/// Companion to [`MAX_SOURCE_AREA_PIXELS`] for degenerate shapes: a
+/// 1×500-million-pixel ribbon passes an area cap alone while still driving
+/// hundreds of millions of per-row iterations. No real image has a side
+/// beyond a million pixels.
+const MAX_SOURCE_SIDE_PIXELS: u32 = 1 << 20;
+
 /// The largest square target `mem_budget` could hold a canvas for, leaving
 /// half the budget for the decoder.
 ///
@@ -228,34 +243,45 @@ pub fn generate(
 	let orientation = prepared.orientation();
 
 	// A broken preview must not fail a decodable image — previews are an
-	// optimisation, the real decode is the contract.
-	let preview = prepared.embedded_preview().unwrap_or_default();
-	if let Some(preview) = &preview
-		&& preview_suffices(preview, spec)
-	{
-		return Ok(Some(apply_orientation(preview.clone(), orientation)));
+	// optimisation, the real decode is the contract. Budget-gated like every
+	// other path: the preview plus the one rotated copy `apply_orientation`
+	// may hold concurrently must fit (2× its RGBA — 8 bytes per pixel); an
+	// oversized "preview" falls through to the bounded decode instead.
+	let mut preview = prepared
+		.embedded_preview()
+		.unwrap_or_default()
+		.filter(|p| p.rgba.len().saturating_mul(2) <= spec.mem_budget);
+	if let Some(preview) = preview.take_if(|p| preview_suffices(p, spec)) {
+		return Ok(Some(apply_orientation(preview, orientation)));
 	}
 
+	let source_dims = prepared.dims();
 	let output = prepared.output_dims();
 	if output.0 == 0 || output.1 == 0 {
 		return Ok(None);
 	}
-	let peak = prepared.peak_estimate();
-	let canvas = canvas_dims(
-		output,
-		(spec.target_width, spec.target_height),
-		spec.mem_budget.saturating_sub(peak),
-	);
-	if peak
-		.checked_add(accumulator_bytes(canvas))
-		.is_some_and(|total| total <= spec.mem_budget)
-	{
-		let mut acc = BoxAccumulator::new(output, canvas);
-		prepared.decode_into(&mut acc)?;
-		return Ok(Some(apply_orientation(acc.finish(), orientation)));
+	let over_work_ceiling = u64::from(source_dims.0) * u64::from(source_dims.1)
+		> MAX_SOURCE_AREA_PIXELS
+		|| source_dims.0.max(source_dims.1) > MAX_SOURCE_SIDE_PIXELS;
+	if !over_work_ceiling {
+		let peak = prepared.peak_estimate();
+		let canvas = canvas_dims(
+			output,
+			(spec.target_width, spec.target_height),
+			spec.mem_budget.saturating_sub(peak),
+		);
+		if peak
+			.checked_add(accumulator_bytes(canvas))
+			.is_some_and(|total| total <= spec.mem_budget)
+		{
+			let mut acc = BoxAccumulator::new(output, canvas);
+			prepared.decode_into(&mut acc)?;
+			return Ok(Some(apply_orientation(acc.finish(), orientation)));
+		}
 	}
 
-	// Over budget: an undersized preview beats no thumbnail at all.
+	// Over budget (or over the work ceiling): an undersized preview beats no
+	// thumbnail at all.
 	Ok(preview.map(|preview| apply_orientation(preview, orientation)))
 }
 

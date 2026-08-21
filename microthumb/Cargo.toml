@@ -16,7 +16,9 @@ image = { version = "0.25.6", default-features = false, features = [
 	"tiff",
 	"webp",
 ] }
+gif = "0.13"
 jpeg-decoder = { version = "0.3.2", default-features = false }
+tiff = "0.10"
 png = "0.18"
 heif-decoder = { path = "../heif-decoder", optional = true }
 

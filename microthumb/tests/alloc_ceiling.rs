@@ -1,11 +1,14 @@
 //! The memory contract, enforced: a counting allocator measures the high-water
 //! mark of `generate()` on large fixtures and asserts it stays inside the
 //! budget. On macOS the meter is libmalloc's `malloc_logger` hook, which sees
-//! every allocation in the process — including the C side (libheif/libde265),
-//! which a Rust `#[global_allocator]` cannot observe. Elsewhere the global
-//! allocator swap meters the pure-Rust formats. This lives in its own test
-//! binary because both meters are process-wide, and runs the cases in ONE
-//! #[test] so no parallel test pollutes the counters.
+//! every malloc/realloc/free in the process — including the C side
+//! (libheif/libde265), which a Rust `#[global_allocator]` cannot observe.
+//! NOT visible to either meter: thread stacks (libde265 spawns workers) and
+//! direct mmap/vm_allocate — the numbers here are heap high-water marks, not
+//! total process footprint. Elsewhere the global allocator swap meters the
+//! pure-Rust formats only. This lives in its own test binary because both
+//! meters are process-wide, and runs the cases in ONE #[test] so no parallel
+//! test pollutes the counters.
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -295,6 +298,76 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	);
 	assert!(read * 2 < len, "dc path read {read} of {len} bytes");
 
+	// 12 MP GIF — the row streamer's peak is palettes + two rows.
+	let mut gif_bytes = Vec::new();
+	{
+		let mut palette = Vec::new();
+		for i in 0..=255u8 {
+			palette.extend_from_slice(&[i, i.wrapping_mul(3), i.wrapping_mul(7)]);
+		}
+		let mut enc = gif::Encoder::new(&mut gif_bytes, 4000, 3000, &palette).unwrap();
+		let pixels: Vec<u8> = (0..4000usize * 3000).map(|i| (i % 256) as u8).collect();
+		enc.write_frame(&gif::Frame::from_indexed_pixels(4000, 3000, pixels, None))
+			.unwrap();
+	}
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(gif_bytes)), &spec(512)));
+	result.unwrap().expect("12 MP gif must thumbnail");
+	eprintln!("12 MP gif peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"12 MP gif peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// 24 MP striped TIFF — peak is one 16-row strip.
+	let mut tiff_bytes = Vec::new();
+	{
+		let data: Vec<u8> = (0..6000usize * 4000 * 3).map(|i| (i % 253) as u8).collect();
+		let mut enc = tiff::encoder::TiffEncoder::new(Cursor::new(&mut tiff_bytes)).unwrap();
+		let mut img = enc
+			.new_image::<tiff::encoder::colortype::RGB8>(6000, 4000)
+			.unwrap();
+		img.rows_per_strip(16).unwrap();
+		img.write_data(&data).unwrap();
+	}
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(tiff_bytes)), &spec(512)));
+	result.unwrap().expect("24 MP striped tiff must thumbnail");
+	eprintln!("24 MP tiff peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"24 MP tiff peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// 24 MP BMP (24bpp, 72 MB of pixel data) — the seek-rows path reads one
+	// row at a time; the fixture Vec sits at the baseline, not in the peak.
+	let mut bmp_bytes = Vec::with_capacity(6000 * 3 * 4000 + 64);
+	bmp_bytes.extend_from_slice(b"BM");
+	bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&54u32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&40u32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&6000i32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&4000i32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&1u16.to_le_bytes());
+	bmp_bytes.extend_from_slice(&24u16.to_le_bytes());
+	bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&[0u8; 8]);
+	bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+	bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
+	// 6000*3 = 18000 bytes/row, already 4-aligned; identical rows are fine
+	// for a memory test.
+	let row: Vec<u8> = (0..6000usize * 3).map(|i| (i % 251) as u8).collect();
+	for _ in 0..4000 {
+		bmp_bytes.extend_from_slice(&row);
+	}
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(bmp_bytes)), &spec(512)));
+	result.unwrap().expect("24 MP bmp must thumbnail");
+	eprintln!("24 MP bmp peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"24 MP bmp peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
 	#[cfg(feature = "heif")]
 	heif_cases();
 
@@ -333,7 +406,11 @@ fn heif_cases() {
 		)
 	});
 	let Ok(bytes) = std::fs::read(&path) else {
-		eprintln!("SKIP heif cases: no fixture at {path}");
+		eprintln!(
+			"SKIP heif cases: no fixture at {path} — the HEIF embedded-preview and \
+			 tile-decode memory ceilings are NOT being proven by this run (CI has no \
+			 fixture; supply one via MICROTHUMB_HEIF_FIXTURE to exercise them)"
+		);
 		return;
 	};
 

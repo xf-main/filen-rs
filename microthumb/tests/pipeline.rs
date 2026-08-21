@@ -4,7 +4,7 @@
 use std::io::Cursor;
 
 use image::{ImageFormat, Rgb, RgbImage};
-use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbSpec, generate};
+use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbError, ThumbSpec, generate};
 
 fn spec(target: u32) -> ThumbSpec {
 	ThumbSpec {
@@ -503,6 +503,389 @@ fn a_progressive_jpeg_with_zero_dimensions_is_refused() {
 			"{w}x{h} must not produce a thumbnail"
 		);
 	}
+}
+
+// ---- phase 2: streaming gif / tiff / bmp ----
+
+#[test]
+fn gif_thumbnails_the_first_frame_of_an_animation() {
+	let (w, h) = (64u16, 32u16);
+	let mut bytes = Vec::new();
+	{
+		let palette = [255, 0, 0, 0, 255, 0];
+		let mut enc = gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+		let px = w as usize * h as usize;
+		enc.write_frame(&gif::Frame::from_indexed_pixels(w, h, vec![0u8; px], None))
+			.unwrap();
+		enc.write_frame(&gif::Frame::from_indexed_pixels(w, h, vec![1u8; px], None))
+			.unwrap();
+	}
+	let result = generate(Box::new(MemSource(bytes)), &spec(32))
+		.unwrap()
+		.expect("gif must thumbnail");
+	assert!(
+		mean_channel(&result.rgba, 0) > 200,
+		"expected the RED first frame"
+	);
+	assert!(mean_channel(&result.rgba, 1) < 50);
+}
+
+#[test]
+fn interlaced_gif_rows_land_at_their_display_positions() {
+	// 16 distinct row colors, rows written in interlace pass order with the
+	// interlace flag set — the decode must land each at its display y.
+	let (w, h) = (16u16, 16u16);
+	let mut palette = Vec::new();
+	for i in 0..16u8 {
+		palette.extend_from_slice(&[i * 17, i * 17, i * 17]);
+	}
+	let pass_order = [0u8, 8, 4, 12, 2, 6, 10, 14, 1, 3, 5, 7, 9, 11, 13, 15];
+	let mut pixels = Vec::new();
+	for y in pass_order {
+		pixels.extend(std::iter::repeat_n(y, w as usize));
+	}
+	let mut bytes = Vec::new();
+	{
+		let mut enc = gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+		let mut frame = gif::Frame::from_indexed_pixels(w, h, pixels, None);
+		frame.interlaced = true;
+		enc.write_frame(&frame).unwrap();
+	}
+	let result = generate(Box::new(MemSource(bytes)), &spec(16))
+		.unwrap()
+		.expect("interlaced gif must thumbnail");
+	assert_eq!((result.width, result.height), (16, 16));
+	for y in 0..16u32 {
+		let v = result.rgba[(y * 16 * 4) as usize];
+		assert_eq!(v, y as u8 * 17, "row {y} landed wrong");
+	}
+}
+
+#[test]
+fn tiff_gray16_streams_with_depth_downscale() {
+	let (w, h) = (300u32, 200u32);
+	let data: Vec<u16> = (0..w * h).map(|i| ((i % w) * 65535 / w) as u16).collect();
+	let mut bytes = Vec::new();
+	{
+		let mut enc = tiff::encoder::TiffEncoder::new(std::io::Cursor::new(&mut bytes)).unwrap();
+		let mut img = enc
+			.new_image::<tiff::encoder::colortype::Gray16>(w, h)
+			.unwrap();
+		img.rows_per_strip(8).unwrap();
+		img.write_data(&data).unwrap();
+	}
+	let result = generate(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("gray16 tiff must thumbnail");
+	for px in result.rgba.chunks_exact(4) {
+		assert_eq!(px[0], px[1]);
+		assert_eq!(px[1], px[2]);
+	}
+	let mean = mean_channel(&result.rgba, 0);
+	assert!((100..=155).contains(&mean), "gradient mean drifted: {mean}");
+}
+
+#[test]
+fn a_single_huge_strip_tiff_is_refused_but_striped_is_not() {
+	let (w, h) = (2000u32, 1500u32);
+	let data: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+	let encode = |rows: u32| {
+		let mut bytes = Vec::new();
+		let mut enc = tiff::encoder::TiffEncoder::new(std::io::Cursor::new(&mut bytes)).unwrap();
+		let mut img = enc
+			.new_image::<tiff::encoder::colortype::RGB8>(w, h)
+			.unwrap();
+		img.rows_per_strip(rows).unwrap();
+		img.write_data(&data).unwrap();
+		bytes
+	};
+	// Same pixels, same budget, two strip layouts — the whole point of pricing
+	// a decode by its real per-chunk peak. One 9 MB strip must be decoded whole
+	// and cannot fit a 4 MB budget; 8-row strips peak at ~48 KB and sail
+	// through. (Under the default 12 MB budget the single strip DOES fit and is
+	// decoded — affording what the budget genuinely allows is the point.)
+	let tight = ThumbSpec {
+		target_width: 512,
+		target_height: 512,
+		mem_budget: 4 * 1024 * 1024,
+	};
+	let huge = encode(h);
+	assert_eq!(
+		generate(Box::new(MemSource(huge.clone())), &tight).unwrap(),
+		None
+	);
+	let striped = encode(8);
+	assert!(
+		generate(Box::new(MemSource(striped.clone())), &tight)
+			.unwrap()
+			.is_some()
+	);
+	// Both are affordable once the budget can actually hold the strip.
+	assert!(
+		generate(Box::new(MemSource(huge)), &spec(512))
+			.unwrap()
+			.is_some()
+	);
+	assert!(
+		generate(Box::new(MemSource(striped)), &spec(512))
+			.unwrap()
+			.is_some()
+	);
+}
+
+/// Hand-assembled uncompressed BMP (BITMAPINFOHEADER). `rows` are display
+/// order (top first), indices for 8bpp or BGR triples for 24bpp.
+fn bmp_bytes(
+	w: u32,
+	h: u32,
+	bpp: u16,
+	top_down: bool,
+	palette: &[[u8; 4]],
+	rows: &[&[u8]],
+) -> Vec<u8> {
+	let stride = ((w as usize * bpp as usize).div_ceil(32)) * 4;
+	let data_offset = 14 + 40 + palette.len() * 4;
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(b"BM");
+	bytes.extend_from_slice(&(data_offset as u32 + (stride as u32) * h).to_le_bytes());
+	bytes.extend_from_slice(&0u32.to_le_bytes());
+	bytes.extend_from_slice(&(data_offset as u32).to_le_bytes());
+	bytes.extend_from_slice(&40u32.to_le_bytes());
+	bytes.extend_from_slice(&(w as i32).to_le_bytes());
+	let h_field = if top_down { -(h as i32) } else { h as i32 };
+	bytes.extend_from_slice(&h_field.to_le_bytes());
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&bpp.to_le_bytes());
+	bytes.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+	bytes.extend_from_slice(&0u32.to_le_bytes());
+	bytes.extend_from_slice(&[0u8; 8]); // ppm
+	bytes.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+	bytes.extend_from_slice(&0u32.to_le_bytes());
+	for entry in palette {
+		bytes.extend_from_slice(entry);
+	}
+	let disk_rows: Vec<&&[u8]> = if top_down {
+		rows.iter().collect()
+	} else {
+		rows.iter().rev().collect()
+	};
+	for row in disk_rows {
+		let mut padded = row.to_vec();
+		padded.resize(stride, 0);
+		bytes.extend_from_slice(&padded);
+	}
+	bytes
+}
+
+#[test]
+fn bmp_palette_and_row_orders_stream_correctly() {
+	// 8bpp bottom-up: two rows, distinct palette colors; display top row must
+	// be palette 0 (red) even though it is LAST on disk.
+	let palette = [[0u8, 0, 255, 0], [0u8, 255, 0, 0]]; // BGRA: red, green
+	let bytes = bmp_bytes(3, 2, 8, false, &palette, &[&[0, 0, 0], &[1, 1, 1]]);
+	let result = generate(Box::new(MemSource(bytes)), &spec(4))
+		.unwrap()
+		.expect("8bpp bmp must thumbnail");
+	assert_eq!((result.width, result.height), (3, 2));
+	assert_eq!(&result.rgba[..4], &[255, 0, 0, 255], "top row must be red");
+	assert_eq!(&result.rgba[3 * 4..3 * 4 + 4], &[0, 255, 0, 255]);
+
+	// 24bpp top-down: BGR on disk, first disk row IS the top row.
+	let bytes = bmp_bytes(
+		2,
+		2,
+		24,
+		true,
+		&[],
+		&[&[255, 0, 0, 255, 0, 0], &[0, 0, 255, 0, 0, 255]],
+	);
+	let result = generate(Box::new(MemSource(bytes)), &spec(4))
+		.unwrap()
+		.expect("top-down bmp must thumbnail");
+	assert_eq!(&result.rgba[..4], &[0, 0, 255, 255], "top row must be blue");
+	assert_eq!(&result.rgba[2 * 4..2 * 4 + 4], &[255, 0, 0, 255]);
+}
+
+#[test]
+fn rle_bmp_falls_back_to_the_capped_image_path() {
+	// Minimal valid RLE8 2x2 (compression = 1): our streamer refuses it and
+	// hands the source to the whole-frame fallback, which decodes it.
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(b"BM");
+	bytes.extend_from_slice(&([0u32; 2].map(|_| 0u32))[0].to_le_bytes()); // size (unused)
+	bytes.extend_from_slice(&0u32.to_le_bytes());
+	bytes.extend_from_slice(&(14u32 + 40 + 8).to_le_bytes());
+	bytes.extend_from_slice(&40u32.to_le_bytes());
+	bytes.extend_from_slice(&2i32.to_le_bytes());
+	bytes.extend_from_slice(&2i32.to_le_bytes());
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&8u16.to_le_bytes());
+	bytes.extend_from_slice(&1u32.to_le_bytes()); // BI_RLE8
+	bytes.extend_from_slice(&0u32.to_le_bytes());
+	bytes.extend_from_slice(&[0u8; 8]);
+	bytes.extend_from_slice(&2u32.to_le_bytes());
+	bytes.extend_from_slice(&0u32.to_le_bytes());
+	bytes.extend_from_slice(&[0, 0, 255, 0]); // palette 0: red (BGRA)
+	bytes.extend_from_slice(&[0, 255, 0, 0]); // palette 1: green
+	// bottom row: 2 px of idx 0, EOL; top row: 2 px of idx 1, EOS.
+	bytes.extend_from_slice(&[2, 0, 0, 0, 2, 1, 0, 1]);
+	let result = generate(Box::new(MemSource(bytes)), &spec(4))
+		.unwrap()
+		.expect("rle bmp must fall back and decode");
+	assert_eq!((result.width, result.height), (2, 2));
+	assert_eq!(&result.rgba[..4], &[0, 255, 0, 255], "top row green");
+}
+
+// ---- review-fix pass: hostile shapes and the work ceiling ----
+
+/// GIF89a + a bare logical screen descriptor + an immediate trailer + one
+/// trailing byte. The decoder's trailer state consumes nothing and reports
+/// nothing, so feeding it that byte used to spin forever INSIDE update();
+/// the trailer bail must fire first.
+#[test]
+fn a_trailer_before_any_frame_errors_instead_of_spinning() {
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(b"GIF89a");
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&1u16.to_le_bytes());
+	bytes.extend_from_slice(&[0, 0, 0]);
+	bytes.push(0x3B);
+	bytes.push(0x00);
+	assert!(generate(Box::new(MemSource(bytes)), &spec(64)).is_err());
+}
+
+fn crc32(data: &[u8]) -> u32 {
+	let mut crc = 0xFFFF_FFFFu32;
+	for &b in data {
+		crc ^= u32::from(b);
+		for _ in 0..8 {
+			crc = (crc >> 1) ^ (0xEDB8_8320 & (0u32.wrapping_sub(crc & 1)));
+		}
+	}
+	!crc
+}
+
+fn png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+	out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+	out.extend_from_slice(tag);
+	out.extend_from_slice(data);
+	let mut crc_input = tag.to_vec();
+	crc_input.extend_from_slice(data);
+	out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+/// A 1×2³⁰ PNG: per-row memory passes any budget — the row COUNT is the
+/// attack. The source-side ceiling refuses it before a single row decodes.
+/// (Hand-built header; actually encoding one would itself be the DoS.)
+#[test]
+fn a_degenerate_png_ribbon_refuses_before_any_decode_work() {
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+	let mut ihdr = Vec::new();
+	ihdr.extend_from_slice(&1u32.to_be_bytes());
+	ihdr.extend_from_slice(&(1u32 << 30).to_be_bytes());
+	ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, no interlace
+	png_chunk(&mut bytes, b"IHDR", &ihdr);
+	png_chunk(&mut bytes, b"IDAT", &[0x78, 0x9C]);
+	png_chunk(&mut bytes, b"IEND", &[]);
+	assert_eq!(
+		generate(Box::new(MemSource(bytes)), &spec(64)).unwrap(),
+		None
+	);
+}
+
+/// A forged `RowsPerStrip=1` TIFF declaring 2²⁶ rows: every per-strip peak is
+/// tiny, the strip count is the attack. Hand-built IFD — inline values only.
+#[test]
+fn a_forged_strip_count_tiff_refuses_before_any_decode_work() {
+	let mut t = Vec::new();
+	t.extend_from_slice(b"II");
+	t.extend_from_slice(&42u16.to_le_bytes());
+	t.extend_from_slice(&8u32.to_le_bytes());
+	let entries: &[(u16, u16, u32)] = &[
+		(256, 3, 1),        // ImageWidth = 1
+		(257, 4, 1 << 26),  // ImageLength
+		(258, 3, 8),        // BitsPerSample
+		(259, 3, 1),        // Compression = none
+		(262, 3, 1),        // Photometric = BlackIsZero
+		(273, 4, 0x10_000), // StripOffsets (bogus, never read)
+		(277, 3, 1),        // SamplesPerPixel
+		(278, 4, 1),        // RowsPerStrip = 1
+		(279, 4, 1),        // StripByteCounts
+	];
+	t.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+	for &(tag, kind, value) in entries {
+		t.extend_from_slice(&tag.to_le_bytes());
+		t.extend_from_slice(&kind.to_le_bytes());
+		t.extend_from_slice(&1u32.to_le_bytes());
+		if kind == 3 {
+			t.extend_from_slice(&(value as u16).to_le_bytes());
+			t.extend_from_slice(&0u16.to_le_bytes());
+		} else {
+			t.extend_from_slice(&value.to_le_bytes());
+		}
+	}
+	t.extend_from_slice(&0u32.to_le_bytes());
+	let result = generate(Box::new(MemSource(t)), &spec(64));
+	// Refused on the DECLARED count, before `Decoder::new` reads a single
+	// offset entry — the whole point, since that constructor materialises the
+	// per-strip tables eagerly (~48 B each, so 2²⁶ strips is gigabytes) under
+	// the tiff crate's own limits rather than ours. A generic Err would also
+	// have passed here before the gate existed, so pin the reason.
+	match result {
+		Err(ThumbError::Decode(msg)) => assert!(
+			msg.contains("strip/tile count"),
+			"expected the pre-decode strip-count refusal, got {msg}"
+		),
+		other => panic!("expected a pre-decode refusal, got {other:?}"),
+	}
+}
+
+/// An embedded preview that does not fit the budget (with its rotation copy)
+/// must not be served through the fast path — pre-fix it skipped the budget
+/// check entirely.
+#[test]
+fn an_oversized_embedded_preview_is_not_served_unbudgeted() {
+	let bytes = jpeg_with_exif_thumbnail(1);
+	let starved = ThumbSpec {
+		target_width: 16,
+		target_height: 16,
+		mem_budget: 64,
+	};
+	// The preview would suffice for a 16px target, but 64 bytes cannot hold
+	// it twice over — and the starved budget refuses the real decode too.
+	assert_eq!(
+		generate(Box::new(MemSource(bytes)), &starved).unwrap(),
+		None
+	);
+}
+
+/// #11: a first frame smaller than the logical screen — the surrounding
+/// border must carry the background color, exercised by no other fixture.
+#[test]
+fn a_small_first_frame_fills_the_border_with_the_background() {
+	let (w, h) = (16u16, 16u16);
+	let mut bytes = Vec::new();
+	{
+		// Palette index 0 (the background) is blue, index 1 is red.
+		let palette = [0, 0, 255, 255, 0, 0];
+		let mut enc = gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+		let mut frame = gif::Frame::from_indexed_pixels(8, 8, vec![1u8; 64], None);
+		frame.left = 4;
+		frame.top = 4;
+		enc.write_frame(&frame).unwrap();
+	}
+	let result = generate(Box::new(MemSource(bytes)), &spec(16))
+		.unwrap()
+		.expect("gif with a small frame must thumbnail");
+	assert_eq!((result.width, result.height), (16, 16));
+	assert_eq!(&result.rgba[..4], &[0, 0, 255, 255], "corner is background");
+	let center = ((8 * 16 + 8) * 4) as usize;
+	assert_eq!(
+		&result.rgba[center..center + 4],
+		&[255, 0, 0, 255],
+		"frame interior is the frame's color"
+	);
 }
 
 #[test]
