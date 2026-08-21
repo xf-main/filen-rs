@@ -404,23 +404,38 @@ pub(crate) fn select_change_meta(conn: &Connection) -> Result<([u8; 16], i64), r
 	conn.query_one(SELECT_CHANGE_META, [], |row| Ok((row.get(0)?, row.get(1)?)))
 }
 
-/// Every item stamped above `seq_floor` — what a replica holding that sequence has not been shown.
+/// Every item stamped above `seq_floor` and at or below `seq_cutoff` — what a replica holding
+/// that sequence has not been shown, bounded to one page (`i64::MAX` for the whole diff).
 pub(crate) fn select_changed_items(
 	conn: &Connection,
 	seq_floor: i64,
+	seq_cutoff: i64,
 ) -> SQLResult<Vec<DBNonRootObject>> {
 	let mut stmt = conn.prepare_cached(SELECT_CHANGED_ITEMS)?;
-	stmt.query_and_then([seq_floor], DBNonRootObject::from_row)?
+	stmt.query_and_then([seq_floor, seq_cutoff], DBNonRootObject::from_row)?
 		.collect::<SQLResult<Vec<_>>>()
 }
 
-/// Every provider id retired above `seq_floor`, oldest first.
+/// Every provider id retired above `seq_floor` and at or below `seq_cutoff`, oldest first.
 pub(crate) fn select_retired_ids(
 	conn: &Connection,
 	seq_floor: i64,
+	seq_cutoff: i64,
 ) -> Result<Vec<Uuid>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(SELECT_RETIRED_IDS)?;
-	stmt.query_map([seq_floor], |row| row.get(0))?
+	stmt.query_map([seq_floor, seq_cutoff], |row| row.get(0))?
+		.collect::<Result<Vec<_>, _>>()
+}
+
+/// Up to `limit` live sequences above `seq_floor`, items and tombstones pooled, oldest first —
+/// how a paged diff picks its cutoff (see [`statements::SELECT_CHANGE_SEQS_PAGE`]).
+pub(crate) fn select_change_seqs_page(
+	conn: &Connection,
+	seq_floor: i64,
+	limit: i64,
+) -> Result<Vec<i64>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(SELECT_CHANGE_SEQS_PAGE)?;
+	stmt.query_map([seq_floor, limit], |row| row.get(0))?
 		.collect::<Result<Vec<_>, _>>()
 }
 
@@ -2451,7 +2466,7 @@ mod change_tracking_tests {
 		add_dir(&conn, uuid(1), parent, "sub");
 		add_file(&conn, uuid(2), stable(3), uuid(1), "a.txt");
 
-		let changes = changes_since(&conn, Some(&served)).unwrap();
+		let changes = changes_since(&conn, Some(&served), 0).unwrap();
 		assert_eq!(
 			updated_uuids(&changes),
 			vec![uuid(1).to_string(), uuid(2).to_string()],
@@ -2465,7 +2480,7 @@ mod change_tracking_tests {
 		assert!(!changes.more, "a diff is served whole");
 
 		let served = changes.anchor;
-		let changes = changes_since(&conn, Some(&served)).unwrap();
+		let changes = changes_since(&conn, Some(&served), 0).unwrap();
 		assert!(
 			changes.updated.is_empty() && changes.deleted_ids.is_empty(),
 			"asking again after nothing happened must return nothing: {changes:?}"
@@ -2481,7 +2496,7 @@ mod change_tracking_tests {
 		)
 		.unwrap();
 
-		let changes = changes_since(&conn, Some(&served)).unwrap();
+		let changes = changes_since(&conn, Some(&served), 0).unwrap();
 		assert_eq!(
 			updated_uuids(&changes),
 			vec![uuid(2).to_string()],
@@ -2515,7 +2530,7 @@ mod change_tracking_tests {
 		)
 		.unwrap();
 
-		let changes = changes_since(&conn, Some(&served)).unwrap();
+		let changes = changes_since(&conn, Some(&served), 0).unwrap();
 		assert_eq!(
 			sorted(changes.deleted_ids),
 			sorted(vec![provider_id(uuid(2)), provider_id(uuid(3))]),
@@ -2527,7 +2542,7 @@ mod change_tracking_tests {
 		add_file(&conn, uuid(4), stable(2), parent, "a.txt");
 		add_dir(&conn, uuid(3), parent, "sub");
 
-		let changes = changes_since(&conn, Some(&served)).unwrap();
+		let changes = changes_since(&conn, Some(&served), 0).unwrap();
 		assert!(
 			changes.deleted_ids.is_empty(),
 			"both ids resolve again, so neither may still be served as deleted: {:?}",
@@ -2554,7 +2569,7 @@ mod change_tracking_tests {
 			.unwrap();
 		assert_eq!(retired(&conn).len(), 1, "there is a tombstone to withhold");
 
-		let changes = changes_since(&conn, None).unwrap();
+		let changes = changes_since(&conn, None, 0).unwrap();
 
 		assert_eq!(
 			updated_uuids(&changes),
@@ -2592,7 +2607,7 @@ mod change_tracking_tests {
 		] {
 			assert!(
 				matches!(
-					changes_since(&conn, Some(anchor)),
+					changes_since(&conn, Some(anchor), 0),
 					Err(CacheError::SyncAnchorExpired(_))
 				),
 				"{label} must expire rather than be honoured"
@@ -2600,7 +2615,7 @@ mod change_tracking_tests {
 		}
 
 		assert!(
-			changes_since(&conn, Some(&ours)).is_ok(),
+			changes_since(&conn, Some(&ours), 0).is_ok(),
 			"and our own must still be good"
 		);
 	}

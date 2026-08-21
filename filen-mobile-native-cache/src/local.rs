@@ -126,8 +126,24 @@ impl FilenMobileCacheState {
 	/// or miss one made after it was read. Consumers must treat those two fields as a hint and ask
 	/// for the item itself when the answer matters.
 	pub fn enumerate_changes(&self, anchor: Option<Vec<u8>>) -> Result<FfiChanges, CacheError> {
-		let changes = self
-			.sync_execute_authed(|auth_state| changes_since(&auth_state.conn(), anchor.as_deref()));
+		self.enumerate_changes_page(anchor, 0)
+	}
+
+	/// [`Self::enumerate_changes`], bounded to at most `limit` changes (items and retired ids
+	/// pooled, in change order). `limit` 0 means unbounded. A full page comes back with
+	/// [`FfiChanges::more`] set and an anchor naming the page's last change — hand it straight
+	/// back for the next page. Paging is what keeps a bulk change (a big delete, a first listing
+	/// of a huge folder) from wedging the feed on one giant response: each page the consumer
+	/// commits advances the anchor durably, so a killed enumeration resumes instead of starting
+	/// over.
+	pub fn enumerate_changes_page(
+		&self,
+		anchor: Option<Vec<u8>>,
+		limit: u32,
+	) -> Result<FfiChanges, CacheError> {
+		let changes = self.sync_execute_authed(|auth_state| {
+			changes_since(&auth_state.conn(), anchor.as_deref(), limit)
+		});
 		// The replica has just been told where things stand, which is the natural moment to bring
 		// tracking in line with the working set — never before serving the diff, which this must
 		// not hold up. It is also the backstop for every membership change that has no refresh of
@@ -264,6 +280,7 @@ pub(crate) fn current_sync_anchor(conn: &Connection) -> Result<Vec<u8>, CacheErr
 pub(crate) fn changes_since(
 	conn: &Connection,
 	anchor: Option<&[u8]>,
+	limit: u32,
 ) -> Result<FfiChanges, CacheError> {
 	let (db_instance, seq) = sql::select_change_meta(conn)?;
 	let seq_floor = match anchor {
@@ -272,14 +289,31 @@ pub(crate) fn changes_since(
 		// live item is new to it, and every retired id names something it never heard of.
 		None => 0,
 	};
-	debug!("Enumerating changes above sequence {seq_floor} (at {seq})");
+	debug!("Enumerating changes above sequence {seq_floor} (at {seq}, limit {limit})");
 
-	let updated = sql::select_changed_items(conn, seq_floor)?
+	// The page cutoff. Items and retired ids advance through ONE pooled sequence order, so a
+	// bulk delete's tombstones page exactly like a bulk listing's rows — neither can wedge the
+	// feed on a response too big to deliver. A partial page's anchor names its LAST change; the
+	// final page keeps the counter-first anchor, so a write landing mid-read is re-served by the
+	// next diff instead of skipped (see the read-order contract above).
+	let (seq_cutoff, more) = if limit == 0 {
+		(i64::MAX, false)
+	} else {
+		let seqs = sql::select_change_seqs_page(conn, seq_floor, i64::from(limit) + 1)?;
+		if seqs.len() > limit as usize {
+			(seqs[limit as usize - 1], true)
+		} else {
+			// The page swallows the whole remaining diff.
+			(i64::MAX, false)
+		}
+	};
+
+	let updated = sql::select_changed_items(conn, seq_floor, seq_cutoff)?
 		.into_iter()
 		.map(|obj| FfiObject::from(DBObject::from(obj)))
 		.collect();
 	let deleted_ids = match anchor {
-		Some(_) => sql::select_retired_ids(conn, seq_floor)?
+		Some(_) => sql::select_retired_ids(conn, seq_floor, seq_cutoff)?
 			.into_iter()
 			.map(|id| format!("{STABLE_PREFIX}{id}"))
 			.collect(),
@@ -289,8 +323,12 @@ pub(crate) fn changes_since(
 	Ok(FfiChanges {
 		updated,
 		deleted_ids,
-		anchor: encode_anchor(&db_instance, seq),
-		more: false,
+		anchor: if more {
+			encode_anchor(&db_instance, seq_cutoff)
+		} else {
+			encode_anchor(&db_instance, seq)
+		},
+		more,
 	})
 }
 
@@ -704,5 +742,147 @@ mod id_resolution_tests {
 			resolve_uuid_or_stable(&conn, &format!("{}/child.txt", uuid(9))).is_err(),
 			"a path names a place, and this is not the resolver that walks one"
 		);
+	}
+}
+
+#[cfg(test)]
+mod change_feed_paging_tests {
+	use super::*;
+
+	fn db() -> Connection {
+		let conn = Connection::open_in_memory().unwrap();
+		crate::auth::configure_conn(&conn).unwrap();
+		conn.execute_batch(sql::statements::INIT).unwrap();
+		add_dir(&conn, uuid(9));
+		conn
+	}
+
+	fn uuid(byte: u8) -> Uuid {
+		Uuid::from_bytes([byte; 16])
+	}
+
+	/// A file row as a listing leaves it — enough of one for the feed to render it.
+	fn add_file(conn: &Connection, uuid_: Uuid, stable: Uuid) {
+		conn.execute(
+			"INSERT INTO items (uuid, stable_uuid, parent, type) VALUES (?1, ?2, ?3, 2);",
+			rusqlite::params![uuid_, stable, uuid(9)],
+		)
+		.unwrap();
+		conn.execute(
+			"INSERT INTO files (id, size, chunks, region, bucket, timestamp,
+				metadata_state, raw_metadata)
+			VALUES (last_insert_rowid(), 1, 1, 'de-1', 'b', 1, 2, 'encrypted');",
+			[],
+		)
+		.unwrap();
+	}
+
+	fn add_dir(conn: &Connection, uuid_: Uuid) {
+		conn.execute(
+			"INSERT INTO items (uuid, parent, type) VALUES (?1, NULL, 0);",
+			rusqlite::params![uuid_],
+		)
+		.unwrap();
+	}
+
+	/// One page id per change, in the order the pages served them: `stable/<id>` for a
+	/// retirement, the item's uuid for an update.
+	fn walk_pages(conn: &Connection, mut anchor: Vec<u8>, limit: u32) -> (Vec<String>, usize) {
+		let mut served = Vec::new();
+		let mut pages = 0;
+		loop {
+			let page = changes_since(conn, Some(&anchor), limit).unwrap();
+			pages += 1;
+			assert!(
+				limit == 0 || page.updated.len() + page.deleted_ids.len() <= limit as usize,
+				"a page must not exceed its limit"
+			);
+			for obj in &page.updated {
+				let FfiObject::File(file) = obj else {
+					panic!("only file rows were seeded");
+				};
+				served.push(file.uuid.clone());
+			}
+			served.extend(page.deleted_ids.iter().cloned());
+			anchor = page.anchor;
+			if !page.more {
+				// The final page's anchor is the live counter, exactly like an unpaged diff.
+				assert_eq!(anchor, current_sync_anchor(conn).unwrap());
+				return (served, pages);
+			}
+		}
+	}
+
+	/// The F2 wedge, un-wedged: a diff bigger than one page walks out in bounded pages, items
+	/// and retirements pooled through one sequence order, every change served exactly once, and
+	/// each partial page's anchor resuming exactly where it stopped.
+	#[test]
+	fn a_bulk_diff_pages_out_without_loss_or_duplication() {
+		let mut conn = db();
+		let anchor = current_sync_anchor(&conn).unwrap();
+
+		for byte in 1..=5u8 {
+			add_file(&conn, uuid(byte), uuid(byte + 100));
+		}
+		// Two retirements land ABOVE the survivors in the history: deletes tombstone the files
+		// by their stable id.
+		sql::delete_item(&mut conn, uuid(2)).unwrap();
+		sql::delete_item(&mut conn, uuid(4)).unwrap();
+
+		let (served, pages) = walk_pages(&conn, anchor, 2);
+
+		// Three live rows and two retirements = five changes over three pages of two.
+		assert_eq!(pages, 3, "five changes at limit 2 must take three pages");
+		let expected: Vec<String> = vec![
+			uuid(1).to_string(),
+			uuid(3).to_string(),
+			uuid(5).to_string(),
+			format!("{STABLE_PREFIX}{}", uuid(102)),
+			format!("{STABLE_PREFIX}{}", uuid(104)),
+		];
+		let mut sorted = served.clone();
+		sorted.sort();
+		let mut expected_sorted = expected.clone();
+		expected_sorted.sort();
+		assert_eq!(
+			sorted, expected_sorted,
+			"every change must be served exactly once across the pages"
+		);
+		// The retirements were the LAST writes, so pooled ordering puts them after the rows.
+		assert_eq!(
+			&served[3..],
+			&expected[3..],
+			"pages must walk the pooled history in sequence order"
+		);
+	}
+
+	/// An unpaged read is byte-for-byte what it was before paging existed: the whole diff, the
+	/// live counter as the anchor, and `more` false.
+	#[test]
+	fn an_unbounded_read_serves_the_whole_diff_in_one_page() {
+		let conn = db();
+		let anchor = current_sync_anchor(&conn).unwrap();
+		for byte in 1..=5u8 {
+			add_file(&conn, uuid(byte), uuid(byte + 100));
+		}
+
+		let (served, pages) = walk_pages(&conn, anchor, 0);
+		assert_eq!(pages, 1);
+		assert_eq!(served.len(), 5);
+	}
+
+	/// A limit exactly matching the diff must come back as a final page, not dangle a `more`
+	/// that serves an empty follow-up forever.
+	#[test]
+	fn an_exactly_full_page_is_final() {
+		let conn = db();
+		let anchor = current_sync_anchor(&conn).unwrap();
+		add_file(&conn, uuid(1), uuid(101));
+		add_file(&conn, uuid(2), uuid(102));
+
+		let page = changes_since(&conn, Some(&anchor), 2).unwrap();
+		assert_eq!(page.updated.len(), 2);
+		assert!(!page.more, "a page that drained the diff is the last page");
+		assert_eq!(page.anchor, current_sync_anchor(&conn).unwrap());
 	}
 }

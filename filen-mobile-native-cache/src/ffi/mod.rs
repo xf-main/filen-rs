@@ -385,9 +385,11 @@ pub struct FfiChanges {
 	/// The anchor to hand back next time. Opaque bytes: it names both the
 	/// sequence reached and the incarnation of the database that issued it.
 	pub anchor: Vec<u8>,
-	/// Whether another page follows this one. Always `false` today — a diff is
-	/// served whole — and here so that adding paging later does not change the
-	/// shape of the call.
+	/// Whether another page follows this one. Set only by the paged call
+	/// ([`FilenMobileCacheState::enumerate_changes_page`](crate::auth::FilenMobileCacheState)
+	/// with a non-zero limit): hand [`FfiChanges::anchor`] back to get the next
+	/// page, and report it to the system as the anchor reached so a killed
+	/// enumeration resumes where it stopped.
 	pub more: bool,
 }
 

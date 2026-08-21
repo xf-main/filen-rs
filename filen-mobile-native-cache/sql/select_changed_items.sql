@@ -41,6 +41,10 @@ LEFT JOIN files_meta ON items.id = files_meta.id
 -- like any other, and they keep their original `parent` for the restore.
 WHERE
 	items.change_seq > ?1
+	-- The page bound: a paged feed serves the diff in change_seq order up to a
+	-- cutoff chosen by the caller (i64::MAX for an unpaged read), so a bulk
+	-- change cannot wedge delivery on one giant response.
+	AND items.change_seq <= ?2
 	-- Roots are local scaffolding; no replica ever sees one.
 	AND items.type != 0
 	-- A row whose per-type half has not landed yet cannot be rendered: the

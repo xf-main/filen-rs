@@ -92,11 +92,24 @@ pub(crate) const SELECT_CHANGE_META: &str = "SELECT db_instance, counter FROM ch
 /// is evaluated before the AFTER triggers that do the stamping, and the per-type tables bump the
 /// item again after the `items` row itself is written.
 pub(crate) const SELECT_CHANGE_SEQ: &str = "SELECT change_seq FROM items WHERE id = ?;";
-/// The provider ids retired above a sequence. `kind` is not selected: it is what keeps the
-/// tombstone lookups off a full scan (see `init.sql`), but both kinds render into the same
-/// `stable/<id>` namespace, so the id alone is the whole answer.
+/// The provider ids retired above a sequence, up to the page cutoff (`?2`, i64::MAX for an
+/// unpaged read). `kind` is not selected: it is what keeps the tombstone lookups off a full scan
+/// (see `init.sql`), but both kinds render into the same `stable/<id>` namespace, so the id
+/// alone is the whole answer.
 pub(crate) const SELECT_RETIRED_IDS: &str =
-	"SELECT item_id FROM tombstones WHERE seq > ?1 ORDER BY seq ASC;";
+	"SELECT item_id FROM tombstones WHERE seq > ?1 AND seq <= ?2 ORDER BY seq ASC;";
+/// The sequences live above `?1`, items and tombstones pooled, oldest first, at most `?2` of
+/// them — how a paged diff picks its cutoff: the last sequence of a full page bounds what that
+/// page serves, so items and retirements advance through ONE ordered history and neither can
+/// starve the other. The items half deliberately skips the per-type joins: a half-written row's
+/// sequence may shorten a page, never lose a change (landing the other half re-stamps it).
+pub(crate) const SELECT_CHANGE_SEQS_PAGE: &str = "SELECT seq FROM (
+	SELECT items.change_seq AS seq FROM items
+	WHERE items.change_seq > ?1 AND items.type != 0
+	UNION ALL
+	SELECT tombstones.seq AS seq FROM tombstones WHERE tombstones.seq > ?1
+)
+ORDER BY seq ASC LIMIT ?2;";
 pub(crate) const SELECT_CHANGED_ITEMS: &str = include_str!("../../sql/select_changed_items.sql");
 pub(crate) const SELECT_WORKING_SET: &str = include_str!("../../sql/select_working_set.sql");
 
