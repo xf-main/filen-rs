@@ -1,0 +1,335 @@
+//! The memory contract, enforced: a counting allocator measures the high-water
+//! mark of `generate()` on large fixtures and asserts it stays inside the
+//! budget. On macOS the meter is libmalloc's `malloc_logger` hook, which sees
+//! every allocation in the process — including the C side (libheif/libde265),
+//! which a Rust `#[global_allocator]` cannot observe. Elsewhere the global
+//! allocator swap meters the pure-Rust formats. This lives in its own test
+//! binary because both meters are process-wide, and runs the cases in ONE
+//! #[test] so no parallel test pollutes the counters.
+
+use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use image::{ImageFormat, Rgb, RgbImage};
+use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbSpec, generate};
+
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn on_alloc(size: usize) {
+	let now = CURRENT.fetch_add(size, Ordering::Relaxed) + size;
+	PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+#[cfg(not(target_os = "macos"))]
+mod meter {
+	use std::alloc::{GlobalAlloc, Layout, System};
+	use std::sync::atomic::Ordering;
+
+	use super::{CURRENT, on_alloc};
+
+	struct Counting;
+
+	unsafe impl GlobalAlloc for Counting {
+		unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+			on_alloc(layout.size());
+			unsafe { System.alloc(layout) }
+		}
+
+		unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+			CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
+			unsafe { System.dealloc(ptr, layout) }
+		}
+
+		unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+			if new_size > layout.size() {
+				on_alloc(new_size - layout.size());
+			} else {
+				CURRENT.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+			}
+			unsafe { System.realloc(ptr, layout, new_size) }
+		}
+	}
+
+	#[global_allocator]
+	static ALLOC: Counting = Counting;
+
+	pub fn install() {}
+
+	pub fn dropped() -> usize {
+		0
+	}
+}
+
+/// libmalloc's logging hook. Installing a `malloc_logger` gets a callback for
+/// every malloc/realloc/free across all zones in this process — Rust's
+/// `System` allocator funnels through libmalloc too, so this single meter
+/// subsumes the global-allocator one AND sees libheif/libde265.
+///
+/// Free and realloc events do not carry the old block's size, so the callback
+/// keeps a fixed-size open-addressing table of live (ptr, size) pairs. The
+/// callback runs inside malloc itself and therefore must never allocate: the
+/// table is static, insertion is CAS-only, and overflow is counted (never
+/// dropped silently) — an untracked block inflates CURRENT forever, which only
+/// over-reports the peak, and `dropped()` is asserted zero regardless.
+#[cfg(target_os = "macos")]
+mod meter {
+	use std::sync::Once;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use super::{CURRENT, on_alloc};
+
+	// stack_logging.h: event type bits.
+	const TYPE_ALLOC: u32 = 2;
+	const TYPE_DEALLOC: u32 = 4;
+	const FLAG_ZONE: u32 = 8;
+
+	type Logger = unsafe extern "C" fn(u32, usize, usize, usize, usize, u32);
+
+	unsafe extern "C" {
+		static mut malloc_logger: Option<Logger>;
+	}
+
+	const SLOTS: usize = 1 << 20;
+	const PROBE_LIMIT: usize = 1024;
+	const TOMBSTONE: usize = usize::MAX;
+
+	static PTRS: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+	static SIZES: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+	static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+	fn slot(ptr: usize, step: usize) -> usize {
+		(((ptr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) + step) & (SLOTS - 1)
+	}
+
+	/// The malloc callback for `ptr` runs before malloc returns it, so no other
+	/// thread can race an insert of the same pointer with its own free.
+	fn insert(ptr: usize, size: usize) {
+		for step in 0..PROBE_LIMIT {
+			let s = &PTRS[slot(ptr, step)];
+			let found = s.load(Ordering::Relaxed);
+			if (found == 0 || found == TOMBSTONE)
+				&& s.compare_exchange(found, ptr, Ordering::AcqRel, Ordering::Relaxed)
+					.is_ok()
+			{
+				SIZES[slot(ptr, step)].store(size, Ordering::Release);
+				return;
+			}
+		}
+		DROPPED.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Size the pointer was tracked with, or 0 for blocks allocated before the
+	/// hook was installed (their free is a no-op on the counters).
+	fn remove(ptr: usize) -> usize {
+		for step in 0..PROBE_LIMIT {
+			let idx = slot(ptr, step);
+			let found = PTRS[idx].load(Ordering::Relaxed);
+			if found == ptr {
+				let size = SIZES[idx].load(Ordering::Acquire);
+				PTRS[idx].store(TOMBSTONE, Ordering::Release);
+				return size;
+			}
+			if found == 0 {
+				return 0;
+			}
+		}
+		0
+	}
+
+	unsafe extern "C" fn logger(ty: u32, p1: usize, p2: usize, p3: usize, result: usize, _n: u32) {
+		// With the zone flag, p1 is the zone and the payload shifts to p2/p3.
+		let (a, b) = if ty & FLAG_ZONE != 0 {
+			(p2, p3)
+		} else {
+			(p1, p2)
+		};
+		match ty & (TYPE_ALLOC | TYPE_DEALLOC) {
+			t if t == TYPE_ALLOC | TYPE_DEALLOC => {
+				// realloc: a = old ptr, b = new size, result = new ptr.
+				let old = remove(a);
+				if result != 0 {
+					insert(result, b);
+					on_alloc(b);
+				}
+				CURRENT.fetch_sub(old, Ordering::Relaxed);
+			}
+			TYPE_ALLOC => {
+				// malloc/calloc/valloc: a = size, result = the block.
+				if result != 0 {
+					insert(result, a);
+					on_alloc(a);
+				}
+			}
+			TYPE_DEALLOC => {
+				// free: a = the block.
+				let old = remove(a);
+				CURRENT.fetch_sub(old, Ordering::Relaxed);
+			}
+			_ => {}
+		}
+	}
+
+	pub fn install() {
+		static ONCE: Once = Once::new();
+		ONCE.call_once(|| unsafe {
+			malloc_logger = Some(logger);
+		});
+	}
+
+	pub fn dropped() -> usize {
+		DROPPED.load(Ordering::Relaxed)
+	}
+}
+
+/// Peak extra bytes allocated while `f` ran, on top of what was already live.
+fn measured_peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
+	meter::install();
+	let baseline = CURRENT.load(Ordering::Relaxed);
+	PEAK.store(baseline, Ordering::Relaxed);
+	let out = f();
+	let peak = PEAK.load(Ordering::Relaxed);
+	(out, peak.saturating_sub(baseline))
+}
+
+fn spec(target: u32) -> ThumbSpec {
+	ThumbSpec {
+		target_width: target,
+		target_height: target,
+		mem_budget: DEFAULT_MEM_BUDGET,
+	}
+}
+
+/// Any real photograph downscales to more than one colour; a decode bug that
+/// pushes nothing (or one tile) into the canvas leaves it flat.
+#[cfg(feature = "heif")]
+fn assert_not_flat(image: &microthumb::SmallImage, what: &str) {
+	let first = &image.rgba[..4];
+	assert!(
+		image.rgba.chunks_exact(4).any(|px| px != first),
+		"{what}: decoded image is a single flat colour"
+	);
+}
+
+#[test]
+fn generate_stays_inside_the_budget_for_large_sources() {
+	// 24 MP — the class of source the old full-frame pipeline died on
+	// (96 MB of RGBA). Fixture encoding happens OUTSIDE the measurement.
+	let gradient = RgbImage::from_fn(6000, 4000, |x, y| {
+		Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+	});
+
+	let mut jpeg = Vec::new();
+	gradient
+		.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+		.unwrap();
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(jpeg)), &spec(512)));
+	// The input Vec (a few MB) is owned by the source and counted at the
+	// baseline of the closure via the move — subtract nothing, just assert
+	// the whole thing stays under budget + the moved-in source itself.
+	let result = result.unwrap().expect("24 MP baseline jpeg must thumbnail");
+	assert!(result.width >= 500 || result.height >= 500);
+	eprintln!("24 MP baseline jpeg peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"24 MP jpeg peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	let mut png = Vec::new();
+	gradient
+		.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+		.unwrap();
+	drop(gradient);
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(png)), &spec(512)));
+	result.unwrap().expect("24 MP png must thumbnail");
+	eprintln!("24 MP png peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"24 MP png peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// A 60 MP baseline JPEG — beyond any phone sensor — still fits: the IDCT
+	// scale keeps the decode output proportional to the target, not the file.
+	let big = RgbImage::from_pixel(10000, 6000, Rgb([90, 120, 30]));
+	let mut jpeg = Vec::new();
+	big.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+		.unwrap();
+	drop(big);
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(jpeg)), &spec(512)));
+	result.unwrap().expect("60 MP baseline jpeg must thumbnail");
+	eprintln!("60 MP baseline jpeg peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"60 MP jpeg peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	#[cfg(feature = "heif")]
+	heif_cases();
+
+	assert_eq!(meter::dropped(), 0, "the live-block table overflowed");
+}
+
+/// A real device HEIC (`iphone_img.heic` at the workspace root, or
+/// `MICROTHUMB_HEIF_FIXTURE`) exercises both HEIF paths against the C side of
+/// the pipeline — which only the macOS malloc_logger meter can see; the
+/// global-allocator meter under-counts these two cases and their ceilings are
+/// asserted for the C-aware meter's benefit. HEVC cannot be encoded at test
+/// time (the vendored libheif is decode-only), so this is the one fixture-file
+/// dependency; the case skips loudly when the file is absent.
+#[cfg(feature = "heif")]
+fn heif_cases() {
+	let path = std::env::var("MICROTHUMB_HEIF_FIXTURE").unwrap_or_else(|_| {
+		format!(
+			"{}/../iphone_img.heic",
+			env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+		)
+	});
+	let Ok(bytes) = std::fs::read(&path) else {
+		eprintln!("SKIP heif cases: no fixture at {path}");
+		return;
+	};
+
+	// Embedded-thumbnail path: a device HEIC carries a `thmb` item (~320–685 px
+	// depending on iOS vintage), which suffices for a 512 target — no tile is
+	// ever decoded, and the result IS the preview, whose dimensions anchor the
+	// tile-path proof below.
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(bytes.clone())), &spec(512)));
+	let preview = result.unwrap().expect("device heic must thumbnail at 512");
+	assert_not_flat(&preview, "heif embedded preview");
+	eprintln!("heif embedded-preview peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"heif preview peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// Tile path. The requested target alone can no longer force it: an
+	// oversized request is clamped to what the budget can serve, so asking for
+	// 2048 under the default budget just serves the embedded preview again.
+	// A budget large enough to make the clamped target exceed twice the
+	// preview's long side is what sends the decode through the grid — and the
+	// peak is then asserted against THAT budget, since the canvas is entitled
+	// to spend it. A strictly larger long side than the 512-target run is the
+	// proof the tiles actually ran, whatever thumb this fixture carries.
+	const TILE_BUDGET: usize = 96 * 1024 * 1024;
+	let tile_spec = ThumbSpec {
+		target_width: 2048,
+		target_height: 2048,
+		mem_budget: TILE_BUDGET,
+	};
+	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(bytes)), &tile_spec));
+	let result = result.unwrap().expect("device heic must thumbnail at 2048");
+	assert!(
+		result.width.max(result.height) > preview.width.max(preview.height),
+		"expected the tile-decoded canvas to out-resolve the {}x{} preview, got {}x{}",
+		preview.width,
+		preview.height,
+		result.width,
+		result.height
+	);
+	assert_not_flat(&result, "heif tile decode");
+	eprintln!("heif tile-decode peak: {peak} bytes");
+	assert!(
+		peak <= TILE_BUDGET,
+		"heif tile decode peaked at {peak} bytes (budget {TILE_BUDGET})"
+	);
+}

@@ -7,3 +7,7 @@
 // Tile-wise decoding of grid images (heif_image_handle_get_image_tiling /
 // heif_image_handle_decode_image_tile) — the memory-bounded HEIF path.
 #include <libheif/heif_tiling.h>
+// Per-context security limits (heif_context_get_security_limits) — the only
+// pre-allocation guard on the tile-decode path, which skips libheif's
+// whole-image dimension check.
+#include <libheif/heif_security.h>

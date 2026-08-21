@@ -136,6 +136,22 @@ impl<'a> ImageHandle<'a> {
 		self.width() as i64 >= target_width as i64 && self.height() as i64 >= target_height as i64
 	}
 
+	/// Pixel count as DECLARED by the item's `ispe` box, before any
+	/// transformation — `None` when the box is absent or non-positive.
+	///
+	/// This is the number libheif itself checks against
+	/// `max_image_size_pixels`, and the only size a caller can learn without
+	/// decoding. It is a declaration, not a measurement: see
+	/// [`HeifSession::set_decode_limits`] for what that does and does not buy.
+	fn ispe_pixel_count(&self) -> Option<u64> {
+		let width = unsafe { heif_image_handle_get_ispe_width(self.inner) };
+		let height = unsafe { heif_image_handle_get_ispe_height(self.inner) };
+		if width <= 0 || height <= 0 {
+			return None;
+		}
+		Some(width as u64 * height as u64)
+	}
+
 	/// The first embedded thumbnail, if any ("usually 0 or 1" per libheif).
 	fn first_thumbnail(&self) -> Option<ImageHandle<'a>> {
 		let count = unsafe { heif_image_handle_get_number_of_thumbnails(self.inner) };
@@ -361,6 +377,14 @@ pub struct HeifSession<T: Read + Seek> {
 	// calls back into it lazily on every decode.
 	#[allow(dead_code)] // held for its stable address + Drop order
 	reader: Box<HeifReader<T>>,
+	/// Ceiling from [`set_decode_limits`](Self::set_decode_limits), kept on
+	/// this side too: libheif does not apply its own `max_image_size_pixels`
+	/// on the tile path, so [`decode_tile_rgba`](Self::decode_tile_rgba)
+	/// enforces it against the tile item itself.
+	max_image_pixels: Option<u64>,
+	/// Whether the whole grid has been size-checked against
+	/// `max_image_pixels` yet — the scan is per session, not per tile.
+	tiles_validated: std::cell::Cell<bool>,
 }
 
 impl<T: Read + Seek> HeifSession<T> {
@@ -372,7 +396,51 @@ impl<T: Read + Seek> HeifSession<T> {
 		// lifetime laundering `from_file` already does; the struct's field
 		// order keeps it honest.
 		let context: HeicContext<'static> = HeicContext::from_reader(&mut reader)?;
-		Ok(HeifSession { context, reader })
+		Ok(HeifSession {
+			context,
+			reader,
+			max_image_pixels: None,
+			tiles_validated: std::cell::Cell::new(false),
+		})
+	}
+
+	/// Caps what any single decode through this session may materialise.
+	///
+	/// Two guards, with different reach — be precise about which is which:
+	///
+	/// - `max_image_pixels` is enforced HERE, before decoding, against each
+	///   item's DECLARED (`ispe`) size: libheif applies its own check only
+	///   when decoding a whole image (`image_item.cc`,
+	///   `if (!decode_tile_only)`), so on the tile path
+	///   [`decode_tile_rgba`](Self::decode_tile_rgba) does it instead.
+	/// - `max_total_memory` is enforced by libheif at
+	///   `heif_image_add_plane_safe`, i.e. when the decoded picture is copied
+	///   OUT of the codec. That is a backstop, not a pre-allocation guard.
+	///
+	/// What neither guard covers: a bitstream whose SPS declares a picture
+	/// larger than the item's `ispe` promised. libde265 (vendored, 1.0.16)
+	/// takes no size limit of its own and materialises the picture in its DPB
+	/// before libheif sees a single plane, so such a file is caught only on
+	/// copy-out, after the codec has already allocated. That gap is libheif's
+	/// on every path, tiled or not — it is not specific to this API, and it
+	/// cannot be closed without bounding libde265 itself.
+	///
+	/// The limits live on the context and apply to every later decode call;
+	/// the container parse in [`new`](Self::new) already happened under
+	/// libheif's global defaults.
+	pub fn set_decode_limits(&mut self, max_image_pixels: u64, max_total_memory: u64) {
+		self.max_image_pixels = Some(max_image_pixels);
+		self.tiles_validated.set(false);
+		let limits = unsafe { heif_context_get_security_limits(self.context.inner) };
+		if limits.is_null() {
+			// Not reachable per the API contract; losing the cap must not
+			// break decoding, the caller's own budget checks still stand.
+			return;
+		}
+		unsafe {
+			(*limits).max_image_size_pixels = max_image_pixels;
+			(*limits).max_total_memory = max_total_memory;
+		}
 	}
 
 	fn primary(&self) -> Result<ImageHandle<'_>, HeifError> {
@@ -432,10 +500,108 @@ impl<T: Read + Seek> HeifSession<T> {
 		}))
 	}
 
+	/// The grid tile item at ORIGINAL (untransformed) grid indices, as its own
+	/// handle, so its declared size can be read before anything decodes it.
+	/// `None` when the primary is not a grid or the indices name no tile.
+	///
+	/// Untransformed on purpose. `heif_image_handle_get_grid_image_tile_id`
+	/// range-checks its arguments against the untransformed grid and only
+	/// THEN maps them (`heif_tiling.cc`), so passing display coordinates makes
+	/// it reject the rows a rotation added — an 8x6 grid shown as 6x8 loses
+	/// rows 6 and 7. Enumerating the original grid sidesteps that entirely,
+	/// and for a size bound the tile ORDER does not matter.
+	fn original_tile_handle(
+		&self,
+		primary: &ImageHandle<'_>,
+		tile_x: u32,
+		tile_y: u32,
+	) -> Option<ImageHandle<'_>> {
+		let mut tile_id: heif_item_id = 0;
+		let result = unsafe {
+			heif_image_handle_get_grid_image_tile_id(primary.inner, 0, tile_x, tile_y, &mut tile_id)
+		};
+		if result.code != heif_error_code_heif_error_Ok {
+			return None;
+		}
+		let mut handle = std::ptr::null_mut();
+		let result =
+			unsafe { heif_context_get_image_handle(self.context.inner, tile_id, &mut handle) };
+		if result.code != heif_error_code_heif_error_Ok || handle.is_null() {
+			return None;
+		}
+		Some(ImageHandle {
+			inner: handle,
+			_lifetime: PhantomData,
+		})
+	}
+
+	/// Checks EVERY tile's declared (`ispe`) size against the ceiling, once
+	/// per session. Cheap: item-property reads, no decoding.
+	///
+	/// Whole-grid rather than per-tile because the tiling struct reports only
+	/// TILE 0's size (`grid.cc`, `get_heif_image_tiling`) — the size the
+	/// caller's own budget arithmetic is built on — so a grid whose later
+	/// tiles declare something far larger would otherwise sail through the
+	/// budget check and reach the codec unchallenged.
+	///
+	/// The scan walks a square that contains the original grid whichever way
+	/// round it is, and counts what libheif accepted: every coordinate it
+	/// names must check out, and the count must reach the tile total, or the
+	/// grid is refused rather than half-verified.
+	fn validate_tile_sizes(
+		&self,
+		primary: &ImageHandle<'_>,
+		max_pixels: u64,
+	) -> Result<(), HeifError> {
+		let Some(tiling) = self.tiling()? else {
+			return Ok(());
+		};
+		let expected = u64::from(tiling.num_columns) * u64::from(tiling.num_rows);
+		let span = tiling.num_columns.max(tiling.num_rows);
+		let mut checked = 0u64;
+		for y in 0..span {
+			for x in 0..span {
+				let Some(tile) = self.original_tile_handle(primary, x, y) else {
+					continue;
+				};
+				match tile.ispe_pixel_count() {
+					Some(pixels) if pixels <= max_pixels => checked += 1,
+					Some(pixels) => {
+						return Err(HeifError::invalid_input(&format!(
+							"grid tile declares {pixels} pixels, over the {max_pixels} allowed"
+						)));
+					}
+					None => {
+						return Err(HeifError::invalid_input(
+							"a grid tile does not declare its size; refusing to decode the grid",
+						));
+					}
+				}
+			}
+		}
+		if checked < expected {
+			return Err(HeifError::invalid_input(&format!(
+				"only {checked} of {expected} grid tiles could be size-checked; refusing the grid"
+			)));
+		}
+		Ok(())
+	}
+
 	/// Decodes exactly one grid tile to RGBA (~tile-sized allocation, not
 	/// image-sized). Tile coordinates are grid indices, transformed space.
+	///
+	/// The first call verifies every tile's declared size against
+	/// [`set_decode_limits`](Self::set_decode_limits), because libheif skips
+	/// its own `ispe` check for single-tile decodes
+	/// (`image_item.cc`, `if (!decode_tile_only)`).
 	pub fn decode_tile_rgba(&self, tile_x: u32, tile_y: u32) -> Result<RgbaImage, HeifError> {
 		let primary = self.primary()?;
+		if let Some(max_pixels) = self.max_image_pixels
+			&& !self.tiles_validated.get()
+		{
+			self.validate_tile_sizes(&primary, max_pixels)?;
+			self.tiles_validated.set(true);
+		}
 		let mut heif_image_ptr = std::ptr::null_mut();
 		let result = unsafe {
 			heif_image_handle_decode_image_tile(

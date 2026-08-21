@@ -6,6 +6,7 @@ members = [
 	"filen-types",
 	"filen-macros",
 	"heif-decoder",
+	"microthumb",
 	"test-utils",
 	"uniffi-bindgen",
 	"uniffi-bindgen-swift",
