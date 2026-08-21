@@ -214,7 +214,10 @@ impl AuthCacheState {
 			.await
 			.expect("the decode gate is never closed");
 		let decode_result = tokio::task::spawn_blocking(
-			move || -> Result<Option<(u32, u32)>, filen_sdk_rs::error::Error> {
+			move || -> Result<
+				Option<filen_sdk_rs::thumbnail::ThumbnailInfo>,
+				filen_sdk_rs::error::Error,
+			> {
 				let _decode_permit = decode_permit;
 				filen_sdk_rs::thumbnail::make_thumbnail_from_source(
 					source,
@@ -241,7 +244,18 @@ impl AuthCacheState {
 		};
 
 		match decode_result {
-			Ok(Some(_)) => {
+			Ok(Some(info)) => {
+				// Which path served this is the difference between a couple of
+				// container reads and fetching the whole file, and it is
+				// invisible from the outside — log it so a silently broken
+				// fast path cannot masquerade as "working, just slower".
+				debug!(
+					"thumbnail for {} produced {}x{} from {}",
+					file.uuid(),
+					info.width,
+					info.height,
+					info.source
+				);
 				tokio::fs::rename(&tmp_path, &thumbnail_path).await?;
 				tmp_guard.disarm();
 				Ok(Some(thumbnail_path))

@@ -6,6 +6,15 @@ use std::io::Cursor;
 use image::{ImageFormat, Rgb, RgbImage};
 use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbError, ThumbSpec, generate};
 
+/// Most tests care only about the pixels. The ones that care about WHICH path
+/// produced them call `generate` directly and inspect `Thumbnail::source`.
+fn thumb(
+	src: Box<dyn microthumb::ByteSource>,
+	spec: &ThumbSpec,
+) -> Result<Option<microthumb::SmallImage>, microthumb::ThumbError> {
+	Ok(generate(src, spec)?.map(|t| t.image))
+}
+
 fn spec(target: u32) -> ThumbSpec {
 	ThumbSpec {
 		target_width: target,
@@ -45,7 +54,7 @@ fn mean_channel(rgba: &[u8], channel: usize) -> u32 {
 #[test]
 fn jpeg_baseline_downscales_a_checkerboard_to_grey() {
 	let bytes = encode(&checkerboard(512, 512), ImageFormat::Jpeg);
-	let result = generate(Box::new(MemSource(bytes)), &spec(64))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
 		.unwrap()
 		.expect("baseline jpeg must thumbnail");
 	assert!(result.width >= 64 && result.width <= 512);
@@ -61,7 +70,7 @@ fn jpeg_baseline_downscales_a_checkerboard_to_grey() {
 fn png_rows_stream_and_preserve_aspect() {
 	let image = RgbImage::from_fn(1000, 500, |x, _| Rgb([(x % 256) as u8, 0, 0]));
 	let bytes = encode(&image, ImageFormat::Png);
-	let result = generate(Box::new(MemSource(bytes)), &spec(100))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(100))
 		.unwrap()
 		.expect("png must thumbnail");
 	// 2:1 aspect survives the canvas.
@@ -77,7 +86,7 @@ fn png_rows_stream_and_preserve_aspect() {
 #[test]
 fn small_sources_are_never_upscaled() {
 	let bytes = encode(&checkerboard(16, 16), ImageFormat::Png);
-	let result = generate(Box::new(MemSource(bytes)), &spec(64))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
 		.unwrap()
 		.expect("small png must thumbnail");
 	assert_eq!((result.width, result.height), (16, 16));
@@ -94,25 +103,22 @@ fn webp_over_budget_is_refused_but_streaming_png_is_not() {
 		mem_budget: 1024 * 1024,
 	};
 	let webp = encode(&image, ImageFormat::WebP);
-	assert_eq!(generate(Box::new(MemSource(webp)), &tiny).unwrap(), None);
+	assert_eq!(thumb(Box::new(MemSource(webp)), &tiny).unwrap(), None);
 	let png = encode(&image, ImageFormat::Png);
-	assert!(generate(Box::new(MemSource(png)), &tiny).unwrap().is_some());
+	assert!(thumb(Box::new(MemSource(png)), &tiny).unwrap().is_some());
 }
 
 #[test]
 fn unsupported_bytes_are_ok_none_not_an_error() {
 	let bytes = b"this is not an image at all, not even close".to_vec();
-	assert_eq!(
-		generate(Box::new(MemSource(bytes)), &spec(64)).unwrap(),
-		None
-	);
+	assert_eq!(thumb(Box::new(MemSource(bytes)), &spec(64)).unwrap(), None);
 }
 
 #[test]
 fn truncated_jpeg_is_an_error_not_a_thumbnail() {
 	let mut bytes = encode(&checkerboard(512, 512), ImageFormat::Jpeg);
 	bytes.truncate(bytes.len() / 3);
-	assert!(generate(Box::new(MemSource(bytes)), &spec(64)).is_err());
+	assert!(thumb(Box::new(MemSource(bytes)), &spec(64)).is_err());
 }
 
 /// SOI + SOF2 (progressive) header for an image of the given size — enough
@@ -136,7 +142,7 @@ fn a_large_progressive_jpeg_routes_to_the_dc_parser() {
 	// has no scan data, so the observable is the DC parser's own truncation
 	// error — proof of the routing (the old behavior was a silent None).
 	let bytes = progressive_jpeg_header(8000, 6000);
-	let err = generate(Box::new(MemSource(bytes)), &spec(512)).unwrap_err();
+	let err = thumb(Box::new(MemSource(bytes)), &spec(512)).unwrap_err();
 	assert!(err.to_string().contains("dc-scan"), "got: {err}");
 }
 
@@ -146,7 +152,7 @@ fn a_small_progressive_jpeg_is_at_least_attempted() {
 	// the decode — which then fails on the truncated entropy data. The error
 	// (vs None above) is what distinguishes "attempted" from "refused".
 	let bytes = progressive_jpeg_header(400, 300);
-	assert!(generate(Box::new(MemSource(bytes)), &spec(512)).is_err());
+	assert!(thumb(Box::new(MemSource(bytes)), &spec(512)).is_err());
 }
 
 /// A JPEG whose EXIF APP1 carries orientation 6 and an embedded thumbnail of
@@ -198,7 +204,7 @@ fn jpeg_with_exif_thumbnail(orientation_: u16) -> Vec<u8> {
 #[test]
 fn the_exif_thumbnail_serves_small_requests_without_a_full_decode() {
 	let bytes = jpeg_with_exif_thumbnail(1);
-	let result = generate(Box::new(MemSource(bytes)), &spec(64))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
 		.unwrap()
 		.expect("the embedded thumbnail must serve this");
 	// Green means the preview path; red would mean the main image decoded.
@@ -215,7 +221,7 @@ fn exif_orientation_rotates_the_result() {
 	// come out portrait. Target large enough that the 160px thumb cannot
 	// serve it (160*2 < 512), forcing the main decode + rotation.
 	let bytes = jpeg_with_exif_thumbnail(6);
-	let result = generate(Box::new(MemSource(bytes)), &spec(512))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(512))
 		.unwrap()
 		.expect("must decode the main image");
 	assert!(mean_channel(&result.rgba, 0) > 200, "expected the red main");
@@ -231,7 +237,7 @@ fn exif_orientation_rotates_the_result() {
 fn gif_and_bmp_and_tiff_thumbnail_within_their_caps() {
 	for format in [ImageFormat::Gif, ImageFormat::Bmp, ImageFormat::Tiff] {
 		let bytes = encode(&checkerboard(200, 100), format);
-		let result = generate(Box::new(MemSource(bytes)), &spec(50))
+		let result = thumb(Box::new(MemSource(bytes)), &spec(50))
 			.unwrap()
 			.unwrap_or_else(|| panic!("{format:?} must thumbnail"));
 		assert!(result.width >= 50, "{format:?}");
@@ -330,7 +336,7 @@ fn dc_parse_matches_the_full_decode_within_tolerance() {
 		(jpeg_encoder::SamplingFactor::F_2_2, 10.0),
 	] {
 		let bytes = progressive_jpeg(&image, sampling);
-		let result = generate(Box::new(MemSource(bytes)), &dc_forcing_spec(64))
+		let result = thumb(Box::new(MemSource(bytes)), &dc_forcing_spec(64))
 			.unwrap()
 			.expect("dc path must produce a preview");
 		assert_eq!((result.width, result.height), (64, 48));
@@ -352,7 +358,7 @@ fn dc_parse_handles_grayscale() {
 		.collect();
 	enc.encode(&luma, 200, 120, jpeg_encoder::ColorType::Luma)
 		.unwrap();
-	let result = generate(Box::new(MemSource(out)), &dc_forcing_spec(32))
+	let result = thumb(Box::new(MemSource(out)), &dc_forcing_spec(32))
 		.unwrap()
 		.expect("grayscale dc path must produce a preview");
 	// Grey means R==G==B everywhere.
@@ -377,7 +383,7 @@ fn dc_parse_reads_only_a_prefix_of_the_file() {
 	let len = bytes.len() as u64;
 	let watermark = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 	let source = CountingSource(MemSource(bytes), watermark.clone());
-	let result = generate(Box::new(source), &spec(512)).unwrap();
+	let result = thumb(Box::new(source), &spec(512)).unwrap();
 	result.expect("large progressive must produce a dc preview");
 	let read = watermark.load(std::sync::atomic::Ordering::Relaxed);
 	eprintln!(
@@ -397,7 +403,7 @@ fn hostile_progressive_streams_error_cleanly() {
 	let image = smooth_image(512, 384);
 	let mut bytes = progressive_jpeg(&image, jpeg_encoder::SamplingFactor::F_2_2);
 	bytes.truncate(bytes.len() / 20);
-	assert!(generate(Box::new(MemSource(bytes)), &dc_forcing_spec(64)).is_err());
+	assert!(thumb(Box::new(MemSource(bytes)), &dc_forcing_spec(64)).is_err());
 
 	// A DHT whose counts exceed 256 symbols.
 	let mut bad_dht = progressive_jpeg_header(4000, 3000);
@@ -405,7 +411,7 @@ fn hostile_progressive_streams_error_cleanly() {
 	bad_dht.extend_from_slice(&[16u8; 16]);
 	bad_dht.extend_from_slice(&[0u8; 256]);
 	bad_dht.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00]);
-	assert!(generate(Box::new(MemSource(bad_dht)), &spec(512)).is_err());
+	assert!(thumb(Box::new(MemSource(bad_dht)), &spec(512)).is_err());
 }
 
 /// A progressive JPEG built to overflow the DC dequantiser: a 16-bit DQT with
@@ -483,7 +489,7 @@ fn a_dc_scan_with_a_huge_quantizer_and_shift_does_not_panic() {
 		target_height: 64,
 		mem_budget: 400 * 1024,
 	};
-	let result = generate(Box::new(MemSource(bytes)), &starved)
+	let result = thumb(Box::new(MemSource(bytes)), &starved)
 		.expect("a hostile DC scan must not error out here")
 		.expect("the DC parser must still produce a preview");
 	// Saturated rather than wrapped: the clamp is what the widening buys.
@@ -497,7 +503,7 @@ fn a_dc_scan_with_a_huge_quantizer_and_shift_does_not_panic() {
 fn a_progressive_jpeg_with_zero_dimensions_is_refused() {
 	for (w, h) in [(0u16, 300u16), (300, 0), (0, 0)] {
 		let bytes = progressive_jpeg_header(w, h);
-		let result = generate(Box::new(MemSource(bytes)), &spec(512));
+		let result = thumb(Box::new(MemSource(bytes)), &spec(512));
 		assert!(
 			matches!(result, Ok(None) | Err(_)),
 			"{w}x{h} must not produce a thumbnail"
@@ -520,7 +526,7 @@ fn gif_thumbnails_the_first_frame_of_an_animation() {
 		enc.write_frame(&gif::Frame::from_indexed_pixels(w, h, vec![1u8; px], None))
 			.unwrap();
 	}
-	let result = generate(Box::new(MemSource(bytes)), &spec(32))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(32))
 		.unwrap()
 		.expect("gif must thumbnail");
 	assert!(
@@ -551,7 +557,7 @@ fn interlaced_gif_rows_land_at_their_display_positions() {
 		frame.interlaced = true;
 		enc.write_frame(&frame).unwrap();
 	}
-	let result = generate(Box::new(MemSource(bytes)), &spec(16))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(16))
 		.unwrap()
 		.expect("interlaced gif must thumbnail");
 	assert_eq!((result.width, result.height), (16, 16));
@@ -574,7 +580,7 @@ fn tiff_gray16_streams_with_depth_downscale() {
 		img.rows_per_strip(8).unwrap();
 		img.write_data(&data).unwrap();
 	}
-	let result = generate(Box::new(MemSource(bytes)), &spec(64))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
 		.unwrap()
 		.expect("gray16 tiff must thumbnail");
 	for px in result.rgba.chunks_exact(4) {
@@ -611,23 +617,23 @@ fn a_single_huge_strip_tiff_is_refused_but_striped_is_not() {
 	};
 	let huge = encode(h);
 	assert_eq!(
-		generate(Box::new(MemSource(huge.clone())), &tight).unwrap(),
+		thumb(Box::new(MemSource(huge.clone())), &tight).unwrap(),
 		None
 	);
 	let striped = encode(8);
 	assert!(
-		generate(Box::new(MemSource(striped.clone())), &tight)
+		thumb(Box::new(MemSource(striped.clone())), &tight)
 			.unwrap()
 			.is_some()
 	);
 	// Both are affordable once the budget can actually hold the strip.
 	assert!(
-		generate(Box::new(MemSource(huge)), &spec(512))
+		thumb(Box::new(MemSource(huge)), &spec(512))
 			.unwrap()
 			.is_some()
 	);
 	assert!(
-		generate(Box::new(MemSource(striped)), &spec(512))
+		thumb(Box::new(MemSource(striped)), &spec(512))
 			.unwrap()
 			.is_some()
 	);
@@ -683,7 +689,7 @@ fn bmp_palette_and_row_orders_stream_correctly() {
 	// be palette 0 (red) even though it is LAST on disk.
 	let palette = [[0u8, 0, 255, 0], [0u8, 255, 0, 0]]; // BGRA: red, green
 	let bytes = bmp_bytes(3, 2, 8, false, &palette, &[&[0, 0, 0], &[1, 1, 1]]);
-	let result = generate(Box::new(MemSource(bytes)), &spec(4))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(4))
 		.unwrap()
 		.expect("8bpp bmp must thumbnail");
 	assert_eq!((result.width, result.height), (3, 2));
@@ -699,7 +705,7 @@ fn bmp_palette_and_row_orders_stream_correctly() {
 		&[],
 		&[&[255, 0, 0, 255, 0, 0], &[0, 0, 255, 0, 0, 255]],
 	);
-	let result = generate(Box::new(MemSource(bytes)), &spec(4))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(4))
 		.unwrap()
 		.expect("top-down bmp must thumbnail");
 	assert_eq!(&result.rgba[..4], &[0, 0, 255, 255], "top row must be blue");
@@ -729,7 +735,7 @@ fn rle_bmp_falls_back_to_the_capped_image_path() {
 	bytes.extend_from_slice(&[0, 255, 0, 0]); // palette 1: green
 	// bottom row: 2 px of idx 0, EOL; top row: 2 px of idx 1, EOS.
 	bytes.extend_from_slice(&[2, 0, 0, 0, 2, 1, 0, 1]);
-	let result = generate(Box::new(MemSource(bytes)), &spec(4))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(4))
 		.unwrap()
 		.expect("rle bmp must fall back and decode");
 	assert_eq!((result.width, result.height), (2, 2));
@@ -751,7 +757,7 @@ fn a_trailer_before_any_frame_errors_instead_of_spinning() {
 	bytes.extend_from_slice(&[0, 0, 0]);
 	bytes.push(0x3B);
 	bytes.push(0x00);
-	assert!(generate(Box::new(MemSource(bytes)), &spec(64)).is_err());
+	assert!(thumb(Box::new(MemSource(bytes)), &spec(64)).is_err());
 }
 
 fn crc32(data: &[u8]) -> u32 {
@@ -788,10 +794,7 @@ fn a_degenerate_png_ribbon_refuses_before_any_decode_work() {
 	png_chunk(&mut bytes, b"IHDR", &ihdr);
 	png_chunk(&mut bytes, b"IDAT", &[0x78, 0x9C]);
 	png_chunk(&mut bytes, b"IEND", &[]);
-	assert_eq!(
-		generate(Box::new(MemSource(bytes)), &spec(64)).unwrap(),
-		None
-	);
+	assert_eq!(thumb(Box::new(MemSource(bytes)), &spec(64)).unwrap(), None);
 }
 
 /// A forged `RowsPerStrip=1` TIFF declaring 2²⁶ rows: every per-strip peak is
@@ -826,7 +829,7 @@ fn a_forged_strip_count_tiff_refuses_before_any_decode_work() {
 		}
 	}
 	t.extend_from_slice(&0u32.to_le_bytes());
-	let result = generate(Box::new(MemSource(t)), &spec(64));
+	let result = thumb(Box::new(MemSource(t)), &spec(64));
 	// Refused on the DECLARED count, before `Decoder::new` reads a single
 	// offset entry — the whole point, since that constructor materialises the
 	// per-strip tables eagerly (~48 B each, so 2²⁶ strips is gigabytes) under
@@ -854,10 +857,7 @@ fn an_oversized_embedded_preview_is_not_served_unbudgeted() {
 	};
 	// The preview would suffice for a 16px target, but 64 bytes cannot hold
 	// it twice over — and the starved budget refuses the real decode too.
-	assert_eq!(
-		generate(Box::new(MemSource(bytes)), &starved).unwrap(),
-		None
-	);
+	assert_eq!(thumb(Box::new(MemSource(bytes)), &starved).unwrap(), None);
 }
 
 /// #11: a first frame smaller than the logical screen — the surrounding
@@ -875,7 +875,7 @@ fn a_small_first_frame_fills_the_border_with_the_background() {
 		frame.top = 4;
 		enc.write_frame(&frame).unwrap();
 	}
-	let result = generate(Box::new(MemSource(bytes)), &spec(16))
+	let result = thumb(Box::new(MemSource(bytes)), &spec(16))
 		.unwrap()
 		.expect("gif with a small frame must thumbnail");
 	assert_eq!((result.width, result.height), (16, 16));
@@ -886,6 +886,33 @@ fn a_small_first_frame_fills_the_border_with_the_background() {
 		&[255, 0, 0, 255],
 		"frame interior is the frame's color"
 	);
+}
+
+#[test]
+fn the_reported_source_distinguishes_the_two_paths() {
+	// The whole point of reporting it: an embedded preview costs a couple of
+	// container reads, a decode can cost the whole file, and nothing else in
+	// the result tells them apart. A JPEG carrying an EXIF thumbnail serves a
+	// small request from it...
+	let with_thumb = jpeg_with_exif_thumbnail(1);
+	let served = generate(Box::new(MemSource(with_thumb.clone())), &spec(64))
+		.unwrap()
+		.expect("the embedded thumbnail must serve this");
+	assert_eq!(served.source, microthumb::ThumbSource::EmbeddedPreview);
+
+	// ...and the same file decodes for real once the request outgrows the
+	// 160 px thumb (preview_suffices needs half the requested long side).
+	let decoded = generate(Box::new(MemSource(with_thumb)), &spec(512))
+		.unwrap()
+		.expect("the main image must decode");
+	assert_eq!(decoded.source, microthumb::ThumbSource::Decoded);
+
+	// A file with no embedded thumbnail at all can only ever be decoded.
+	let plain = encode(&checkerboard(256, 256), ImageFormat::Png);
+	let plain = generate(Box::new(MemSource(plain)), &spec(64))
+		.unwrap()
+		.expect("png must thumbnail");
+	assert_eq!(plain.source, microthumb::ThumbSource::Decoded);
 }
 
 #[test]
@@ -945,8 +972,9 @@ fn a_progressive_jpeg_past_the_dc_block_cap_still_serves_its_embedded_thumbnail(
 	let result = generate(Box::new(MemSource(bytes)), &spec(64))
 		.unwrap()
 		.expect("the embedded thumbnail must survive the DC parser's refusal");
+	assert_eq!(result.source, microthumb::ThumbSource::EmbeddedPreview);
 	assert!(
-		mean_channel(&result.rgba, 1) > 200,
+		mean_channel(&result.image.rgba, 1) > 200,
 		"expected the green embedded thumb"
 	);
 }

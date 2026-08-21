@@ -223,7 +223,7 @@ mod bounded {
 		target_height: u32,
 		mem_budget: usize,
 		out: &mut W,
-	) -> Result<Option<(u32, u32)>, Error>
+	) -> Result<Option<ThumbnailInfo>, Error>
 	where
 		R: BufRead + Seek + Send + 'static,
 		W: Write,
@@ -250,7 +250,7 @@ mod bounded {
 		target_height: u32,
 		mem_budget: usize,
 		out: &mut W,
-	) -> Result<Option<(u32, u32)>, Error>
+	) -> Result<Option<ThumbnailInfo>, Error>
 	where
 		W: Write,
 	{
@@ -259,8 +259,8 @@ mod bounded {
 			target_height,
 			mem_budget,
 		};
-		let small = match microthumb::generate(source, &spec) {
-			Ok(Some(small)) => small,
+		let (small, thumb_source) = match microthumb::generate(source, &spec) {
+			Ok(Some(thumb)) => (thumb.image, thumb.source),
 			Ok(None) => return Ok(None),
 			// Corrupt or refused bytes are the same cacheable "no thumbnail"
 			// verdict the sniff gives unsupported formats — parity with the
@@ -286,7 +286,26 @@ mod bounded {
 		let thumbnail = img.resize_to_fill(created_width, created_height, FilterType::CatmullRom);
 		let encoder = WebPEncoder::new_lossless(out);
 		thumbnail.write_with_encoder(encoder)?;
-		Ok(Some((created_width, created_height)))
+		Ok(Some(ThumbnailInfo {
+			width: created_width,
+			height: created_height,
+			source: thumb_source,
+		}))
+	}
+
+	/// Which path produced a thumbnail, re-exported so callers can log it
+	/// without depending on `microthumb` directly.
+	pub use microthumb::ThumbSource;
+
+	/// The thumbnail that was written, and how it was obtained.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub struct ThumbnailInfo {
+		pub width: u32,
+		pub height: u32,
+		/// Cheap embedded preview vs a real decode — orders of magnitude apart
+		/// in bytes fetched and CPU spent, and otherwise indistinguishable
+		/// from the outside.
+		pub source: ThumbSource,
 	}
 
 	/// [`microthumb::ByteSource`] that fetches and decrypts 1 MiB chunks of a
@@ -408,7 +427,7 @@ mod bounded {
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use bounded::{
 	ByteSource, DEFAULT_THUMBNAIL_MEM_BUDGET, FileSource, REMOTE_SOURCE_RESIDENT_BYTES,
-	RemoteChunkSource, make_thumbnail, make_thumbnail_from_source,
+	RemoteChunkSource, ThumbSource, ThumbnailInfo, make_thumbnail, make_thumbnail_from_source,
 };
 
 #[cfg(test)]
@@ -466,7 +485,8 @@ mod tests {
 			&mut out,
 		)
 		.unwrap();
-		assert_eq!(result, Some((32, 32)));
+		let info = result.expect("a thumbnail");
+		assert_eq!((info.width, info.height), (32, 32));
 		assert!(!out.is_empty());
 	}
 
@@ -485,7 +505,8 @@ mod tests {
 			&mut out,
 		)
 		.unwrap();
-		assert_eq!(result, Some((16, 16)));
+		let info = result.expect("a thumbnail");
+		assert_eq!((info.width, info.height), (16, 16));
 	}
 
 	use std::sync::Arc;
@@ -556,7 +577,8 @@ mod tests {
 			&mut out,
 		)
 		.unwrap();
-		assert_eq!(result, Some((32, 32)));
+		let info = result.expect("a thumbnail");
+		assert_eq!((info.width, info.height), (32, 32));
 		assert!(!out.is_empty());
 	}
 

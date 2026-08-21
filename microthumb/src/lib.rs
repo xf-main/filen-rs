@@ -67,6 +67,39 @@ pub struct ThumbSpec {
 	pub mem_budget: usize,
 }
 
+/// Which path produced a thumbnail.
+///
+/// Reported rather than logged: this crate stays free of a logging dependency,
+/// and the caller is the one with a tracing subscriber and an item id to name.
+/// Worth surfacing because the two paths differ by orders of magnitude in cost
+/// — an embedded preview is a couple of container reads, a decode can be a
+/// whole-file fetch — so "are we hitting the fast path?" is the first question
+/// asked whenever this pipeline is touched, and it is invisible from the
+/// outside otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbSource {
+	/// The image's own embedded thumbnail (EXIF IFD1, HEIF `thmb` item).
+	EmbeddedPreview,
+	/// Decoded from the full image, downscaled into the canvas.
+	Decoded,
+}
+
+impl std::fmt::Display for ThumbSource {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ThumbSource::EmbeddedPreview => f.write_str("embedded preview"),
+			ThumbSource::Decoded => f.write_str("full decode"),
+		}
+	}
+}
+
+/// A thumbnail and the path that produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+	pub image: SmallImage,
+	pub source: ThumbSource,
+}
+
 #[derive(Debug)]
 pub enum ThumbError {
 	Io(std::io::Error),
@@ -225,7 +258,7 @@ fn apply_orientation(image: SmallImage, orientation: u8) -> SmallImage {
 pub fn generate(
 	mut src: Box<dyn ByteSource>,
 	spec: &ThumbSpec,
-) -> Result<Option<SmallImage>, ThumbError> {
+) -> Result<Option<Thumbnail>, ThumbError> {
 	let mut prefix = [0u8; 64];
 	let n = src.read_at(0, &mut prefix)?;
 	let Some(format) = formats::sniff(&prefix[..n]) else {
@@ -252,7 +285,10 @@ pub fn generate(
 		.unwrap_or_default()
 		.filter(|p| p.rgba.len().saturating_mul(2) <= spec.mem_budget);
 	if let Some(preview) = preview.take_if(|p| preview_suffices(p, spec)) {
-		return Ok(Some(apply_orientation(preview, orientation)));
+		return Ok(Some(Thumbnail {
+			image: apply_orientation(preview, orientation),
+			source: ThumbSource::EmbeddedPreview,
+		}));
 	}
 
 	let source_dims = prepared.dims();
@@ -276,13 +312,19 @@ pub fn generate(
 		{
 			let mut acc = BoxAccumulator::new(output, canvas);
 			prepared.decode_into(&mut acc)?;
-			return Ok(Some(apply_orientation(acc.finish(), orientation)));
+			return Ok(Some(Thumbnail {
+				image: apply_orientation(acc.finish(), orientation),
+				source: ThumbSource::Decoded,
+			}));
 		}
 	}
 
 	// Over budget (or over the work ceiling): an undersized preview beats no
 	// thumbnail at all.
-	Ok(preview.map(|preview| apply_orientation(preview, orientation)))
+	Ok(preview.map(|preview| Thumbnail {
+		image: apply_orientation(preview, orientation),
+		source: ThumbSource::EmbeddedPreview,
+	}))
 }
 
 #[cfg(test)]

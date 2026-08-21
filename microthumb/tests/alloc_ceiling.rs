@@ -1,5 +1,5 @@
 //! The memory contract, enforced: a counting allocator measures the high-water
-//! mark of `generate()` on large fixtures and asserts it stays inside the
+//! mark of `thumb()` on large fixtures and asserts it stays inside the
 //! budget. On macOS the meter is libmalloc's `malloc_logger` hook, which sees
 //! every malloc/realloc/free in the process — including the C side
 //! (libheif/libde265), which a Rust `#[global_allocator]` cannot observe.
@@ -15,6 +15,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::{ImageFormat, Rgb, RgbImage};
 use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbSpec, generate};
+
+/// Most tests care only about the pixels. The ones that care about WHICH path
+/// produced them call `generate` directly and inspect `Thumbnail::source`.
+fn thumb(
+	src: Box<dyn microthumb::ByteSource>,
+	spec: &ThumbSpec,
+) -> Result<Option<microthumb::SmallImage>, microthumb::ThumbError> {
+	Ok(generate(src, spec)?.map(|t| t.image))
+}
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -226,7 +235,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	gradient
 		.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
 		.unwrap();
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(jpeg)), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(jpeg)), &spec(512)));
 	// The input Vec (a few MB) is owned by the source and counted at the
 	// baseline of the closure via the move — subtract nothing, just assert
 	// the whole thing stays under budget + the moved-in source itself.
@@ -243,7 +252,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 		.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
 		.unwrap();
 	drop(gradient);
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(png)), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(png)), &spec(512)));
 	result.unwrap().expect("24 MP png must thumbnail");
 	eprintln!("24 MP png peak: {peak} bytes");
 	assert!(
@@ -258,7 +267,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	big.write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
 		.unwrap();
 	drop(big);
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(jpeg)), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(jpeg)), &spec(512)));
 	result.unwrap().expect("60 MP baseline jpeg must thumbnail");
 	eprintln!("60 MP baseline jpeg peak: {peak} bytes");
 	assert!(
@@ -283,7 +292,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	let len = jpeg.len() as u64;
 	let watermark = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 	let source = CountingSource(MemSource(jpeg), watermark.clone());
-	let (result, peak) = measured_peak(|| generate(Box::new(source), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(source), &spec(512)));
 	result
 		.unwrap()
 		.expect("24 MP progressive jpeg must thumbnail via DC scans");
@@ -310,7 +319,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 		enc.write_frame(&gif::Frame::from_indexed_pixels(4000, 3000, pixels, None))
 			.unwrap();
 	}
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(gif_bytes)), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(gif_bytes)), &spec(512)));
 	result.unwrap().expect("12 MP gif must thumbnail");
 	eprintln!("12 MP gif peak: {peak} bytes");
 	assert!(
@@ -329,7 +338,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 		img.rows_per_strip(16).unwrap();
 		img.write_data(&data).unwrap();
 	}
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(tiff_bytes)), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(tiff_bytes)), &spec(512)));
 	result.unwrap().expect("24 MP striped tiff must thumbnail");
 	eprintln!("24 MP tiff peak: {peak} bytes");
 	assert!(
@@ -360,7 +369,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	for _ in 0..4000 {
 		bmp_bytes.extend_from_slice(&row);
 	}
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(bmp_bytes)), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bmp_bytes)), &spec(512)));
 	result.unwrap().expect("24 MP bmp must thumbnail");
 	eprintln!("24 MP bmp peak: {peak} bytes");
 	assert!(
@@ -418,7 +427,7 @@ fn heif_cases() {
 	// depending on iOS vintage), which suffices for a 512 target — no tile is
 	// ever decoded, and the result IS the preview, whose dimensions anchor the
 	// tile-path proof below.
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(bytes.clone())), &spec(512)));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bytes.clone())), &spec(512)));
 	let preview = result.unwrap().expect("device heic must thumbnail at 512");
 	assert_not_flat(&preview, "heif embedded preview");
 	eprintln!("heif embedded-preview peak: {peak} bytes");
@@ -441,7 +450,7 @@ fn heif_cases() {
 		target_height: 2048,
 		mem_budget: TILE_BUDGET,
 	};
-	let (result, peak) = measured_peak(|| generate(Box::new(MemSource(bytes)), &tile_spec));
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bytes)), &tile_spec));
 	let result = result.unwrap().expect("device heic must thumbnail at 2048");
 	assert!(
 		result.width.max(result.height) > preview.width.max(preview.height),
