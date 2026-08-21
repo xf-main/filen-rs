@@ -176,6 +176,22 @@ fn build_libheif(libde265_path: &Path) -> PathBuf {
 	config.define("WITH_OpenJPEG_ENCODER", "OFF");
 	config.define("WITH_LIBSHARPYUV", "OFF");
 	config.define("WITH_OpenH264_DECODER", "OFF");
+	config.define("WITH_OpenH264_ENCODER", "OFF");
+	config.define("WITH_OPENJPH_DECODER", "OFF");
+	config.define("WITH_OPENJPH_ENCODER", "OFF");
+	// Every optional codec is listed, including ones we have never wanted:
+	// libheif's CMake AUTO-DETECTS them, so a codec merely installed on the
+	// build machine gets compiled into libheif.a while nothing links its
+	// library — the x264 encoder did exactly that on the 1.20 -> 1.23 bump and
+	// broke the link with undefined _x264_* symbols. Only WITH_LIBDE265 is ON.
+	config.define("WITH_X264", "OFF");
+	config.define("WITH_KVAZAAR", "OFF");
+	config.define("WITH_UVG266", "OFF");
+	config.define("WITH_VVDEC", "OFF");
+	config.define("WITH_VVENC", "OFF");
+	config.define("WITH_FFMPEG_DECODER", "OFF");
+	config.define("WITH_WEBCODECS", "OFF");
+	config.define("WITH_GDK_PIXBUF", "OFF");
 
 	config.define("WITH_EXAMPLES", "OFF");
 	config.define("BUILD_TESTING", "OFF");

@@ -18,6 +18,16 @@ pub struct Heif;
 /// Embedded HEIF thumbnails are ~320 px; anything bigger is not a thumbnail.
 const MAX_PREVIEW_PIXELS: u64 = 1024 * 1024;
 
+/// HEVC-backed brands only.
+///
+/// `avif`/`avis` are deliberately ABSENT: AVIF carries AV1, and our vendored
+/// libheif is built with only libde265 (HEVC) — `WITH_DAV1D` and
+/// `WITH_AOM_DECODER` are OFF in heif-decoder/build.rs, and
+/// `heif_have_decoder_for_format(heif_compression_AV1)` returns 0 to prove it
+/// (pinned by `heif-decoder`'s `hevc_decodes_avif_does_not`). Claiming the
+/// brand would let an AVIF into a decoder that must then fail. Enabling AV1
+/// means vendoring dav1d or aom — another C submodule and build — which is a
+/// deliberate decision, not a detail to slip in here.
 const BRANDS: &[&[u8; 4]] = &[
 	b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1",
 ];
