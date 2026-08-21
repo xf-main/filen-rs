@@ -20,11 +20,13 @@
 //!   are cinema and CFA files whose only image data IS the mosaic
 //!   (PhotometricInterpretation 32803), so there is nothing to find and they
 //!   error rather than returning a demosaiced-looking lie.
-//! * **CR3 and RAF are not TIFF containers** and are not recognised yet;
-//!   `generate` answers `Ok(None)` after the 64-byte sniff.
+//! * **RAF — all ten** yield a preview: Fujifilm's header points straight at
+//!   one, no directory walk needed.
+//! * **CR3 is not a TIFF container** (it is ISO-BMFF) and is not recognised
+//!   yet; `generate` answers `Ok(None)` after the 64-byte sniff.
 //!
 //! Sizes are honest about the source: a Nikon D1H stores nothing but a 160x120
-//! uncompressed strip, so 160x120 is what comes back. 61 of the 100 samples
+//! uncompressed strip, so 160x120 is what comes back. 71 of the 100 samples
 //! reach the full 512 px request.
 //!
 //! Ignored by default: the pinned set is ~1 GiB. Run it with
@@ -106,15 +108,16 @@ const BASELINE: &[Baseline] = &[
 		nothing: 0,
 		errors: 5,
 	},
-	// Not TIFF containers; not recognised.
-	Baseline {
-		format: "CR3",
-		previews: 0,
-		nothing: 10,
-		errors: 0,
-	},
+	// Fujifilm's header points straight at its preview.
 	Baseline {
 		format: "RAF",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	// Not a TIFF container; not recognised.
+	Baseline {
+		format: "CR3",
 		previews: 0,
 		nothing: 10,
 		errors: 0,
@@ -127,7 +130,7 @@ const SMALLEST_PREVIEW_EDGE: u32 = 128;
 
 /// Samples whose preview reaches the full requested size. The rest are
 /// bounded by what the camera stored, not by anything this crate does.
-const SAMPLES_MEETING_THE_REQUEST: usize = 61;
+const SAMPLES_MEETING_THE_REQUEST: usize = 71;
 
 /// How far into a file the pipeline reaches before giving up on input it
 /// cannot use. Observed maximum is 21% (a Blackmagic cine DNG).

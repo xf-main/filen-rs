@@ -48,12 +48,16 @@ const MAX_DEPTH: u8 = 4;
 const MAX_CANDIDATES: usize = 24;
 /// Bytes read at a candidate's offset to decide whether it really is a JPEG
 /// and how big. Most previews put their SOF within a few hundred bytes, so
-/// that is what is read first...
+/// that is what is read first.
 const SNIFF_BYTES: u64 = 4 * 1024;
-/// ...but Panasonic prefixes its preview with a 31 KB EXIF block carrying a
-/// thumbnail of its own, so a candidate that begins with an SOI and has not
-/// reached its SOF yet earns one larger read before it is given up on.
-const DEEP_SNIFF_BYTES: u64 = 64 * 1024;
+/// A candidate that begins with an SOI but has not reached its SOF yet earns
+/// bigger reads, growing by this factor, rather than being given up on:
+/// Panasonic prefixes its preview with a 31 KB EXIF block and Fujifilm's X-S1
+/// with 78 KB of them, and there is no header size a format guarantees.
+const SNIFF_GROWTH: u64 = 8;
+/// Where growing stops. Reached only by a JPEG whose metadata dwarfs any real
+/// one; four reads get there.
+const MAX_SNIFF_BYTES: u64 = 1024 * 1024;
 /// Anything smaller cannot be a JPEG worth decoding, and rejecting it early
 /// keeps degenerate 4-byte "previews" out of the ranking.
 const MIN_PREVIEW_BYTES: u64 = 128;
@@ -516,27 +520,44 @@ fn believe(src: &mut dyn ByteSource, candidate: &Candidate) -> Option<Preview> {
 	if candidate.len < MIN_PREVIEW_BYTES || end > src.len() {
 		return None;
 	}
-	let head = read_exact_at(src, candidate.off, candidate.len.min(SNIFF_BYTES))?;
-	if head.starts_with(&[0xFF, 0xD8]) {
-		let dims = jpeg_sof(&head).or_else(|| {
-			let deeper = candidate.len.min(DEEP_SNIFF_BYTES);
-			(deeper > head.len() as u64)
-				.then(|| jpeg_sof(&read_exact_at(src, candidate.off, deeper)?))
-				.flatten()
-		});
-		let (w, h) = dims?;
-		return Some(Preview::Jpeg {
-			off: candidate.off,
-			len: candidate.len,
-			w,
-			h,
-		});
+	if let Some(jpeg) = jpeg_window(src, candidate.off, candidate.len) {
+		return Some(jpeg);
 	}
 	candidate.uncompressed.then_some(Preview::Rgb {
 		off: candidate.off,
 		w: candidate.w,
 		h: candidate.h,
 	})
+}
+
+/// A byte range believed to be a decodable JPEG, measured by its own SOF.
+///
+/// Shared with the containers that point straight at their preview instead of
+/// describing it in a directory (Fuji's RAF header, Canon's CR3 `PRVW` box):
+/// wherever the offset came from, it is checked against the source length and
+/// the bytes are looked at before anything is believed.
+pub(super) fn jpeg_window(src: &mut dyn ByteSource, off: u64, len: u64) -> Option<Preview> {
+	if len < MIN_PREVIEW_BYTES || off.checked_add(len)? > src.len() {
+		return None;
+	}
+	let mut window = SNIFF_BYTES;
+	loop {
+		let head = read_exact_at(src, off, len.min(window))?;
+		if !head.starts_with(&[0xFF, 0xD8]) {
+			return None;
+		}
+		match jpeg_sof(&head) {
+			Ok((w, h)) => return Some(Preview::Jpeg { off, len, w, h }),
+			// Structurally not a decodable JPEG. Reading more cannot help.
+			Err(Scan::Malformed) => return None,
+			Err(Scan::Truncated) => {
+				if window >= len || window >= MAX_SNIFF_BYTES {
+					return None;
+				}
+				window = (window * SNIFF_GROWTH).min(MAX_SNIFF_BYTES);
+			}
+		}
+	}
 }
 
 /// The frame dimensions from a JPEG's SOF, over a bounded prefix.
@@ -546,11 +567,11 @@ fn believe(src: &mut dyn ByteSource, candidate: &Candidate) -> Option<Preview> {
 /// data is itself frequently stored as a *lossless* JPEG (SOF3), often the
 /// largest JPEG-shaped thing in the file. Ranking by size without this check
 /// picks the mosaic every time.
-fn jpeg_sof(data: &[u8]) -> Option<(u32, u32)> {
+fn jpeg_sof(data: &[u8]) -> Result<(u32, u32), Scan> {
 	let mut at = 2usize;
 	while at + 4 <= data.len() {
 		if data[at] != 0xFF {
-			return None;
+			return Err(Scan::Malformed);
 		}
 		let marker = data[at + 1];
 		// Fill bytes, TEM, RSTn and a stray SOI carry no payload.
@@ -564,20 +585,45 @@ fn jpeg_sof(data: &[u8]) -> Option<(u32, u32)> {
 		}
 		// Entropy-coded data or end of image: the SOF should have come first.
 		if marker == 0xD9 || marker == 0xDA {
-			return None;
+			return Err(Scan::Malformed);
 		}
 		let len = usize::from(u16::from_be_bytes([data[at + 2], data[at + 3]]));
 		if len < 2 {
-			return None;
+			return Err(Scan::Malformed);
+		}
+		// Any other frame header — lossless (SOF3), differential, arithmetic —
+		// is a JPEG we cannot decode, and saying so is what stops the scan
+		// walking past it in search of a frame it likes better. A RAW's sensor
+		// data is exactly this.
+		if matches!(marker, 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+			return Err(Scan::Malformed);
 		}
 		if matches!(marker, 0xC0..=0xC2) {
-			let h = u16::from_be_bytes([*data.get(at + 5)?, *data.get(at + 6)?]);
-			let w = u16::from_be_bytes([*data.get(at + 7)?, *data.get(at + 8)?]);
-			return (w > 0 && h > 0).then_some((u32::from(w), u32::from(h)));
+			let Some(frame) = data.get(at + 5..at + 9) else {
+				return Err(Scan::Truncated);
+			};
+			let h = u16::from_be_bytes([frame[0], frame[1]]);
+			let w = u16::from_be_bytes([frame[2], frame[3]]);
+			return match (w > 0 && h > 0).then_some((u32::from(w), u32::from(h))) {
+				Some(dims) => Ok(dims),
+				None => Err(Scan::Malformed),
+			};
 		}
-		at = at.checked_add(2 + len)?;
+		at = at.checked_add(2 + len).ok_or(Scan::Malformed)?;
 	}
-	None
+	Err(Scan::Truncated)
+}
+
+/// Why an SOF scan came back empty. The distinction is what lets a candidate
+/// with an unusually fat metadata block earn a larger read while garbage is
+/// dropped after the first one.
+#[derive(Debug, PartialEq, Eq)]
+enum Scan {
+	/// The bytes ran out before the SOF; more of them may help.
+	Truncated,
+	/// Not a decodable JPEG. Includes the SOFs a general-purpose decoder does
+	/// not handle, notably the lossless SOF3 a RAW's sensor data is stored as.
+	Malformed,
 }
 
 /// Wraps the found preview as a prepared decode.
@@ -725,7 +771,7 @@ impl PreparedDecode for PreparedRawRgb {
 
 #[cfg(test)]
 mod tests {
-	use super::{Vocab, Walk, jpeg_sof, scan};
+	use super::{Scan, Vocab, Walk, jpeg_sof, scan};
 	use crate::{ByteSource, MemSource, exif::Endian};
 
 	/// A little-endian TIFF header pointing at `ifd0`.
@@ -755,22 +801,43 @@ mod tests {
 
 	#[test]
 	fn sof_is_read_and_lossless_jpeg_is_rejected() {
-		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)), Some((1600, 1200)));
-		// SOF3 is a RAW's own sensor data. Picking it is the failure mode this
-		// check exists to prevent.
+		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)), Ok((1600, 1200)));
+		// SOF3 is a RAW's own sensor data, and often the largest JPEG-shaped
+		// thing in the file. Picking it is the failure mode this check exists
+		// to prevent — and it must be Malformed, not Truncated, or the scan
+		// would keep reading in the hope of a better answer.
 		let mut lossless = jpeg_head(4000, 3000);
 		lossless[9] = 0xC3;
-		assert_eq!(jpeg_sof(&lossless), None);
-		// Truncated, empty and non-JPEG input answer None, never panic.
-		assert_eq!(jpeg_sof(&[]), None);
-		assert_eq!(jpeg_sof(&[0xFF, 0xD8, 0xFF]), None);
-		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)[..8]), None);
-		assert_eq!(jpeg_sof(b"not a jpeg at all"), None);
+		assert_eq!(jpeg_sof(&lossless), Err(Scan::Malformed));
+		// Running out of bytes is distinguishable from being wrong.
+		assert_eq!(jpeg_sof(&[]), Err(Scan::Truncated));
+		assert_eq!(jpeg_sof(&[0xFF, 0xD8, 0xFF]), Err(Scan::Truncated));
+		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)[..8]), Err(Scan::Truncated));
+		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)[..14]), Err(Scan::Truncated));
+		assert_eq!(jpeg_sof(b"not a jpeg at all"), Err(Scan::Malformed));
+		assert_eq!(jpeg_sof(&jpeg_head(0, 1200)), Err(Scan::Malformed));
 		// A zero-length marker segment must not loop forever.
 		assert_eq!(
 			jpeg_sof(&[0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x00, 0xFF, 0xD9]),
-			None
+			Err(Scan::Malformed)
 		);
+	}
+
+	/// A preview whose metadata dwarfs the 4 KB first look is still found —
+	/// Fujifilm's X-S1 puts 78 KB of EXIF ahead of its SOF — while a window
+	/// that only ever holds garbage is dropped after one read.
+	#[test]
+	fn a_deeply_buried_sof_is_reached_by_growing_the_window() {
+		let mut jpeg = vec![0xFF, 0xD8];
+		for _ in 0..3 {
+			jpeg.extend_from_slice(&[0xFF, 0xE1, 0xFF, 0xFD]);
+			jpeg.resize(jpeg.len() + 0xFFFD - 2, 0);
+		}
+		jpeg.extend_from_slice(&jpeg_head(4416, 2944)[2..]);
+		let len = jpeg.len() as u64;
+		let mut src = MemSource(jpeg);
+		let found = super::jpeg_window(&mut src, 0, len).expect("the SOF must be reached");
+		assert_eq!(found.dims(), (4416, 2944));
 	}
 
 	/// The shape every TIFF-family RAW reduces to: a SubIFD carrying a JPEG
