@@ -147,10 +147,11 @@ impl FilenMobileCacheState {
 	}
 
 	/// The items this device has a stake in: bytes in the local cache, an edit that has not
-	/// reached the server, or a favourite. This is the set worth keeping up to date
-	/// incrementally — everything else is reconciled when it is presented.
+	/// reached the server, a favourite, or a seat in one of the MATERIALIZED CONTAINERS the
+	/// platform reported. This is the set kept up to date incrementally — everything else is
+	/// reconciled when it is presented.
 	pub fn query_working_set(&self) -> Result<Vec<FfiObject>, CacheError> {
-		self.sync_execute_authed(|auth_state| working_set(&auth_state.conn()))
+		self.sync_execute_authed(working_set)
 	}
 
 	/// The working set together with the anchor to report for the enumeration serving it.
@@ -164,9 +165,8 @@ impl FilenMobileCacheState {
 	/// delivery, which an idempotent replica absorbs.
 	pub fn query_working_set_with_anchor(&self) -> Result<FfiWorkingSet, CacheError> {
 		self.sync_execute_authed(|auth_state| {
-			let conn = auth_state.conn();
-			let anchor = current_sync_anchor(&conn)?;
-			let items = working_set(&conn)?;
+			let anchor = current_sync_anchor(&auth_state.conn())?;
+			let items = working_set(auth_state)?;
 			Ok(FfiWorkingSet { anchor, items })
 		})
 	}
@@ -326,12 +326,18 @@ pub(crate) fn changes_since(
 	})
 }
 
-/// The working set (see [`FilenMobileCacheState::query_working_set`]).
-pub(crate) fn working_set(conn: &Connection) -> Result<Vec<FfiObject>, CacheError> {
-	Ok(sql::select_working_set(conn)?
-		.into_iter()
-		.map(|obj| FfiObject::from(DBObject::from(obj)))
-		.collect())
+/// The working set (see [`FilenMobileCacheState::query_working_set`]). The account root is
+/// injected into the container set unconditionally: the root is excluded from the set itself
+/// (`type = 0`), but without it every top-level item is a non-member and the root folder stays
+/// exactly as stale as an unreported container.
+pub(crate) fn working_set(auth_state: &AuthCacheState) -> Result<Vec<FfiObject>, CacheError> {
+	let containers = auth_state.working_set_containers();
+	Ok(
+		sql::select_working_set(&auth_state.conn(), containers.into_iter())?
+			.into_iter()
+			.map(|obj| FfiObject::from(DBObject::from(obj)))
+			.collect(),
+	)
 }
 
 impl AuthCacheState {

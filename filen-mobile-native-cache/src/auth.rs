@@ -20,10 +20,7 @@ use filen_types::{
 };
 use rusqlite::{Connection, ToSql, types::ToSqlOutput};
 use serde::{Deserialize, Serialize};
-use tokio::{
-	io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-	sync::OwnedRwLockReadGuard,
-};
+use tokio::sync::OwnedRwLockReadGuard;
 use tracing::{debug, info, trace};
 
 use crate::{CacheError, sql};
@@ -74,6 +71,13 @@ pub struct AuthCacheState {
 	/// The live socket path (subscription handle + drainer, see [`crate::live`]). Dropping this
 	/// state — which is what deauth does — unsubscribes and stops the drainer.
 	pub(crate) live: crate::live::LiveState,
+	/// The MATERIALIZED CONTAINERS the platform reported (see
+	/// [`crate::live`]'s `set_materialized_containers`): the directories the system has synced
+	/// to disk and will never re-enumerate on its own. Held unconditionally — losing an id here
+	/// silently reproduces the stale-forever bug — and mirrored to `db_state.json` so an offline
+	/// launch before the first drain still has the last-known set. The account root is NOT
+	/// stored; it is injected at query time, always.
+	pub(crate) materialized_containers: RwLock<std::collections::HashSet<Uuid>>,
 	/// Orders server listings against the live applier (the F3 snapshot race): a `dir/content`
 	/// listing fetched BEFORE a socket event but applied AFTER it would silently revert the
 	/// event — a rename undone, a deleted row resurrected — until the item's next event. Listing
@@ -163,6 +167,11 @@ pub(crate) struct SavedDBState {
 	/// db_state.json deserializes to — re-initializes the cache.
 	#[serde(default)]
 	pub(crate) owner: Option<String>,
+	/// Last-known materialized containers (see [`AuthCacheState::materialized_containers`]),
+	/// so a launch that never gets a report — offline, or killed early — still serves the set
+	/// it served last time.
+	#[serde(default)]
+	pub(crate) materialized_containers: Option<Vec<UuidStr>>,
 }
 
 impl Default for SavedDBState {
@@ -172,6 +181,7 @@ impl Default for SavedDBState {
 			version: Some(CACHE_VERSION),
 			last_cache_cleanup: None,
 			owner: None,
+			materialized_containers: None,
 		}
 	}
 }
@@ -180,24 +190,46 @@ pub(crate) async fn update_saved_db_state_cache_cleanup_time(
 	state_file_path: &Path,
 	timestamp: DateTime<Utc>,
 ) -> Result<(), CacheError> {
-	let mut file = tokio::fs::OpenOptions::new()
-		.create(true)
-		.truncate(false)
-		.read(true)
-		.write(true)
-		.open(state_file_path)
-		.await?;
-	let mut contents = String::new();
-	file.read_to_string(&mut contents).await?;
+	update_saved_db_state(state_file_path, |saved_state| {
+		saved_state.last_cache_cleanup = Some(timestamp);
+	})
+	.await
+}
+
+/// Read-modify-writes `db_state.json`. The durable home of everything that must survive the
+/// process without being worth a schema change (an `init.sql` edit wipes the account's cache).
+///
+/// Written via a pid-suffixed temp file + rename, never in place, and serialized on one
+/// process-wide lock: the live path calls this per applied socket event, and an unserialized
+/// read-modify-write pair loses one side's update — while a torn or defaulted file is far
+/// worse, because `db_from_dir` answers an unparseable or owner-less state file with a full
+/// cache wipe, pending-upload markers included. The rename keeps every crash presenting either
+/// the old state or the new one; a READ failure (other than the file being absent) aborts the
+/// update rather than clobbering a good file with defaults.
+pub(crate) async fn update_saved_db_state(
+	state_file_path: &Path,
+	update: impl FnOnce(&mut SavedDBState),
+) -> Result<(), CacheError> {
+	static WRITER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+	let _writer = WRITER.lock().await;
+	let contents = match tokio::fs::read_to_string(state_file_path).await {
+		Ok(contents) => contents,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+		// A transient read failure over a GOOD file must not become a default state: the
+		// default's `owner: None` reads as an account mismatch and wipes the cache next open.
+		Err(e) => return Err(e.into()),
+	};
+	// An UNPARSEABLE file is already a wipe sentence at the next open; rewriting it as a
+	// parseable default is no worse, and lets the fields written below survive.
 	let mut saved_state = serde_json::from_str::<SavedDBState>(&contents).unwrap_or_default();
-	saved_state.last_cache_cleanup = Some(timestamp);
-	contents.clear();
-	// SAFETY: serde_json::to_writer always writes valid UTF-8
-	serde_json::to_writer(unsafe { contents.as_mut_vec() }, &saved_state)
+	update(&mut saved_state);
+	let serialized = serde_json::to_string(&saved_state)
 		.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
-	file.set_len(0).await?;
-	file.seek(std::io::SeekFrom::Start(0)).await?;
-	file.write_all(contents.as_bytes()).await?;
+	let mut tmp = state_file_path.as_os_str().to_owned();
+	tmp.push(format!(".{}.tmp", std::process::id()));
+	let tmp = PathBuf::from(tmp);
+	tokio::fs::write(&tmp, serialized.as_bytes()).await?;
+	tokio::fs::rename(&tmp, state_file_path).await?;
 	Ok(())
 }
 
@@ -793,6 +825,13 @@ impl AuthCacheState {
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
 			live: Default::default(),
+			materialized_containers: RwLock::new(
+				state
+					.as_ref()
+					.and_then(|s| s.materialized_containers.as_ref())
+					.map(|uuids| uuids.iter().map(|uuid| Uuid::from(*uuid)).collect())
+					.unwrap_or_default(),
+			),
 			listing_barrier: tokio::sync::RwLock::new(()),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};
@@ -840,6 +879,7 @@ impl AuthCacheState {
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
 			live: Default::default(),
+			materialized_containers: RwLock::new(Default::default()),
 			listing_barrier: tokio::sync::RwLock::new(()),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};

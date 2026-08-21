@@ -42,9 +42,10 @@ use filen_sdk_rs::{
 	socket::{DecryptedDriveEvent, DecryptedSocketEvent, ListenerHandle},
 };
 use filen_types::{
-	fs::{ParentUuid, StableUuid, Uuid},
+	fs::{ParentUuid, StableUuid, Uuid, UuidStr},
 	traits::{CowHelpers, CowHelpersExt},
 };
+use futures::StreamExt;
 use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::{
 	RwLock,
@@ -566,6 +567,117 @@ impl AuthCacheState {
 			return Ok(false);
 		};
 		Ok(self.forget_item(obj).await?.is_none())
+	}
+}
+
+impl AuthCacheState {
+	/// The container set the working-set predicate binds: every reported materialized container
+	/// plus — unconditionally — the account root. The root is `type = 0` and excluded from the
+	/// working set itself, so without this injection every top-level item would be a non-member
+	/// and the root folder would stay exactly as stale as an unreported container.
+	pub(crate) fn working_set_containers(&self) -> Vec<UuidStr> {
+		let set = self
+			.materialized_containers
+			.read()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		set.iter()
+			.copied()
+			.chain(std::iter::once(self.client.root().uuid()))
+			.map(UuidStr::from)
+			.collect()
+	}
+
+	/// Replaces the reported materialized-container set (see the FFI wrapper below).
+	///
+	/// The ORDER inside is load-bearing: the set is stored — in memory and in `db_state.json` —
+	/// BEFORE any probe runs, because the probes are recovery, not a gate. An offline launch
+	/// whose probes all fail must still hold the full set, or it silently reproduces the
+	/// stale-forever bug for the process lifetime.
+	pub(crate) async fn set_materialized_containers(
+		&self,
+		ids: Vec<String>,
+	) -> Result<(), CacheError> {
+		let root = self.client.root().uuid();
+		let mut parsed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+		for id in &ids {
+			// The platform reports the identifiers it holds, which are `stable/<uuid>` for
+			// directories; take the bare form too.
+			let bare = id.strip_prefix(crate::local::STABLE_PREFIX).unwrap_or(id);
+			match bare.parse::<Uuid>() {
+				// The root is injected at query time, always; storing it would only duplicate.
+				Ok(uuid) if uuid != root => {
+					parsed.insert(uuid);
+				}
+				Ok(_) => {}
+				Err(e) => {
+					tracing::warn!("ignoring unparseable materialized container id {id}: {e}");
+				}
+			}
+		}
+		tracing::debug!("materialized containers reported: {} ids", parsed.len());
+
+		let mirrored: Vec<UuidStr> = parsed.iter().copied().map(UuidStr::from).collect();
+		*self
+			.materialized_containers
+			.write()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = parsed.clone();
+		// Mirrored durably, best-effort: a failed write costs the NEXT launch's pre-drain
+		// freshness, never this session's.
+		if let Err(e) = crate::auth::update_saved_db_state(&self.cache_state_file, move |state| {
+			state.materialized_containers = Some(mirrored);
+		})
+		.await
+		{
+			tracing::warn!("failed to mirror the materialized containers to db_state.json: {e}");
+		}
+
+		// Best-effort probes seed rows for containers the (possibly wiped) cache has never
+		// heard of, so their children can resolve. A failed probe never drops the id.
+		let missing: Vec<Uuid> = {
+			let conn = self.conn();
+			parsed
+				.into_iter()
+				.filter(|uuid| !matches!(RawDBItem::select(&conn, *uuid), Ok(Some(_))))
+				.collect()
+		};
+		futures::stream::iter(missing.into_iter().map(|uuid| async move {
+			match self.client.get_dir(uuid).await {
+				Ok(dir) => {
+					if let Err(e) = DBDir::upsert_from_remote(&mut self.conn(), dir) {
+						tracing::warn!("failed to seed materialized container {uuid}: {e}");
+					}
+				}
+				// Recovery only: the id stays in the set whatever this said.
+				Err(e) => {
+					tracing::debug!("could not seed materialized container {uuid}: {e}");
+				}
+			}
+		}))
+		.buffer_unordered(CONTAINER_PROBE_CONCURRENCY)
+		.collect::<Vec<()>>()
+		.await;
+		Ok(())
+	}
+}
+
+/// Concurrency for the container seeding probes (and the gap pass's listings): 4 keeps the
+/// worst case around a few MB of listing buffers inside a ~20 MB extension.
+const CONTAINER_PROBE_CONCURRENCY: usize = 4;
+
+#[filen_macros::create_uniffi_wrapper]
+impl FilenMobileCacheState {
+	/// Replaces the set of MATERIALIZED CONTAINERS the platform reports — the directories the
+	/// system has synced to disk and will never re-enumerate on its own, whose contents are
+	/// therefore this cache's to keep fresh through the working set. Wholesale replace on every
+	/// call (idempotent, self-healing after a missed report); ids are container uuids in either
+	/// bare or `stable/<uuid>` form. Call it with the drained
+	/// `enumeratorForMaterializedItems` set at launch and again (debounced) from
+	/// `materializedItemsDidChange`.
+	pub async fn set_materialized_containers(&self, ids: Vec<String>) -> Result<(), CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.set_materialized_containers(ids).await
+		})
+		.await
 	}
 }
 

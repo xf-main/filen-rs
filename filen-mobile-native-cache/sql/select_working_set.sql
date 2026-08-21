@@ -39,7 +39,16 @@ LEFT JOIN files_meta ON items.id = files_meta.id
 -- The working set: the items this device has a stake in, and so the only ones
 -- kept up to date incrementally. Everything else is reconciled when it is
 -- presented. Trashed rows stay in: a file that was materialised or
--- favourited is still the user's business once it is in the trash.
+-- favourited is still the user's business once it is in the trash — and one
+-- that was in a materialized container moved to the system's trash view,
+-- which is a change the system must be shown.
+--
+-- ?1 is the JSON array of MATERIALIZED CONTAINER uuids the platform reported
+-- (plus the account root, injected unconditionally by the caller): the
+-- directories the system has synced to disk, whose contents it will never
+-- re-enumerate on its own — remote changes below them reach it through this
+-- set or not at all (NSFileProviderReplicatedExtension.h: "there is no
+-- alternative cache invalidation mechanism").
 WHERE
 	-- Same two exclusions as the change feed: no roots, and no half-written row.
 	items.type != 0
@@ -54,4 +63,22 @@ WHERE
 		-- and a dir only the second.
 		OR files.favorite_rank > 0
 		OR dirs.favorite_rank > 0
+		-- ...or it sits in a container the system holds materialized. The
+		-- `JSON_EACH` + `UNHEX(REPLACE(...))` decode matches the BLOB uuids the
+		-- JSON's hyphenated text names.
+		OR (
+			items.parent IN (
+				SELECT UNHEX(REPLACE(container_ids.value, '-', ''))
+				FROM JSON_EACH(?1) AS container_ids
+			)
+			-- ...unless the container itself was trashed remotely: its children
+			-- keep their parent (that is the restore path), but presenting them
+			-- as live members would resurrect a folder the user deleted.
+			AND NOT EXISTS (
+				SELECT 1 FROM items AS trashed_parent
+				WHERE
+					trashed_parent.uuid = items.parent
+					AND trashed_parent.trashed = TRUE
+			)
+		)
 	);
