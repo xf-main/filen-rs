@@ -990,17 +990,21 @@ impl CacheState {
 	}
 }
 
+#[uniffi::export]
 impl FilenMobileCacheState {
 	/// Brings the live socket path up for the current authenticated state, if it is not up
-	/// already. Production auth paths call this on their own; it is public for the in-memory
-	/// test constructor, which deliberately does not.
+	/// already. Idempotent, and the production auth paths call it on their own — this export
+	/// exists for explicit platform control and for tests (the in-memory constructor
+	/// deliberately never auto-starts).
 	pub fn start_live_updates(&self) {
 		ensure_started(&self.state);
 	}
 
-	/// Tears the live path down: unsubscribes and stops applying. The next
-	/// [`Self::start_live_updates`] (or any auth-path refresh) brings it back up. For tests —
-	/// production teardown is deauth, which drops the whole state.
+	/// Tears the live path down: unsubscribes and stops applying. On a production (auth-file)
+	/// state the next authenticated FFI call brings it back up on its own; an in-memory test
+	/// state stays down until an explicit [`Self::start_live_updates`]. Calling this from a
+	/// teardown (`invalidate()` on iOS) is safe: nothing is lost that the next launch does not
+	/// rebuild.
 	pub fn stop_live_updates(&self) {
 		let state = self.sync_get_cache_state_borrowed();
 		if let AuthStatus::Authenticated(auth) = &state.status {
@@ -1010,10 +1014,6 @@ impl FilenMobileCacheState {
 			auth.live.started.store(false, Ordering::Release);
 		}
 	}
-}
-
-#[uniffi::export]
-impl FilenMobileCacheState {
 	/// Registers who to tell when the live path has changed something — the replica's cue to
 	/// ask for a diff (`signalEnumerator(.workingSet)` on iOS). `None` clears it.
 	///
