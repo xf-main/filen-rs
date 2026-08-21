@@ -19,6 +19,7 @@ use crate::{
 };
 
 use super::jpeg::exif_preview;
+use super::raw;
 
 pub struct Tiff;
 
@@ -59,9 +60,18 @@ fn max_declared_chunks(mem_budget: usize) -> u64 {
 	(mem_budget as u64 / 8 / BYTES_PER_DECLARED_CHUNK).max(1)
 }
 
+/// Whether these bytes are a plain TIFF the `tiff` crate can be handed, as
+/// opposed to a vendor container that merely borrows the byte order mark.
+fn plain_tiff(src: &mut dyn ByteSource) -> bool {
+	let mut head = [0u8; 4];
+	matches!(src.read_at(0, &mut head), Ok(4)) && (head == *b"II\x2a\x00" || head == *b"MM\x00\x2a")
+}
+
 impl FormatDecoder for Tiff {
 	fn detect(&self, prefix: &[u8]) -> bool {
-		prefix.starts_with(b"II\x2a\x00") || prefix.starts_with(b"MM\x00\x2a")
+		prefix.starts_with(b"II\x2a\x00")
+			|| prefix.starts_with(b"MM\x00\x2a")
+			|| raw::detect_vendor_tiff(prefix)
 	}
 
 	fn open(
@@ -69,6 +79,23 @@ impl FormatDecoder for Tiff {
 		mut src: Box<dyn ByteSource>,
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
+		// Camera RAW files wear TIFF's magic (and Olympus' and Panasonic's
+		// wear a near-miss of it), but IFD0 describes a sensor mosaic rather
+		// than a picture. Look for the real JPEG the camera embedded before
+		// letting the TIFF decoder anywhere near the file: it would otherwise
+		// either refuse the colour type or, worse, decode a 160x120 sub-image
+		// and pass it off as the photograph.
+		let index = raw::scan(&mut *src);
+		if let Some(preview) = index.preview {
+			return raw::prepare(src, preview, index.orientation, spec);
+		}
+		if !plain_tiff(&mut *src) {
+			return Err(err(
+				"vendor RAW container with no embedded preview; the sensor \
+				 mosaic is not a decodable image",
+			));
+		}
+
 		// The file IS a TIFF/EXIF payload: walk its own IFDs for orientation
 		// and an embedded JPEG thumbnail before spinning up the decoder.
 		let probe_len = usize::try_from(src.len())

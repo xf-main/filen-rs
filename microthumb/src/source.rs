@@ -84,6 +84,45 @@ impl ByteSource for MemSource {
 	}
 }
 
+/// A window onto part of another source, addressed from 0.
+///
+/// Lets a container decoder hand an inner byte range straight to the decoder
+/// that owns that format — a RAW file's embedded JPEG preview becomes an
+/// ordinary JPEG source, with the same laziness the outer source has: only the
+/// bytes the inner decoder actually reads are ever fetched.
+pub struct SubSource {
+	inner: Box<dyn ByteSource>,
+	start: u64,
+	len: u64,
+}
+
+impl SubSource {
+	/// Clamps to what `inner` actually holds, so a forged offset or length in a
+	/// container header can only ever produce a shorter window, never a read
+	/// past the end.
+	pub fn new(inner: Box<dyn ByteSource>, start: u64, len: u64) -> Self {
+		let total = inner.len();
+		let start = start.min(total);
+		let len = len.min(total - start);
+		SubSource { inner, start, len }
+	}
+}
+
+impl ByteSource for SubSource {
+	fn len(&self) -> u64 {
+		self.len
+	}
+
+	fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+		if offset >= self.len {
+			return Ok(0);
+		}
+		let available = self.len - offset;
+		let want = (buf.len() as u64).min(available) as usize;
+		self.inner.read_at(self.start + offset, &mut buf[..want])
+	}
+}
+
 /// `Read + Seek` over any [`ByteSource`], for the sequential decoder crates.
 pub struct SeqReader {
 	src: Box<dyn ByteSource>,

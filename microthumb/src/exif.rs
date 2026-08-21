@@ -6,12 +6,12 @@
 //! panics, `None` on any structural nonsense.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Endian {
+pub(crate) enum Endian {
 	Little,
 	Big,
 }
 
-fn u16_at(data: &[u8], off: usize, endian: Endian) -> Option<u16> {
+pub(crate) fn u16_at(data: &[u8], off: usize, endian: Endian) -> Option<u16> {
 	let bytes: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
 	Some(match endian {
 		Endian::Little => u16::from_le_bytes(bytes),
@@ -19,7 +19,7 @@ fn u16_at(data: &[u8], off: usize, endian: Endian) -> Option<u16> {
 	})
 }
 
-fn u32_at(data: &[u8], off: usize, endian: Endian) -> Option<u32> {
+pub(crate) fn u32_at(data: &[u8], off: usize, endian: Endian) -> Option<u32> {
 	let bytes: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
 	Some(match endian {
 		Endian::Little => u32::from_le_bytes(bytes),

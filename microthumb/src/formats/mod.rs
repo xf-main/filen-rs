@@ -5,6 +5,7 @@ mod heif;
 mod jpeg;
 mod jpeg_dc;
 mod png;
+pub(crate) mod raw;
 mod simple;
 mod tiff;
 

@@ -1,34 +1,34 @@
-//! What the pipeline does with real camera RAW files, TODAY.
+//! What the pipeline does with real camera RAW files.
 //!
-//! This is a characterisation suite, not a feature suite. RAW preview
-//! extraction has NOT been implemented; the extension gate upstream merely
-//! lets RAW files reach `generate`. These tests record the current outcome for
-//! every pinned sample so that implementing RAW support changes a written-down
-//! baseline deliberately instead of silently.
+//! This is a characterisation suite: it pins the outcome for every sample so
+//! that a change in RAW handling has to rewrite a written-down baseline
+//! instead of moving silently. It runs over 100 CC0 samples spanning ten
+//! formats and ten vendors.
 //!
-//! Nothing here asserts that RAW works — it does not. As of this commit, over
-//! 100 CC0 samples spanning ten formats and ten vendors:
+//! The pipeline does not decode sensor mosaics and never will — demosaicing is
+//! not this crate's job, and the `tiff` crate's attempt at it was actively
+//! harmful (on a NEF it decoded IFD0, a 160x120 postage stamp, and returned it
+//! for a 512 px request as though it were the photograph). What it does
+//! instead is find the JPEG the camera embedded next to the mosaic and decode
+//! *that*, through the ordinary JPEG path and the ordinary budget check.
 //!
-//! * **No sample yields an embedded preview.** Not one, in any format. Real
-//!   RAW previews live in SubIFDs (tag 0x014A) or in maker-note offsets, and
-//!   `exif::embedded_thumbnail` walks only IFD0 -> IFD1, so it never reaches
-//!   them.
-//! * **CR3, ORF, RAF and RW2 are not recognised at all** — their magic is not
-//!   TIFF's (`ftypcrx`, `IIRO`/`MMOR`, `FUJIFILM`, `II\x55\x00`), no decoder
-//!   claims them, and `generate` answers `Ok(None)` after reading 64 bytes.
-//! * **CR2, ARW, PEF and SRW are claimed by the TIFF decoder and then fail** —
-//!   IFD0 of those files describes the sensor mosaic, not a displayable image,
-//!   so `open` refuses the colour type or the strip table.
-//! * **NEF and DNG sometimes "succeed", and that is the worst case**: the TIFF
-//!   path decodes IFD0, which on a NEF is a 160x120 postage stamp beside a
-//!   12 MP photograph, and hands it back for a 512x512 request. A caller
-//!   cannot tell that apart from a real thumbnail. Nine of ten NEFs and four
-//!   of ten DNGs do this; the largest result across all 100 samples is
-//!   320x218. See [`decoded_raw_never_reaches_the_requested_size`].
+//! Where that leaves each format:
+//!
+//! * **CR2, ARW, NEF, PEF, SRW, ORF, RW2 — all ten samples each** yield a
+//!   preview, on both the full and the preview-only spec.
+//! * **DNG splits five and five.** Five carry a real preview; the other five
+//!   are cinema and CFA files whose only image data IS the mosaic
+//!   (PhotometricInterpretation 32803), so there is nothing to find and they
+//!   error rather than returning a demosaiced-looking lie.
+//! * **CR3 and RAF are not TIFF containers** and are not recognised yet;
+//!   `generate` answers `Ok(None)` after the 64-byte sniff.
+//!
+//! Sizes are honest about the source: a Nikon D1H stores nothing but a 160x120
+//! uncompressed strip, so 160x120 is what comes back. 61 of the 100 samples
+//! reach the full 512 px request.
 //!
 //! Ignored by default: the pinned set is ~1 GiB. Run it with
 //! `cargo test -p microthumb --test raw_characterisation -- --ignored --nocapture`.
-
 mod raw_fixtures;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,18 +42,92 @@ use raw_fixtures::{RAW_FIXTURES, RawFixture};
 /// The request every case is characterised against.
 const TARGET: u32 = 512;
 
-/// Formats whose magic no decoder in the registry claims.
-const UNRECOGNISED: &[&str] = &["CR3", "ORF", "RAF", "RW2"];
-/// Formats the TIFF decoder claims and then refuses.
-const CLAIMED_THEN_REFUSED: &[&str] = &["CR2", "ARW", "PEF", "SRW"];
-/// Formats where IFD0 happens to hold a decodable — but tiny and wrong —
-/// image, so some samples return a thumbnail that is not of the photograph.
-const DECODES_WRONG_SUB_IMAGE: &[&str] = &["NEF", "DNG"];
+/// Per-format baseline: how many of the ten samples end in a preview, in
+/// `Ok(None)`, and in an error. Any movement here is a deliberate change to
+/// RAW support, not a detail.
+struct Baseline {
+	format: &'static str,
+	previews: usize,
+	nothing: usize,
+	errors: usize,
+}
 
-/// The largest edge any RAW sample currently produces. Well under `TARGET`,
-/// which is the tell that these are sub-images rather than downscales of the
-/// real frame.
-const LARGEST_OBSERVED_EDGE: u32 = 320;
+const BASELINE: &[Baseline] = &[
+	// TIFF-family containers, all of which hide a real JPEG (or, on the
+	// oldest Nikons, a small uncompressed RGB strip).
+	Baseline {
+		format: "CR2",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	Baseline {
+		format: "ARW",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	Baseline {
+		format: "NEF",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	Baseline {
+		format: "PEF",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	Baseline {
+		format: "SRW",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	// Olympus and Panasonic use their own container magic and hide the
+	// preview in a maker note / private tag respectively.
+	Baseline {
+		format: "ORF",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	Baseline {
+		format: "RW2",
+		previews: 10,
+		nothing: 0,
+		errors: 0,
+	},
+	// Half the DNGs are cinema/CFA files carrying no displayable image.
+	Baseline {
+		format: "DNG",
+		previews: 5,
+		nothing: 0,
+		errors: 5,
+	},
+	// Not TIFF containers; not recognised.
+	Baseline {
+		format: "CR3",
+		previews: 0,
+		nothing: 10,
+		errors: 0,
+	},
+	Baseline {
+		format: "RAF",
+		previews: 0,
+		nothing: 10,
+		errors: 0,
+	},
+];
+
+/// The smallest preview any sample yields — a Canon PowerShot DNG's 128x96
+/// uncompressed thumbnail. Below this something has gone wrong.
+const SMALLEST_PREVIEW_EDGE: u32 = 128;
+
+/// Samples whose preview reaches the full requested size. The rest are
+/// bounded by what the camera stored, not by anything this crate does.
+const SAMPLES_MEETING_THE_REQUEST: usize = 61;
 
 /// How far into a file the pipeline reaches before giving up on input it
 /// cannot use. Observed maximum is 21% (a Blackmagic cine DNG).
@@ -289,109 +363,121 @@ fn pins_are_well_formed() {
 	}
 }
 
-/// THE finding, and the one a RAW implementation is meant to flip: across
-/// every pinned sample, the embedded-preview path comes back empty. RAW
-/// previews sit in SubIFDs; `exif::embedded_thumbnail` walks IFD0 -> IFD1 only.
+/// THE property RAW support exists for: the embedded preview is found. It
+/// must be found on the preview-only spec too, because a RAW file is tens of
+/// megabytes and a remote-backed caller passes exactly that spec.
 #[test]
 #[ignore = "downloads ~1 GiB of pinned RAW samples; run with --ignored"]
-fn no_raw_sample_yields_an_embedded_preview() {
+fn the_embedded_preview_is_found_on_both_specs() {
 	with_records(|records| {
-		let found: Vec<_> = records
-			.iter()
-			.filter(|r| {
-				matches!(r.preview_only, Outcome::Thumb(..))
-					|| matches!(r.full, Outcome::Thumb(_, _, ThumbSource::EmbeddedPreview))
-			})
-			.map(|r| r.fixture.cache_name)
-			.collect();
-		assert!(
-			found.is_empty(),
-			"BASELINE CHANGED — these samples now produce an embedded preview: {found:?}. \
-			 If RAW preview extraction was implemented, this test is the one to rewrite."
-		);
-	});
-}
-
-/// The dangerous case. When a RAW file does produce a thumbnail today, it is
-/// not a thumbnail of the photograph: the TIFF path decodes IFD0, which on
-/// these files holds a small embedded preview image. A NEF returning 160x120
-/// for a 12 MP frame is the unambiguous case; the general, checkable symptom
-/// is that no decode gets anywhere near the size that was asked for.
-///
-/// A caller has no way to distinguish this from a real thumbnail, which is why
-/// it is worth pinning: RAW support must change this test.
-#[test]
-#[ignore = "downloads ~1 GiB of pinned RAW samples; run with --ignored"]
-fn decoded_raw_never_reaches_the_requested_size() {
-	with_records(|records| {
-		let mut decoded = 0;
-		for r in records.iter() {
-			let Some((w, h)) = r.full.dims() else {
+		let mut found = 0;
+		for r in records {
+			let Outcome::Thumb(w, h, source) = r.full else {
 				continue;
 			};
-			decoded += 1;
-			assert!(
-				DECODES_WRONG_SUB_IMAGE.contains(&r.fixture.format),
-				"{} ({}) produced a thumbnail, which no {} sample did at baseline",
+			found += 1;
+			assert_eq!(
+				source,
+				ThumbSource::EmbeddedPreview,
+				"{} produced a {w}x{h} thumbnail by decoding the mosaic, which is \
+				 never what this pipeline should do",
+				r.fixture.cache_name
+			);
+			assert_eq!(
+				r.preview_only.label(),
+				r.full.label(),
+				"{} ({}) yields {:?} to a local caller but {:?} to a remote one; the \
+				 preview path must not depend on allow_full_decode",
 				r.fixture.cache_name,
 				r.fixture.format,
-				r.fixture.format
-			);
-			assert!(
-				w.max(h) <= LARGEST_OBSERVED_EDGE,
-				"{} decoded to {w}x{h}; at baseline no RAW sample exceeded {LARGEST_OBSERVED_EDGE}px, \
-				 so this may now be decoding the real frame rather than IFD0",
-				r.fixture.cache_name
+				r.full,
+				r.preview_only,
 			);
 		}
 		assert!(
-			decoded > 0,
-			"no sample decoded at all; the TIFF path's reach into RAW changed"
+			found >= records.len() * 3 / 4,
+			"only {found} of {} samples yielded a preview",
+			records.len()
 		);
 	});
 }
 
-/// Per-format outcome buckets. Unsupported input must stay *cleanly*
-/// unsupported: nothing recognised gets silently half-handled.
+/// Per-format outcome buckets. The counts are the baseline; a format moving
+/// between columns is the whole point of this file.
 #[test]
 #[ignore = "downloads ~1 GiB of pinned RAW samples; run with --ignored"]
 fn per_format_outcomes_match_baseline() {
 	with_records(|records| {
-		for r in records.iter() {
-			let format = r.fixture.format;
-			if UNRECOGNISED.contains(&format) {
-				assert_eq!(
-					r.full,
-					Outcome::Nothing,
-					"{} ({format}) is unrecognised at baseline but gave {:?}",
-					r.fixture.cache_name,
-					r.full
-				);
-				assert_eq!(
-					r.read_pct, 0,
-					"{} ({format}) is rejected on the 64-byte sniff at baseline, yet read {}% of the file",
-					r.fixture.cache_name, r.read_pct
-				);
-			} else if CLAIMED_THEN_REFUSED.contains(&format) {
-				assert!(
-					matches!(r.full, Outcome::Failed(_)),
-					"{} ({format}) fails in the TIFF decoder at baseline but gave {:?}",
-					r.fixture.cache_name,
-					r.full
-				);
-			} else {
-				assert!(
-					DECODES_WRONG_SUB_IMAGE.contains(&format),
-					"{format} has no recorded baseline; add it to one of the three lists"
-				);
-				assert!(
-					!matches!(r.full, Outcome::Nothing),
-					"{} ({format}) is claimed by the TIFF decoder at baseline, so it either \
-					 decodes IFD0 or errors — it does not fall through to Ok(None)",
-					r.fixture.cache_name
-				);
+		for expected in BASELINE {
+			let rs: Vec<_> = records
+				.iter()
+				.filter(|r| r.fixture.format == expected.format)
+				.collect();
+			if rs.is_empty() {
+				continue;
+			}
+			let count = |label: &str| rs.iter().filter(|r| r.full.label() == label).count();
+			let (previews, nothing, errors) =
+				(count("embedded preview"), count("Ok(None)"), count("Err"));
+			assert_eq!(
+				(previews, nothing, errors),
+				(expected.previews, expected.nothing, expected.errors),
+				"{} baseline is {} preview / {} none / {} err, got {previews} / {nothing} / \
+				 {errors} over {} samples",
+				expected.format,
+				expected.previews,
+				expected.nothing,
+				expected.errors,
+				rs.len(),
+			);
+		}
+		let unlisted: Vec<_> = records
+			.iter()
+			.map(|r| r.fixture.format)
+			.filter(|f| !BASELINE.iter().any(|b| b.format == *f))
+			.collect();
+		assert!(
+			unlisted.is_empty(),
+			"formats with no baseline row: {unlisted:?}"
+		);
+	});
+}
+
+/// What the previews are actually worth. Nothing here can be asserted as a
+/// flat minimum — a Nikon D1H stores a 160x120 strip and no more, so 160x120
+/// is the honest answer for it — but the SHAPE of the distribution is a
+/// baseline: how many samples reach the size that was asked for, and that
+/// none comes back degenerate.
+#[test]
+#[ignore = "downloads ~1 GiB of pinned RAW samples; run with --ignored"]
+fn preview_sizes_match_baseline() {
+	with_records(|records| {
+		let mut met = 0;
+		for r in records {
+			let Some((w, h)) = r.full.dims() else {
+				continue;
+			};
+			assert!(
+				w.max(h) >= SMALLEST_PREVIEW_EDGE,
+				"{} came back at {w}x{h}, smaller than anything in the pinned set",
+				r.fixture.cache_name
+			);
+			// `canvas_dims` caps the long side; a result above it would mean
+			// the orchestrator's ceiling was bypassed.
+			assert!(
+				w.max(h) <= 1600,
+				"{} came back at {w}x{h}, past the canvas ceiling",
+				r.fixture.cache_name
+			);
+			if w.max(h) >= TARGET {
+				met += 1;
 			}
 		}
+		assert_eq!(
+			met, SAMPLES_MEETING_THE_REQUEST,
+			"{met} samples reach the {TARGET}px request; baseline is \
+			 {SAMPLES_MEETING_THE_REQUEST}"
+		);
 	});
 }
 
@@ -399,9 +485,10 @@ fn per_format_outcomes_match_baseline() {
 /// megabytes and may be remote-backed, so discovering that we cannot use one
 /// must not cost a full fetch.
 ///
-/// Only the give-up paths are bounded. A sample that actually decodes may
-/// legitimately read everything — one 1:1 DNG here decodes a small frame and
-/// reads 99% — and bounding that would be asserting the wrong thing.
+/// Only the give-up paths are bounded. A sample that does yield a preview may
+/// legitimately read to the end of the file — Pentax parks its full-size
+/// preview in the last IFD — and bounding that would be asserting the wrong
+/// thing.
 #[test]
 #[ignore = "downloads ~1 GiB of pinned RAW samples; run with --ignored"]
 fn raw_we_cannot_use_costs_only_a_prefix() {
@@ -423,7 +510,7 @@ fn raw_we_cannot_use_costs_only_a_prefix() {
 		}
 		assert!(
 			checked > 0,
-			"every sample decoded; the give-up paths went uncharacterised"
+			"every sample yielded a preview; the give-up paths went uncharacterised"
 		);
 	});
 }

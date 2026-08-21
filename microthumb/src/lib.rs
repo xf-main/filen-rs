@@ -14,6 +14,7 @@ pub(crate) mod sink;
 mod source;
 
 pub use sink::{BoxAccumulator, PixelSink, SmallImage};
+pub(crate) use source::SubSource;
 pub use source::{ByteSource, FileSource, MemSource, SeqReader};
 
 use crate::sink::accumulator_bytes;
@@ -283,6 +284,48 @@ fn apply_orientation(image: SmallImage, orientation: u8) -> SmallImage {
 	}
 }
 
+/// Runs a prepared decode into a canvas the budget can hold, or answers `None`
+/// when it cannot — the shared arithmetic behind every real decode.
+///
+/// `None` is not a failure: the caller falls back to whatever cheaper image it
+/// already has. Two independent ceilings apply, memory (the decoder's own peak
+/// plus the accumulator) and total work ([`MAX_SOURCE_AREA_PIXELS`] /
+/// [`MAX_SOURCE_SIDE_PIXELS`], which a per-unit memory bound cannot express).
+///
+/// Nested decodes go through here too: a container that finds a real image
+/// inside itself (a RAW file's embedded JPEG preview) prices that inner decode
+/// with the same rules rather than reinventing them.
+pub(crate) fn decode_bounded(
+	prepared: Box<dyn PreparedDecode>,
+	spec: &ThumbSpec,
+) -> Result<Option<SmallImage>, ThumbError> {
+	let source_dims = prepared.dims();
+	let output = prepared.output_dims();
+	if output.0 == 0 || output.1 == 0 {
+		return Ok(None);
+	}
+	if u64::from(source_dims.0) * u64::from(source_dims.1) > MAX_SOURCE_AREA_PIXELS
+		|| source_dims.0.max(source_dims.1) > MAX_SOURCE_SIDE_PIXELS
+	{
+		return Ok(None);
+	}
+	let peak = prepared.peak_estimate();
+	let canvas = canvas_dims(
+		output,
+		(spec.target_width, spec.target_height),
+		spec.mem_budget.saturating_sub(peak),
+	);
+	if peak
+		.checked_add(accumulator_bytes(canvas))
+		.is_none_or(|total| total > spec.mem_budget)
+	{
+		return Ok(None);
+	}
+	let mut acc = BoxAccumulator::new(output, canvas);
+	prepared.decode_into(&mut acc)?;
+	Ok(Some(acc.finish()))
+}
+
 /// Produces a downscaled (never exact-size, never upscaled) RGBA image for
 /// the request, or `Ok(None)` when the source is unsupported or nothing fits
 /// the memory budget. The caller does the final exact resize + encode — both
@@ -332,32 +375,11 @@ pub fn generate(
 		}));
 	}
 
-	let source_dims = prepared.dims();
-	let output = prepared.output_dims();
-	if output.0 == 0 || output.1 == 0 {
-		return Ok(None);
-	}
-	let over_work_ceiling = u64::from(source_dims.0) * u64::from(source_dims.1)
-		> MAX_SOURCE_AREA_PIXELS
-		|| source_dims.0.max(source_dims.1) > MAX_SOURCE_SIDE_PIXELS;
-	if !over_work_ceiling {
-		let peak = prepared.peak_estimate();
-		let canvas = canvas_dims(
-			output,
-			(spec.target_width, spec.target_height),
-			spec.mem_budget.saturating_sub(peak),
-		);
-		if peak
-			.checked_add(accumulator_bytes(canvas))
-			.is_some_and(|total| total <= spec.mem_budget)
-		{
-			let mut acc = BoxAccumulator::new(output, canvas);
-			prepared.decode_into(&mut acc)?;
-			return Ok(Some(Thumbnail {
-				image: apply_orientation(acc.finish(), orientation),
-				source: ThumbSource::Decoded,
-			}));
-		}
+	if let Some(image) = decode_bounded(prepared, spec)? {
+		return Ok(Some(Thumbnail {
+			image: apply_orientation(image, orientation),
+			source: ThumbSource::Decoded,
+		}));
 	}
 
 	// Over budget (or over the work ceiling): an undersized preview beats no

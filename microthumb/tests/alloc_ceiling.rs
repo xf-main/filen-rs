@@ -469,11 +469,12 @@ fn heif_cases() {
 	);
 }
 
-/// Real camera RAW files, metered. The pipeline cannot usefully thumbnail any
-/// of them yet (see tests/raw_characterisation.rs for what it does instead),
-/// but "we do not support this" is not a licence to blow the budget: a RAW
-/// file is tens of megabytes, its IFD0 can declare an enormous strip table,
-/// and every one of these paths still has to stay inside the ceiling.
+/// Real camera RAW files, metered. Most of them now yield a thumbnail — the
+/// embedded preview, decoded through the JPEG path (see
+/// tests/raw_characterisation.rs for the per-format outcome) — and that
+/// decode is the point of metering them: a RAW file is tens of megabytes, its
+/// preview can be a 6480x4320 JPEG, its IFD0 can declare an enormous strip
+/// table, and every one of those paths has to stay inside the ceiling.
 ///
 /// Uses only samples already in the fixture cache — it never downloads, so a
 /// plain `cargo test` is unaffected. Populate the cache by running
