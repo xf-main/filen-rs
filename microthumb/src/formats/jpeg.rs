@@ -12,8 +12,10 @@ use jpeg_decoder::{CodingProcess, Decoder, PixelFormat};
 
 use crate::{
 	ByteSource, FormatDecoder, PixelSink, PreparedDecode, SeqReader, SmallImage, ThumbError,
-	ThumbSpec, exif,
+	ThumbSpec, exif, source::BorrowedSeqReader,
 };
+
+use super::jpeg_dc::PreparedDcScan;
 
 pub struct Jpeg;
 
@@ -28,17 +30,60 @@ impl FormatDecoder for Jpeg {
 
 	fn open(
 		&self,
-		src: Box<dyn ByteSource>,
+		mut src: Box<dyn ByteSource>,
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
-		let mut decoder = Decoder::new(BufReader::new(SeqReader::new(src)));
-		decoder.read_info().map_err(decode_err)?;
-		let info = decoder
-			.info()
-			.ok_or_else(|| ThumbError::Decode("jpeg header parsed but no info".into()))?;
-		let exif = decoder.exif_data().map(<[u8]>::to_vec);
+		// Header probe over a borrow, so the source is still ours to route:
+		// a big progressive image goes to the DC-scan path instead.
+		let (src_dims, progressive, exif) = {
+			let mut probe = Decoder::new(BufReader::new(BorrowedSeqReader::new(&mut *src)));
+			probe.read_info().map_err(decode_err)?;
+			let info = probe
+				.info()
+				.ok_or_else(|| ThumbError::Decode("jpeg header parsed but no info".into()))?;
+			(
+				(u32::from(info.width), u32::from(info.height)),
+				info.coding_process == CodingProcess::DctProgressive,
+				probe.exif_data().map(<[u8]>::to_vec),
+			)
+		};
 		let orientation = exif.as_deref().map_or(1, exif::orientation);
 
+		if progressive {
+			// The full decode needs whole-image coefficient planes; when
+			// that (plus the canvas the orchestrator will charge for) cannot
+			// fit the budget, the DC-scan parser produces a native 1/8-scale
+			// preview instead of falling back to Ok(None). Same arithmetic
+			// the orchestrator applies, so the routing never disagrees.
+			let out_dims = scaled_output_upper_bound(src_dims, spec);
+			let full_peak = full_decode_peak(src_dims, out_dims, true);
+			let canvas = crate::canvas_dims(
+				out_dims,
+				(spec.target_width, spec.target_height),
+				spec.mem_budget.saturating_sub(full_peak),
+			);
+			if full_peak.saturating_add(crate::sink::accumulator_bytes(canvas)) > spec.mem_budget {
+				// A refusal here must DEGRADE, not abort: `open` runs before
+				// the orchestrator has looked at the embedded preview, so
+				// propagating the error would throw away a perfectly good
+				// EXIF thumbnail we have already parsed. Sources the DC parser
+				// will not touch (planes past its block cap, unsupported
+				// precision, a header it cannot walk) fall back to
+				// preview-only, which the orchestrator then serves or turns
+				// into an honest Ok(None).
+				return match PreparedDcScan::open(src, exif.clone(), orientation) {
+					Ok(dc) => Ok(Box::new(dc)),
+					Err(_) => Ok(Box::new(PreviewOnly {
+						src_dims,
+						exif,
+						orientation,
+					})),
+				};
+			}
+		}
+
+		let mut decoder = Decoder::new(BufReader::new(SeqReader::new(src)));
+		decoder.read_info().map_err(decode_err)?;
 		// Ask the IDCT for the target itself: the decoder picks the smallest
 		// 1/8..1 factor covering it in at least one axis, which keeps the
 		// decode buffer at ~1–2× the target instead of 4× (a 2× ask made a
@@ -50,13 +95,78 @@ impl FormatDecoder for Jpeg {
 
 		Ok(Box::new(PreparedJpeg {
 			decoder,
-			src_dims: (u32::from(info.width), u32::from(info.height)),
+			src_dims,
 			out_dims: (u32::from(out_w), u32::from(out_h)),
-			progressive: info.coding_process == CodingProcess::DctProgressive,
+			progressive,
 			exif,
 			orientation,
 		}))
 	}
+}
+
+/// The largest output the IDCT scale can pick for this request: the smallest
+/// 1/8..1 factor covering the target in one axis. Used only for the routing
+/// estimate before a real decoder exists.
+fn scaled_output_upper_bound(src: (u32, u32), spec: &ThumbSpec) -> (u32, u32) {
+	for shift in [3u32, 2, 1, 0] {
+		let (w, h) = (src.0 >> shift, src.1 >> shift);
+		if w >= spec.target_width || h >= spec.target_height {
+			return (w.max(1), h.max(1));
+		}
+	}
+	src
+}
+
+/// Peak allocation of a full jpeg-decoder decode, shared between the routing
+/// decision and `PreparedJpeg::peak_estimate` so they can never diverge.
+fn full_decode_peak(src_dims: (u32, u32), out_dims: (u32, u32), progressive: bool) -> usize {
+	let (out_w, out_h) = out_dims;
+	let out_px = out_w as usize * out_h as usize;
+	// Three buffers are alive at once at the peak, not one:
+	//   * the interleaved RGB image jpeg-decoder returns  — 3 B/out px;
+	//   * its per-component sample planes, which it fills FIRST and still
+	//     holds while building that image (`worker/immediate.rs`, the
+	//     `results` vecs; handed to `compute_image` in `decode_planes`) —
+	//     1.5 B/out px at 4:2:0, 3 B at 4:4:4, so 3 is the honest bound;
+	//   * our own per-row RGBA conversion buffer.
+	// Counting only the first two is what let a 24 MP source pass a 12 MB
+	// budget and then allocate ~18 MB. Block-size rounding adds under a
+	// block per axis on top, far inside the row-buffer slack.
+	let out = out_px * 3 + out_px * 3 + out_w as usize * 4;
+	if progressive {
+		// Whole-image coefficient planes: i16 per sample, so 3 B/src px at
+		// 4:2:0 and 6 B at 4:4:4 — structural for progressive, no scale
+		// escapes it, and the estimate must survive the unsubsampled case.
+		out + src_dims.0 as usize * src_dims.1 as usize * 6
+	} else {
+		// One MCU row band (≤16 px tall) of the FULL-width image.
+		out + src_dims.0 as usize * 16 * 4
+	}
+}
+
+/// Decodes an EXIF IFD1 embedded thumbnail (shared by the full-decode and
+/// DC-scan prepared states).
+pub(super) fn exif_preview(exif: Option<&[u8]>) -> Option<SmallImage> {
+	let bytes = exif.and_then(exif::embedded_thumbnail)?;
+	let mut decoder = Decoder::new(bytes);
+	if decoder.read_info().is_err() {
+		return None;
+	}
+	let sane = decoder
+		.info()
+		.is_some_and(|info| u64::from(info.width) * u64::from(info.height) <= MAX_PREVIEW_PIXELS);
+	if !sane {
+		return None;
+	}
+	// A corrupt embedded thumbnail must not fail the real decode.
+	let pixels = decoder.decode().ok()?;
+	let info = decoder.info().expect("info available after decode");
+	rgba_image(
+		u32::from(info.width),
+		u32::from(info.height),
+		info.pixel_format,
+		&pixels,
+	)
 }
 
 struct PreparedJpeg {
@@ -66,6 +176,39 @@ struct PreparedJpeg {
 	progressive: bool,
 	exif: Option<Vec<u8>>,
 	orientation: u8,
+}
+
+/// A source nothing can decode within the budget, but whose embedded thumbnail
+/// may still serve. `peak_estimate` is deliberately unaffordable, so the
+/// orchestrator skips straight to the preview it already has in hand.
+struct PreviewOnly {
+	src_dims: (u32, u32),
+	exif: Option<Vec<u8>>,
+	orientation: u8,
+}
+
+impl PreparedDecode for PreviewOnly {
+	fn dims(&self) -> (u32, u32) {
+		self.src_dims
+	}
+
+	fn orientation(&self) -> u8 {
+		self.orientation
+	}
+
+	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
+		Ok(exif_preview(self.exif.as_deref()))
+	}
+
+	fn peak_estimate(&self) -> usize {
+		usize::MAX
+	}
+
+	fn decode_into(self: Box<Self>, _sink: &mut dyn PixelSink) -> Result<(), ThumbError> {
+		Err(ThumbError::Decode(
+			"this source has no affordable decode path".into(),
+		))
+	}
 }
 
 impl PreparedDecode for PreparedJpeg {
@@ -82,55 +225,11 @@ impl PreparedDecode for PreparedJpeg {
 	}
 
 	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
-		let Some(bytes) = self.exif.as_deref().and_then(exif::embedded_thumbnail) else {
-			return Ok(None);
-		};
-		let mut decoder = Decoder::new(bytes);
-		if decoder.read_info().is_err() {
-			return Ok(None);
-		}
-		let sane = decoder.info().is_some_and(|info| {
-			u64::from(info.width) * u64::from(info.height) <= MAX_PREVIEW_PIXELS
-		});
-		if !sane {
-			return Ok(None);
-		}
-		let Ok(pixels) = decoder.decode() else {
-			// A corrupt embedded thumbnail must not fail the real decode.
-			return Ok(None);
-		};
-		let info = decoder.info().expect("info available after decode");
-		Ok(rgba_image(
-			u32::from(info.width),
-			u32::from(info.height),
-			info.pixel_format,
-			&pixels,
-		))
+		Ok(exif_preview(self.exif.as_deref()))
 	}
 
 	fn peak_estimate(&self) -> usize {
-		let (out_w, out_h) = self.out_dims;
-		let out_px = out_w as usize * out_h as usize;
-		// Three buffers are alive at once at the peak, not one:
-		//   * the interleaved RGB image jpeg-decoder returns — 3 B/out px;
-		//   * its per-component sample planes, which it fills FIRST and still
-		//     holds while building that image (`worker/immediate.rs`, the
-		//     `results` vecs; handed to `compute_image` in `decode_planes`) —
-		//     1.5 B/out px at 4:2:0, 3 B at 4:4:4, so 3 is the honest bound;
-		//   * our own per-row RGBA conversion buffer.
-		// Counting only the first two let a 24 MP source pass a 12 MB budget
-		// and then allocate ~18 MB.
-		let out = out_px * 3 + out_px * 3 + out_w as usize * 4;
-		if self.progressive {
-			// Whole-image coefficient planes: i16 per sample, so 3 B/src px at
-			// 4:2:0 and 6 B at 4:4:4 — structural for progressive, no scale
-			// escapes it, and the estimate must survive the unsubsampled case.
-			let (w, h) = self.src_dims;
-			out + w as usize * h as usize * 6
-		} else {
-			// One MCU row band (≤16 px tall) of the FULL-width image.
-			out + self.src_dims.0 as usize * 16 * 4
-		}
+		full_decode_peak(self.src_dims, self.out_dims, self.progressive)
 	}
 
 	fn decode_into(mut self: Box<Self>, sink: &mut dyn PixelSink) -> Result<(), ThumbError> {

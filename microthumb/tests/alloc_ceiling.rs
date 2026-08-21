@@ -263,10 +263,58 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 		"60 MP jpeg peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
 	);
 
+	// 24 MP PROGRESSIVE — the class the full decode can never fit (a ~72 MB
+	// coefficient buffer): served by the DC-scan parser, which also must not
+	// read past the DC scans at the head of the file.
+	let gradient = RgbImage::from_fn(6000, 4000, |x, y| {
+		Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+	});
+	let mut jpeg = Vec::new();
+	{
+		let mut enc = jpeg_encoder::Encoder::new(&mut jpeg, 85);
+		enc.set_progressive(true);
+		enc.encode(gradient.as_raw(), 6000, 4000, jpeg_encoder::ColorType::Rgb)
+			.unwrap();
+	}
+	drop(gradient);
+	let len = jpeg.len() as u64;
+	let watermark = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+	let source = CountingSource(MemSource(jpeg), watermark.clone());
+	let (result, peak) = measured_peak(|| generate(Box::new(source), &spec(512)));
+	result
+		.unwrap()
+		.expect("24 MP progressive jpeg must thumbnail via DC scans");
+	let read = watermark.load(Ordering::Relaxed);
+	eprintln!(
+		"24 MP progressive jpeg peak: {peak} bytes; prefix read: {read} of {len} bytes ({:.1}%)",
+		read as f64 * 100.0 / len as f64
+	);
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"24 MP progressive peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+	assert!(read * 2 < len, "dc path read {read} of {len} bytes");
+
 	#[cfg(feature = "heif")]
 	heif_cases();
 
 	assert_eq!(meter::dropped(), 0, "the live-block table overflowed");
+}
+
+/// See tests/pipeline.rs — duplicated because each test binary is its own
+/// crate and ten lines beat a shared test-support module.
+struct CountingSource(MemSource, std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl microthumb::ByteSource for CountingSource {
+	fn len(&self) -> u64 {
+		self.0.len()
+	}
+
+	fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+		let n = self.0.read_at(offset, buf)?;
+		self.1.fetch_max(offset + n as u64, Ordering::Relaxed);
+		Ok(n)
+	}
 }
 
 /// A real device HEIC (`iphone_img.heic` at the workspace root, or

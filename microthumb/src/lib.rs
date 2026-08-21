@@ -10,7 +10,7 @@
 
 mod exif;
 mod formats;
-mod sink;
+pub(crate) mod sink;
 mod source;
 
 pub use sink::{BoxAccumulator, PixelSink, SmallImage};
@@ -135,7 +135,11 @@ pub trait PreparedDecode {
 /// own peak is subtracted, rather than a flat half: a row-streaming decoder
 /// costs a few hundred KB, and charging it half the budget shrank the canvas —
 /// and so the thumbnail — for no reason.
-fn canvas_dims(output: (u32, u32), target: (u32, u32), canvas_budget: usize) -> (u32, u32) {
+pub(crate) fn canvas_dims(
+	output: (u32, u32),
+	target: (u32, u32),
+	canvas_budget: usize,
+) -> (u32, u32) {
 	let (ow, oh) = (u64::from(output.0.max(1)), u64::from(output.1.max(1)));
 	let (tw, th) = (u64::from(target.0.max(1)), u64::from(target.1.max(1)));
 	// Fill semantics: scale by the larger target/output ratio, oversampled 2×.

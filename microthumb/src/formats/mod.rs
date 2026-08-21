@@ -1,6 +1,7 @@
 #[cfg(feature = "heif")]
 mod heif;
 mod jpeg;
+mod jpeg_dc;
 mod png;
 mod simple;
 
