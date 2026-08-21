@@ -261,6 +261,13 @@ impl AuthCacheState {
 		requested_width: u32,
 		requested_height: u32,
 	) -> ThumbnailResult {
+		// Every refusal below is otherwise invisible: the system caches a "no thumbnail"
+		// answer per item and stops asking, so a silent early return reads on-device as
+		// "thumbnails just do not work" with nothing in the log to say why.
+		debug!(
+			"thumbnail requested for {} at {requested_width}x{requested_height}",
+			path.0
+		);
 		// An identity-form (`stable/`) id selects its row directly: rebuilding a display path
 		// and re-resolving it can hand back a same-named sibling's bytes as this id's thumbnail.
 		let selected = if path.0.starts_with(crate::local::STABLE_PREFIX) {
@@ -268,31 +275,55 @@ impl AuthCacheState {
 		} else {
 			let path = match self.canonicalize_id(path) {
 				Ok(path) => path,
-				Err(e) => return ThumbnailResult::Err(e),
+				Err(e) => {
+					debug!("thumbnail id {} could not be canonicalized: {e}", path.0);
+					return ThumbnailResult::Err(e);
+				}
 			};
 			match path.as_parsed() {
 				Ok(pvs) => sql::select_object_at_parsed_id(&self.conn(), &pvs),
-				Err(e) => return ThumbnailResult::Err(e),
+				Err(e) => {
+					debug!("thumbnail id could not be parsed: {e}");
+					return ThumbnailResult::Err(e);
+				}
 			}
 		};
 		let file = match selected {
 			Ok(Some(DBObject::File(file))) => file,
-			Ok(Some(_)) => return ThumbnailResult::NoThumbnail,
-			Ok(None) => return ThumbnailResult::NotFound,
-			Err(e) => return ThumbnailResult::Err(e),
+			Ok(Some(_)) => {
+				debug!("thumbnail target {} is not a file; no thumbnail", path.0);
+				return ThumbnailResult::NoThumbnail;
+			}
+			Ok(None) => {
+				debug!("thumbnail target {} resolves to no row; not found", path.0);
+				return ThumbnailResult::NotFound;
+			}
+			Err(e) => {
+				debug!("thumbnail target {} failed to resolve: {e}", path.0);
+				return ThumbnailResult::Err(e);
+			}
 		};
 
 		let remote_file = match file.try_into() {
 			Ok(remote_file) => remote_file,
-			Err(e) => return ThumbnailResult::Err(CacheError::from(e)),
+			Err(e) => {
+				debug!("thumbnail target {} has undecoded metadata: {e}", path.0);
+				return ThumbnailResult::Err(CacheError::from(e));
+			}
 		};
 		match self
 			.get_or_make_thumbnail(&remote_file, requested_width, requested_height)
 			.await
 		{
 			Ok(Some(path)) => ThumbnailResult::Ok(path.to_string_lossy().to_string()),
-			Ok(None) => ThumbnailResult::NoThumbnail,
-			Err(e) => ThumbnailResult::Err(e),
+			Ok(None) => {
+				debug!("no thumbnail produced for {}", path.0);
+				ThumbnailResult::NoThumbnail
+			}
+			Err(e) => {
+				debug!("thumbnail generation failed for {}: {e}", path.0);
+				ThumbnailResult::Err(e)
+			}
 		}
 	}
 }
