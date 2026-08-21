@@ -5355,6 +5355,58 @@ pub async fn test_the_drain_never_replaces_a_marked_edit_with_an_empty_file() {
 	);
 }
 
+// A file the server no longer has, discovered by a refresh, can still hold an edit that exists
+// nowhere else. The not-found answer routes through `forget_item`, whose pending-upload guard
+// must keep the row, the marker, and the bytes — the engine's resync reap delivers its `Removed`
+// into this very path, so this is what stands between a reap and silent data loss.
+#[shared_test_runtime]
+pub async fn test_a_not_found_refresh_keeps_an_unuploaded_edit() {
+	let (db, rss) = get_isolated_db_resources("refresh_gone").await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_deleted.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_deleted.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	const EDITED: &[u8] = b"v2 edited locally, never uploaded";
+	mark_pending_upload_over(&db, &file_path, EDITED).await;
+	let (uuid, _stable) = file_ids(&db, &file_path);
+
+	// Deleted on the server behind the cache's back...
+	rss.client.delete_file_permanently(file).await.unwrap();
+
+	// ...and the refresh's FileNotFound must not take the only copy of the edit with it.
+	let refreshed = db.update_and_query_item(uuid.into()).await.unwrap();
+	assert!(
+		refreshed.is_some(),
+		"the row must survive: its edit exists nowhere else"
+	);
+	assert!(
+		pending_marker(&db, &file_path).is_some(),
+		"the marker must survive with the row, or the drain never delivers the edit"
+	);
+	assert_eq!(
+		tokio::fs::read(&local_path).await.unwrap(),
+		EDITED,
+		"the edited bytes must still be on disk"
+	);
+}
+
 // Trashing a file with an outstanding edit must not strand its marker. The drain skips trashed
 // rows, so a marker left behind here is never retried and never cleared — it just sits on the row
 // for the life of the cache, and any count of outstanding edits built from it lies.

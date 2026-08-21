@@ -1515,6 +1515,13 @@ impl CacheState {
 	/// dropping it here would race their own bookkeeping; they retire it once the removal lands.
 	/// Re-reaping is therefore possible and harmless: with the rows already gone there is nothing
 	/// left to delete or dispatch.
+	///
+	/// The rows deleted here are the ENGINE's own — cached remote metadata; this schema holds no
+	/// local bytes and no pending-upload state, so there is nothing here to guard. An owner that
+	/// DOES hold local data must guard the dispatched `Removed` itself before discarding
+	/// anything: an un-uploaded local edit outranks the server's not-found. The mobile bridge's
+	/// `forget_item` is that guard, pinned by
+	/// `db_tests::test_a_not_found_refresh_keeps_an_unuploaded_edit`.
 	fn reap_deleted_file_roots(&mut self, gone: Vec<StableUuid>) {
 		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
 		for stable in gone {
