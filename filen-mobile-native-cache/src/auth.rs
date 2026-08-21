@@ -150,6 +150,13 @@ pub(crate) struct SavedDBState {
 	pub(crate) version: Option<u64>,
 	#[serde(default)]
 	pub(crate) last_cache_cleanup: Option<DateTime<Utc>>,
+	/// Root uuid of the account the on-disk cache belongs to. The db_dir is keyed by the
+	/// DOMAIN identifier, which is constant across accounts, so without this stamp an account
+	/// swap silently inherits the previous account's whole tree (and its decrypted names).
+	/// Checked at open in `db_from_dir`; a mismatch — including the `None` a pre-stamp
+	/// db_state.json deserializes to — re-initializes the cache.
+	#[serde(default)]
+	pub(crate) owner: Option<String>,
 }
 
 impl Default for SavedDBState {
@@ -158,6 +165,7 @@ impl Default for SavedDBState {
 			db_hash: *sql::statements::DB_INIT_HASH,
 			version: Some(CACHE_VERSION),
 			last_cache_cleanup: None,
+			owner: None,
 		}
 	}
 }
@@ -228,37 +236,37 @@ impl ToSql for UuidText {
 	}
 }
 
-fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheError> {
-	// Remove the DB together with its WAL sidecars: a stale -wal surviving next to a recreated
-	// DB can be replayed into it on open (sqlite.org/howtocorrupt.html §4.4). Covers every
-	// reinit path (hash mismatch, version bump, wipe interrupted between unlinks).
-	for suffix in ["", "-wal", "-shm"] {
-		let mut os = db_path.as_os_str().to_os_string();
-		os.push(suffix);
-		let path = std::path::PathBuf::from(os);
-		match std::fs::remove_file(&path) {
-			Ok(()) => {
-				tracing::info!("Removed old database file: {}", path.display());
-			}
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-			Err(e) => {
-				tracing::error!("Failed to remove old database file {}: {e}", path.display());
-				return Err(e.into());
-			}
-		}
-	}
-	let db = Connection::open(db_path)?;
+fn init_db(
+	files_dir: &Path,
+	db_dir: &Path,
+	cache_state_file: &Path,
+	owner: &str,
+) -> Result<Connection, CacheError> {
+	// A re-init discards the WHOLE on-disk state, not just the DB: the cache/tmp/thumbnail
+	// dirs and the SDK search cache all hold the previous state's decrypted names or bytes
+	// (another account's, on an owner mismatch), and every uuid keying them dies with the DB.
+	// One shared definition of that set — including the DBs' -wal/-shm sidecars, whose stale
+	// replay hazard (sqlite.org/howtocorrupt.html §4.4) this also covers — lives in
+	// `io::wipe_account_data`. Covers every reinit path (hash mismatch, version bump, owner
+	// swap, wipe interrupted between unlinks); `from_sdk_config` recreates the dirs afterwards.
+	crate::io::wipe_account_data(files_dir, db_dir)?;
+	let db = Connection::open(db_dir.join(DB_FILE_NAME))?;
 	configure_conn(&db)?;
 	db.execute_batch(sql::statements::INIT)?;
-	let contents = serde_json::to_string(&SavedDBState::default())
-		.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
+	let contents = serde_json::to_string(&SavedDBState {
+		owner: Some(owner.to_string()),
+		..SavedDBState::default()
+	})
+	.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
 	std::fs::write(cache_state_file, contents)?;
 	Ok(db)
 }
 
 fn db_from_dir(
+	files_dir: &Path,
 	db_dir: &Path,
 	cache_state_file: &Path,
+	owner: &str,
 ) -> Result<(Connection, Option<SavedDBState>), CacheError> {
 	// Unlike files_dir (system-provided document storage), a relocated db_dir is OURS to
 	// create — don't rely on the platform caller having done it (the Swift side's
@@ -268,7 +276,7 @@ fn db_from_dir(
 	let state_file = match std::fs::read_to_string(cache_state_file) {
 		Ok(contents) => contents,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-			return Ok((init_db(&db_path, cache_state_file)?, None));
+			return Ok((init_db(files_dir, db_dir, cache_state_file, owner)?, None));
 		}
 		Err(e) => {
 			tracing::error!("Failed to read db_state.json, error: {e}");
@@ -289,7 +297,7 @@ fn db_from_dir(
 			"Failed to parse saved DB state, reinitializing database: {}",
 			db_path.display()
 		);
-		return Ok((init_db(&db_path, cache_state_file)?, None));
+		return Ok((init_db(files_dir, db_dir, cache_state_file, owner)?, None));
 	};
 
 	if saved_state.db_hash != *sql::statements::DB_INIT_HASH {
@@ -298,19 +306,40 @@ fn db_from_dir(
 			*sql::statements::DB_INIT_HASH,
 			saved_state.db_hash
 		);
-		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
+		Ok((
+			init_db(files_dir, db_dir, cache_state_file, owner)?,
+			Some(saved_state),
+		))
 	} else if !db_path.exists() {
 		tracing::info!(
 			"Database file does not exist, creating new one: {}",
 			db_path.display()
 		);
-		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
+		Ok((
+			init_db(files_dir, db_dir, cache_state_file, owner)?,
+			Some(saved_state),
+		))
 	} else if saved_state.version.is_none_or(|v| v < CACHE_VERSION) {
 		tracing::info!(
 			"Database version is outdated or missing, reinitializing database: {}",
 			db_path.display()
 		);
-		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
+		Ok((
+			init_db(files_dir, db_dir, cache_state_file, owner)?,
+			Some(saved_state),
+		))
+	} else if saved_state.owner.as_deref() != Some(owner) {
+		// The cache belongs to a different account (or predates the owner stamp, which reads
+		// the same way): its tree — and its decrypted names — must not leak into this session.
+		tracing::info!(
+			"Database owner mismatch (saved: {:?}, current: {owner}), reinitializing database: {}",
+			saved_state.owner,
+			db_path.display()
+		);
+		Ok((
+			init_db(files_dir, db_dir, cache_state_file, owner)?,
+			Some(saved_state),
+		))
 	} else {
 		tracing::info!(
 			"Database hash matches, using existing database: {}",
@@ -332,7 +361,10 @@ fn db_from_dir(
 				) =>
 			{
 				tracing::error!("cached database unusable ({e:?}: {msg:?}); reinitializing");
-				Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
+				Ok((
+					init_db(files_dir, db_dir, cache_state_file, owner)?,
+					Some(saved_state),
+				))
 			}
 			Err(e) => Err(e.into()),
 		}
@@ -713,20 +745,11 @@ impl AuthCacheState {
 
 		let cache_state_file = db_dir.join("db_state.json");
 
-		let (db, state) = db_from_dir(db_dir, &cache_state_file)?;
-
-		if state.as_ref().is_none_or(|state| state.version.is_none()) {
-			tracing::info!(
-				"Database version is missing, removing cache directory to ensure compatibility"
-			);
-			let (cache_dir, _, _) = crate::io::get_paths(files_dir);
-			if let Err(e) = std::fs::remove_dir_all(cache_dir)
-				&& e.kind() != std::io::ErrorKind::NotFound
-			{
-				tracing::error!("Failed to remove cache directory during DB version upgrade: {e}");
-				return Err(e.into());
-			}
-		}
+		// The account's root uuid is the cache's owner stamp: db_dir is keyed by the domain
+		// identifier, shared across accounts, and a mismatch makes db_from_dir re-initialize
+		// rather than hand this session another account's tree.
+		let owner = client.root().uuid().to_string();
+		let (db, state) = db_from_dir(files_dir, db_dir, &cache_state_file, &owner)?;
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir)?;
 
@@ -772,6 +795,8 @@ impl AuthCacheState {
 		let cache_state_file = std::convert::AsRef::<Path>::as_ref(files_dir).join("db_state.json");
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir.as_ref())?;
+		// No owner check here: the DB is in-memory and db_state.json is never read, so there is
+		// no previous account's tree to inherit.
 		let db = Connection::open_in_memory()?;
 		configure_conn(&db)?;
 		db.execute_batch(sql::statements::INIT)?;
@@ -1049,20 +1074,32 @@ mod auth_file_crypto_tests {
 }
 
 #[cfg(test)]
-mod connection_pragma_tests {
-	use rusqlite::Connection;
-
-	use super::configure_conn;
-	use crate::sql;
-
+pub(crate) mod test_support {
 	/// Removes the DB directory when dropped so a failing assertion doesn't leak temp files.
-	struct TempDbDir(std::path::PathBuf);
+	pub(crate) struct TempDbDir(pub(crate) std::path::PathBuf);
+
+	impl TempDbDir {
+		pub(crate) fn create(prefix: &str) -> Self {
+			let dir =
+				TempDbDir(std::env::temp_dir().join(format!("{prefix}-{}", rand::random::<u64>())));
+			std::fs::create_dir_all(&dir.0).unwrap();
+			dir
+		}
+	}
 
 	impl Drop for TempDbDir {
 		fn drop(&mut self) {
 			let _ = std::fs::remove_dir_all(&self.0);
 		}
 	}
+}
+
+#[cfg(test)]
+mod connection_pragma_tests {
+	use rusqlite::Connection;
+
+	use super::{configure_conn, test_support::TempDbDir};
+	use crate::sql;
 
 	// The pragmas are per-connection state, so they must arrive via `configure_conn` (which every
 	// open path calls), not via `init.sql` (which only the creation path executes). Pin that on a
@@ -1071,10 +1108,7 @@ mod connection_pragma_tests {
 	// `cascade_on_delete_delete_children` cannot re-enter and the grandchild survives.
 	#[test]
 	fn reopened_connection_cascades_past_the_first_generation() {
-		let dir = TempDbDir(
-			std::env::temp_dir().join(format!("filen-cache-pragma-test-{}", rand::random::<u64>())),
-		);
-		std::fs::create_dir_all(&dir.0).unwrap();
+		let dir = TempDbDir::create("filen-cache-pragma-test");
 		let db_path = dir.0.join("native_cache.db");
 
 		{
@@ -1114,5 +1148,110 @@ mod connection_pragma_tests {
 			remaining, 0,
 			"cascade stopped early: a reopened connection is missing PRAGMA recursive_triggers"
 		);
+	}
+}
+
+#[cfg(test)]
+mod owner_stamp_tests {
+	use super::{db_from_dir, test_support::TempDbDir};
+
+	const OWNER_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+	const OWNER_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+	fn open(dir: &TempDbDir, owner: &str) -> rusqlite::Connection {
+		let state_file = dir.0.join("db_state.json");
+		db_from_dir(&dir.0, &dir.0, &state_file, owner).unwrap().0
+	}
+
+	fn insert_marker(conn: &rusqlite::Connection) {
+		conn.execute_batch(
+			"INSERT INTO items (uuid, stable_uuid, parent, type)
+			VALUES (x'AA000000000000000000000000000000', NULL, NULL, 1);",
+		)
+		.unwrap();
+	}
+
+	fn marker_count(conn: &rusqlite::Connection) -> i64 {
+		conn.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+			.unwrap()
+	}
+
+	/// Everything account A's session left on disk, beyond the DB itself: the decrypted bytes
+	/// and names that would leak into account B's session if only the DB were recreated.
+	fn litter(dir: &TempDbDir) -> Vec<std::path::PathBuf> {
+		let mut paths = Vec::new();
+		for sub in ["cache", "tmp", "thumbnails"] {
+			let slot = dir.0.join(sub).join("11111111-1111-1111-1111-111111111111");
+			std::fs::create_dir_all(&slot).unwrap();
+			let file = slot.join("decrypted-name.txt");
+			std::fs::write(&file, b"account A's bytes").unwrap();
+			paths.push(file);
+		}
+		// The SDK search cache and its WAL, which carry decrypted names. Never opened by
+		// db_from_dir, so fake contents are safe here.
+		for name in ["sdk_search_cache.db", "sdk_search_cache.db-wal"] {
+			let file = dir.0.join(name);
+			std::fs::write(&file, b"account A's names").unwrap();
+			paths.push(file);
+		}
+		paths
+	}
+
+	/// The point of the stamp: one physical db_dir, keyed by the constant domain identifier, must
+	/// not hand account B the tree account A left behind — neither the DB rows nor the decrypted
+	/// bytes and names in the cache/tmp/thumbnail dirs and the SDK search cache. A swap that only
+	/// recreated the DB would leave the actual leak in place.
+	#[test]
+	fn a_different_owner_wipes_everything_the_previous_account_left() {
+		let dir = TempDbDir::create("filen-cache-owner-swap");
+		insert_marker(&open(&dir, OWNER_A));
+		let leftovers = litter(&dir);
+
+		// Same owner: the cache is theirs, so ALL of it is kept.
+		let conn = open(&dir, OWNER_A);
+		assert_eq!(marker_count(&conn), 1, "same owner must keep the cache");
+		for path in &leftovers {
+			assert!(path.exists(), "same owner must keep {}", path.display());
+		}
+		drop(conn);
+
+		let conn = open(&dir, OWNER_B);
+		assert_eq!(
+			marker_count(&conn),
+			0,
+			"another account's tree survived the swap"
+		);
+		for sub in ["cache", "tmp", "thumbnails"] {
+			assert!(
+				!dir.0.join(sub).exists(),
+				"account A's {sub} dir survived the swap"
+			);
+		}
+		for path in &leftovers {
+			assert!(!path.exists(), "{} survived the swap", path.display());
+		}
+	}
+
+	/// A db_state.json written before the stamp existed has no `owner` field. It must parse (not
+	/// error) and read as a mismatch — exactly one re-init, after which the stamped file holds.
+	#[test]
+	fn a_pre_stamp_db_state_reinitializes_exactly_once() {
+		let dir = TempDbDir::create("filen-cache-owner-upgrade");
+		let state_file = dir.0.join("db_state.json");
+		insert_marker(&open(&dir, OWNER_A));
+
+		// Strip the stamp to recreate the pre-upgrade format, leaving hash/version as written.
+		let mut state: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+		assert!(state.as_object_mut().unwrap().remove("owner").is_some());
+		std::fs::write(&state_file, serde_json::to_string(&state).unwrap()).unwrap();
+
+		let conn = open(&dir, OWNER_A);
+		assert_eq!(marker_count(&conn), 0, "the upgrade re-init must happen");
+		insert_marker(&conn);
+		drop(conn);
+
+		let conn = open(&dir, OWNER_A);
+		assert_eq!(marker_count(&conn), 1, "one re-init on upgrade, not two");
 	}
 }

@@ -80,6 +80,49 @@ pub(crate) fn init(files_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), io:
 	Ok((cache_dir, tmp_dir, thumbnail_dir))
 }
 
+/// Removes everything on disk belonging to the signed-in account — the ONE definition of that
+/// set, shared by every DB re-init (`auth::init_db`: hash/version/owner mismatch, corruption)
+/// and by the confirmed-disable wipe (via `spawn_blocking`):
+///
+/// - the cache/tmp/thumbnail dirs under `files_dir` — decrypted bytes, staged uploads,
+///   thumbnails;
+/// - the native cache DB and the SDK search cache (which lives next to it at `db_dir`, ==
+///   `files_dir` unless the platform relocated it, see `CacheState::db_dir`), each with its
+///   `-wal`/`-shm` sidecars: a stale `-wal` surviving next to a recreated DB is replayed into
+///   it on open (sqlite.org/howtocorrupt.html §4.4), and both WALs carry the most recent
+///   decrypted names.
+///
+/// Callers must hold no open connection to either DB. Keeps going after a failure (NotFound is
+/// not one) so a wedged path removes as much as it can, and returns the first error so the
+/// re-init path can refuse to build on a half-wiped state.
+pub(crate) fn wipe_account_data(files_dir: &Path, db_dir: &Path) -> io::Result<()> {
+	let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(files_dir);
+	let mut first_err = None;
+	let mut note = |res: io::Result<()>, path: &Path, what: &str| match res {
+		Ok(()) => info!("Removed {what}: {}", path.display()),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+		Err(e) => {
+			error!("Failed to remove {what} {}: {e}", path.display());
+			first_err.get_or_insert(e);
+		}
+	};
+	for dir in [&cache_dir, &tmp_dir, &thumbnail_dir] {
+		note(std::fs::remove_dir_all(dir), dir, "account directory");
+	}
+	for db in [DB_FILE_NAME, crate::search::SDK_CACHE_DB_NAME] {
+		for suffix in ["", "-wal", "-shm"] {
+			let mut os = db_dir.join(db).into_os_string();
+			os.push(suffix);
+			let path = PathBuf::from(os);
+			note(std::fs::remove_file(&path), &path, "database file");
+		}
+	}
+	match first_err {
+		None => Ok(()),
+		Some(e) => Err(e),
+	}
+}
+
 pub(crate) async fn update_task(
 	mut receiver: UnboundedReceiver<u64>,
 	file_size: u64,
@@ -396,16 +439,6 @@ impl AuthCacheState {
 		// that claim, and a stale marker keeps an item this device no longer holds inside it.
 		self.drop_materialised(uuid);
 		Ok(())
-	}
-}
-
-async fn remove_dir_all_if_exists(path: &Path) {
-	match tokio::fs::remove_dir_all(path).await {
-		Ok(_) => {}
-		Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-		Err(e) => {
-			error!("Failed to remove directory {}: {}", path.display(), e);
-		}
 	}
 }
 
@@ -933,55 +966,20 @@ impl CacheState {
 					return;
 				}
 				debug!("Confirmed disabled, removing all cache directories and database file");
-				let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(&cache.files_dir);
-				// The DBs live at db_dir (== files_dir unless the platform relocated them, see
-				// CacheState::db_dir). Remove the WAL sidecars along with each DB — a leftover
-				// -wal carries the most recent decrypted names and must not survive logout.
-				let db_file = cache.db_dir.join(DB_FILE_NAME);
-				let sdk_cache = cache.db_dir.join(crate::search::SDK_CACHE_DB_NAME);
-				futures::join!(
-					remove_dir_all_if_exists(&cache_dir),
-					remove_dir_all_if_exists(&tmp_dir),
-					remove_dir_all_if_exists(&thumbnail_dir),
-					async {
-						// we can delete the db here because we are not authenticated
-						// so we know there is no database connection open
-						for suffix in ["", "-wal", "-shm"] {
-							let mut os = db_file.clone().into_os_string();
-							os.push(suffix);
-							let path = std::path::PathBuf::from(os);
-							match tokio::fs::remove_file(&path).await {
-								Ok(_) => info!("Removed database file: {}", path.display()),
-								Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-								Err(e) => error!(
-									"Failed to remove database file {}: {}",
-									path.display(),
-									e
-								),
-							}
-						}
-					},
-					async {
-						// The SDK search cache lives next to native_cache.db (outside cache_dir), so
-						// wipe it and its WAL sidecars here — otherwise it survives logout and, on
-						// directory reuse across accounts, leaks the previous account's cached
-						// names/keys.
-						for suffix in ["", "-wal", "-shm"] {
-							let mut os = sdk_cache.clone().into_os_string();
-							os.push(suffix);
-							let path = std::path::PathBuf::from(os);
-							match tokio::fs::remove_file(&path).await {
-								Ok(_) => info!("Removed SDK search cache file: {}", path.display()),
-								Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-								Err(e) => error!(
-									"Failed to remove SDK search cache file {}: {}",
-									path.display(),
-									e
-								),
-							}
-						}
-					}
-				);
+				// We can delete the DBs because we are not authenticated, so no connection is
+				// open. The wipe itself is the sync function shared with the re-init path,
+				// bounced through spawn_blocking while this task keeps holding the read guard.
+				let files_dir = cache.files_dir.clone();
+				let db_dir = cache.db_dir.clone();
+				if let Err(e) = tokio::task::spawn_blocking(move || {
+					// Per-path failures are logged inside; a confirmed disable has no caller
+					// to propagate them to, and the next confirmation retries what is left.
+					let _ = wipe_account_data(&files_dir, &db_dir);
+				})
+				.await
+				{
+					error!("The confirmed-disable wipe task failed: {e}");
+				}
 			}
 			AuthStatus::Unauthenticated(_) => {
 				debug!("Not authenticated but not confirmed disabled; leaving the cache intact");
