@@ -30,6 +30,157 @@ pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
 	SUPPORTED_THUMBNAIL_MIME_TYPES.binary_search(&mime).is_ok()
 }
 
+/// Extensions worth spending bytes on, evaluated from the filename at READ
+/// time.
+///
+/// This list is ours on purpose. The stored mime is written once at upload by
+/// whichever client uploaded the file — `mime-types` (JS), `mime_guess` (Rust)
+/// or Go's stdlib `mime` — and then never revisited, so it is a fossil of that
+/// library's table at that date, on that machine:
+///
+/// - all three collapse "unknown extension", "no extension" and "genuinely
+///   binary" into `application/octet-stream`, so a NEGATIVE carries no
+///   information at all;
+/// - HEIC — the dominant phone format — is stored as octet-stream by every
+///   Rust client before June 2024 (when `mime_guess` gained it) and by Go
+///   clients on macOS or in slim containers, where the host has no
+///   `/etc/mime.types`;
+/// - RAW formats are absent from the JS table entirely, and from Go's unless
+///   the host happens to have `shared-mime-info` installed.
+///
+/// Deciding from the extension now, against a table we control, makes the
+/// answer the same everywhere and lets a new format be added in one line
+/// instead of waiting for three upstreams and a re-upload.
+///
+/// The RAW entries are attempts, not promises: they are TIFF or ISO-BMFF
+/// containers that normally carry an embedded JPEG preview, which is exactly
+/// what the pipeline's preview probe looks for. Whether every vendor's layout
+/// yields one is unverified — no RAW fixtures were available — but a miss
+/// costs one chunk and answers "no thumbnail", which is what they do today
+/// anyway.
+///
+/// `avif` is deliberately absent: this build has no AV1 decoder (see
+/// `heif-decoder`'s `hevc_decodes_avif_does_not`).
+const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
+	// Formats the pipeline decodes directly.
+	"bmp", "gif", "heic", "heif", "hif", "jfif", "jpe", "jpeg", "jpg", "png", "qoi", "tif", "tiff",
+	"webp", //
+	// RAW: TIFF/BMFF containers, reached for their embedded preview.
+	"3fr", "arw", "cr2", "cr3", "dng", "erf", "iiq", "kdc", "mos", "mrw", "nef", "nrw", "orf",
+	"pef", "raf", "raw", "rw2", "rwl", "srf", "srw", "x3f",
+];
+
+/// Whether a thumbnail is worth attempting for this file.
+///
+/// Magic bytes remain the authority — this only decides whether to spend the
+/// bytes to look.
+///
+/// **An extension, when there is one, decides on its own. The mime is
+/// consulted only for names that carry no extension at all.** Every library
+/// that wrote those stored mimes derived them from the extension in the first
+/// place, so for a named file the extension is the same evidence, only fresher
+/// and evaluated against a table we control. Falling back to the mime for
+/// extensionless names still honours a client that supplied one explicitly —
+/// a browser's `File.type`, say — which is the one case where the mime knows
+/// something the name does not.
+///
+/// This is what keeps `svg`, `psd`, `dwg`, `tga` and friends out despite their
+/// `image/*` mimes, and `avif` out despite ours being correct: nothing here
+/// decodes them, so looking costs a chunk and answers nothing. It also means a
+/// file whose extension lies (`photo.xyz` holding a JPEG) is skipped even if
+/// its mime says otherwise — accepted, because that mime can only have been
+/// supplied by hand, and the alternative is paying a chunk for every unknown
+/// extension on the drive.
+///
+/// Filename handling, all deliberate: the extension is what follows the LAST
+/// dot, matching every library that produced the stored mimes, so
+/// `photo.jpg.enc` reads as `enc` and is skipped. Matching is case-insensitive
+/// and tolerates surrounding whitespace. A dotfile named `.jpg` counts as a
+/// JPEG — permissive, and it costs at most a chunk to be wrong.
+pub fn might_be_thumbnailable(name: Option<&str>, mime: Option<&str>) -> bool {
+	match name.and_then(|name| name.rsplit_once('.')) {
+		Some((_, ext)) => {
+			let ext = ext.trim();
+			THUMBNAILABLE_EXTENSIONS
+				.iter()
+				.any(|known| ext.eq_ignore_ascii_case(known))
+		}
+		None => mime.is_some_and(|mime| mime.starts_with("image/")),
+	}
+}
+
+#[cfg(test)]
+mod gate_tests {
+	use super::might_be_thumbnailable;
+
+	#[test]
+	fn the_extension_rescues_what_the_stored_mime_lost() {
+		// The case this exists for: HEIC stored as octet-stream by a Go client
+		// on macOS, or by any Rust client predating mime_guess 2.0.5.
+		assert!(might_be_thumbnailable(
+			Some("IMG_0042.heic"),
+			Some("application/octet-stream")
+		));
+		// RAW, absent from the JS table entirely.
+		assert!(might_be_thumbnailable(
+			Some("DSC_0001.NEF"),
+			Some("application/octet-stream")
+		));
+		// Uppercase is the norm straight off a camera.
+		assert!(might_be_thumbnailable(Some("IMG_1234.JPG"), None));
+	}
+
+	#[test]
+	fn the_mime_is_the_fallback_only_when_there_is_no_extension() {
+		// An explicitly-supplied mime is the only signal for a name that
+		// carries no extension, so it is honoured.
+		assert!(might_be_thumbnailable(Some("scan"), Some("image/jpeg")));
+		assert!(might_be_thumbnailable(None, Some("image/png")));
+		// But an extension we cannot decode wins over its own correct mime —
+		// looking would cost a chunk to learn nothing.
+		assert!(!might_be_thumbnailable(
+			Some("logo.svg"),
+			Some("image/svg+xml")
+		));
+		assert!(!might_be_thumbnailable(
+			Some("photo.avif"),
+			Some("image/avif")
+		));
+		assert!(!might_be_thumbnailable(
+			Some("art.psd"),
+			Some("image/vnd.adobe.photoshop")
+		));
+	}
+
+	#[test]
+	fn everything_else_is_left_alone() {
+		assert!(!might_be_thumbnailable(
+			Some("archive.zip"),
+			Some("application/zip")
+		));
+		// A wrapper suffix hides the real extension from every mime library
+		// too, so the stored mime is octet-stream and this stays skipped.
+		assert!(!might_be_thumbnailable(
+			Some("photo.jpg.enc"),
+			Some("application/octet-stream")
+		));
+		// No dot, nothing to go on.
+		assert!(!might_be_thumbnailable(
+			Some("IMG_1234"),
+			Some("application/octet-stream")
+		));
+		assert!(!might_be_thumbnailable(None, None));
+		// AVIF: no AV1 decoder in this build, and admitting it would only buy
+		// a chunk and a refusal.
+		assert!(!might_be_thumbnailable(
+			Some("photo.avif"),
+			Some("application/octet-stream")
+		));
+		// A dotfile is treated as its extension, deliberately.
+		assert!(might_be_thumbnailable(Some(".jpg"), None));
+	}
+}
+
 impl Client {
 	pub async fn make_thumbnail_in_memory<Id: Send + Sync>(
 		&self,

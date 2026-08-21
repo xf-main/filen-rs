@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use filen_sdk_rs::{
 	fs::{
-		HasUUID,
+		HasName, HasUUID,
 		file::{RemoteFile, traits::HasFileInfo},
 	},
 	io::FilenMetaExt,
@@ -70,13 +70,17 @@ impl AuthCacheState {
 		target_width: u32,
 		target_height: u32,
 	) -> Result<Option<PathBuf>, CacheError> {
-		let Some(mime) = file.mime() else {
-			debug!("File has no mime type, no thumbnail will be made");
-			return Ok(None);
-		};
-
-		if !mime.starts_with("image/") {
-			debug!("File is not an image, no thumbnail will be made: {mime}");
+		// Decided from the filename, not the stored mime: that mime was written
+		// once at upload by whichever client uploaded the file and is a fossil
+		// of that library's table on that machine — HEIC in particular is
+		// stored as application/octet-stream by Go clients on macOS and by any
+		// Rust client predating June 2024. See `might_be_thumbnailable`.
+		if !filen_sdk_rs::thumbnail::might_be_thumbnailable(file.name(), file.mime()) {
+			debug!(
+				"Not a thumbnailable file, skipping: {:?} ({:?})",
+				file.name(),
+				file.mime()
+			);
 			return Ok(None);
 		}
 		let file_path = self.get_cached_file_path(file);
