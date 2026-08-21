@@ -2246,7 +2246,7 @@ impl AuthCacheState {
 		}
 	}
 
-	async fn inner_update_dir(&self, dir: &mut DBDirObject) -> Result<(), CacheError> {
+	pub(crate) async fn inner_update_dir(&self, dir: &mut DBDirObject) -> Result<(), CacheError> {
 		// Held across fetch AND apply — see `AuthCacheState::listing_barrier`.
 		let _listing = self.listing_barrier.read().await;
 		let (dirs, files) = self

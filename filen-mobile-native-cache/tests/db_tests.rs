@@ -7420,3 +7420,91 @@ pub async fn test_relisting_the_trash_drops_a_purged_file() {
 		"a purged lineage must not survive a trash relist as a phantom"
 	);
 }
+
+/// The gap path end to end: a change made while the socket is DOWN reaches the cache on
+/// reconnect, without anybody browsing — the watermark comparison detects the missed events and
+/// the pass re-lists exactly the reported materialized containers. Also exercises the container
+/// report itself: the container is never listed by this test, so its row exists only because the
+/// report's best-effort probe seeded it.
+#[shared_test_runtime]
+pub async fn test_reconnect_closes_a_socket_gap_by_relisting_containers() {
+	let _live = TRACKING_TEST_LOCK.lock().await;
+	let (db, rss) = get_db_resources().await;
+
+	let container = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "gap_container")
+		.await
+		.unwrap();
+	let container_uuid = container.uuid().to_string();
+
+	// List the parent so the container's row is RELEVANT, then report it materialized. The
+	// report must both hold the id and seed the row (this test never lists the container).
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path).await.unwrap();
+	db.set_materialized_containers(vec![container_uuid.clone()])
+		.await
+		.unwrap();
+	assert!(
+		db.query_item_by_uuid(&container_uuid).unwrap().is_some(),
+		"the report's probe must seed the container's row"
+	);
+
+	let listener = Arc::new(CountingWorkingSetListener::default());
+	db.set_working_set_listener(Some(listener.clone()));
+	db.start_live_updates();
+	let container_id: FfiId = format!("stable/{container_uuid}").into();
+	wait_until_live_is_delivering(&db, &container_id, &listener).await;
+
+	// The outage: the socket goes away, and the drive changes without us hearing it.
+	db.stop_live_updates();
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("landed_in_the_gap.txt", container.uuid())
+				.unwrap(),
+			b"missed by the socket",
+		)
+		.await
+		.unwrap();
+	let stable_id = format!("stable/{}", file.stable_uuid());
+	assert_eq!(
+		db.query_item_by_uuid(&stable_id).unwrap(),
+		None,
+		"the socket was down; nothing may have delivered this yet"
+	);
+
+	// Reconnect. The first authSuccess runs the gap check, which must find the moved counter
+	// and re-list the container — no browse happens in this loop.
+	db.start_live_updates();
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	let delivered = loop {
+		if let Some(FfiObject::File(f)) = db.query_item_by_uuid(&stable_id).unwrap() {
+			break f;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the gap pass never delivered the missed upload"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	};
+	assert_eq!(delivered.parent, container_uuid);
+
+	// And the working set presents it: the container clause is what makes the system come and
+	// look at all.
+	assert!(
+		db.query_working_set()
+			.unwrap()
+			.iter()
+			.any(|obj| matches!(obj, FfiObject::File(f) if f.uuid == delivered.uuid)),
+		"a container member must be a working-set member"
+	);
+
+	db.stop_live_updates();
+	db.set_working_set_listener(None);
+	db.set_materialized_containers(vec![]).await.unwrap();
+	rss.client.delete_file_permanently(file).await.unwrap();
+	rss.client.delete_dir_permanently(container).await.unwrap();
+}

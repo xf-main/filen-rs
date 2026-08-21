@@ -212,6 +212,12 @@ fn live_callback(
 }
 
 /// The ONE consumer: applies events strictly in the order the socket delivered them.
+///
+/// The gap pass runs INSIDE this loop (on `authSuccess`, which the socket broadcasts on every
+/// connect and reconnect), which is what closes the snapshot race by construction: events
+/// arriving while a pass's listings are in flight buffer in the channel and are applied only
+/// after every listing has landed — a listing taken before a rename can therefore never be
+/// applied after the rename's event and silently revert it.
 async fn drain_live_events(
 	state: Weak<RwLock<CacheState>>,
 	mut events: UnboundedReceiver<OwnedEvent>,
@@ -220,34 +226,192 @@ async fn drain_live_events(
 		let Some(state) = state.upgrade() else {
 			return;
 		};
-		let guard = state.read().await;
-		let AuthStatus::Authenticated(auth) = &guard.status else {
-			continue;
-		};
 		match event {
-			DecryptedSocketEvent::Drive { inner, .. } => {
+			// Everything on the drive is gone — or so the event says. Never applied as a bulk
+			// delete: the reconciling pass tells "gone" from "unreachable" per container, and
+			// the guarded forgets keep any unsent local edit. The watermark advances only if
+			// the pass converged; otherwise the pass is recorded as owed and the next gap check
+			// retries it.
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::DeleteAll,
+				drive_message_id,
+			} => {
+				tracing::warn!("deleteAll received; reconciling every materialized container");
+				reconcile_pass(&state, drive_message_id).await;
+				notify_working_set_changed(&state).await;
+			}
+			DecryptedSocketEvent::Drive {
+				inner,
+				drive_message_id,
+			} => {
 				let event_type = inner.event_type();
-				match auth.apply_drive_event(inner).await {
-					Ok(true) => {
-						tracing::debug!("applied live {event_type} event");
-						guard.notify_working_set();
+				let applied = {
+					let guard = state.read().await;
+					let AuthStatus::Authenticated(auth) = &guard.status else {
+						continue;
+					};
+					auth.apply_drive_event(inner).await
+				};
+				match applied {
+					Ok(applied) => {
+						// Advanced AFTER the apply committed, never before: a crash between
+						// the two re-delivers (via the gap pass) instead of skipping forever.
+						advance_watermark(&state, drive_message_id).await;
+						if applied {
+							tracing::debug!("applied live {event_type} event");
+							notify_working_set_changed(&state).await;
+						}
 					}
-					Ok(false) => {}
 					Err(e) => {
-						// Best-effort by design: a failed apply costs freshness until the next
-						// event or browse of the container, never correctness — the cache is
-						// authoritative for nothing.
+						// The event did NOT commit, so the watermark must not move past it —
+						// but holding it back is not enough on its own: the NEXT event advances
+						// the watermark past this id, and a watermark-only gap check would then
+						// see nothing to close. The debt is recorded durably instead, and the
+						// next gap check re-lists what this failed to apply. Best-effort beyond
+						// that: the cache is authoritative for nothing.
 						tracing::warn!("failed to apply live {event_type} event: {e}");
+						mark_pending_reconcile(&state).await;
 					}
 				}
 			}
 			// A drive event happened whose payload could not be read. Nothing to apply — and
-			// nothing to fear: the affected item reconciles on its next event or browse.
-			DecryptedSocketEvent::DriveMalformed { .. } => {}
-			// Connection-state cues; the gap path acts on these.
+			// nothing to fear for the watermark: the id is known, and the affected item
+			// reconciles on its next event or browse.
+			DecryptedSocketEvent::DriveMalformed { drive_message_id } => {
+				advance_watermark(&state, drive_message_id).await;
+			}
+			// The socket (re)connected: check for a gap and close it. This is ALSO the launch
+			// path's check — the first authSuccess after subscribing is the first moment a gap
+			// is even answerable, and it cannot race the subscription that produced it.
+			DecryptedSocketEvent::AuthSuccess => {
+				gap_check(&state).await;
+			}
+			// Remaining connection-state cues need no action: a reconnect ends in its own
+			// authSuccess, and a failed auth delivers nothing to fall behind on.
 			_ => {}
 		}
 	}
+}
+
+/// Compares the persisted watermark against the account's drive counter and, on any gap — or on
+/// a durably owed pass — re-lists every reported materialized container, the only directories
+/// whose staleness the system cannot heal by itself. The watermark advances to the PRE-PASS
+/// remote counter, and only when every container converged; a partial pass leaves it put and
+/// records the debt, because the watermark alone cannot hold a retry open (the next event
+/// advances it past the gap).
+async fn gap_check(state: &Arc<RwLock<CacheState>>) {
+	let (client, watermark, owed) = {
+		let guard = state.read().await;
+		let AuthStatus::Authenticated(auth) = &guard.status else {
+			return;
+		};
+		(
+			auth.client.clone(),
+			auth.drive_watermark(),
+			auth.pending_reconcile() > 0,
+		)
+	};
+	// NO state guard across the round trip (the module's lock discipline).
+	let remote = match client.get_last_event_ids().await {
+		Ok(response) => response.drive,
+		Err(e) => {
+			tracing::debug!("gap check could not read the drive counter: {e}");
+			return;
+		}
+	};
+	if !pass_owed(owed, watermark, remote) {
+		return;
+	}
+	tracing::info!(
+		"drive event gap (local {watermark:?}, remote {remote}, owed {owed}); re-listing \
+		 materialized containers"
+	);
+	reconcile_pass(state, remote).await;
+	notify_working_set_changed(state).await;
+}
+
+/// The gap gate: a pass runs when the remote counter has moved past our watermark, and ALSO
+/// whenever one is durably owed — a container that failed to converge, an event that failed to
+/// apply, a container reported for the first time. The debt has to be its own answer here,
+/// because the events that follow the failure advance the watermark past the gap and leave the
+/// counters saying "caught up" over a container nothing has re-listed.
+fn pass_owed(owed: bool, watermark: Option<u64>, remote: u64) -> bool {
+	owed || watermark.is_none_or(|local| local < remote)
+}
+
+/// One reconcile pass and the durable bookkeeping it owes: the watermark advances to `id` and
+/// the pending flag clears only when EVERY container converged. A partial pass leaves the
+/// watermark where it was AND records the debt, which is what makes the retry survive the later
+/// events that carry the watermark past `id`.
+async fn reconcile_pass(state: &Arc<RwLock<CacheState>>, id: u64) {
+	// Read BEFORE the container set is, so a report landing mid-pass fails the compare-and-clear
+	// below instead of being cleared by a pass that never listed it.
+	let owed = {
+		let guard = state.read().await;
+		let AuthStatus::Authenticated(auth) = &guard.status else {
+			return;
+		};
+		auth.pending_reconcile()
+	};
+	if reconcile_containers(state).await {
+		advance_watermark(state, id).await;
+		clear_pending_reconcile(state, owed).await;
+	} else {
+		mark_pending_reconcile(state).await;
+	}
+}
+
+async fn mark_pending_reconcile(state: &Arc<RwLock<CacheState>>) {
+	let guard = state.read().await;
+	if let AuthStatus::Authenticated(auth) = &guard.status {
+		auth.mark_pending_reconcile().await;
+	}
+}
+
+async fn clear_pending_reconcile(state: &Arc<RwLock<CacheState>>, owed: u64) {
+	let guard = state.read().await;
+	if let AuthStatus::Authenticated(auth) = &guard.status {
+		auth.clear_pending_reconcile(owed).await;
+	}
+}
+
+/// Re-lists every reported materialized container (the account root included), concurrency
+/// bounded, best-effort per container — one failure must not abort the pass. Returns whether
+/// EVERY container converged, which is what gates the watermark.
+async fn reconcile_containers(state: &Arc<RwLock<CacheState>>) -> bool {
+	let containers = {
+		let guard = state.read().await;
+		let AuthStatus::Authenticated(auth) = &guard.status else {
+			return false;
+		};
+		auth.working_set_containers()
+	};
+	let results: Vec<bool> = futures::stream::iter(containers.into_iter().map(|uuid| {
+		let state = state.clone();
+		async move {
+			// The guard is PER CONTAINER, so a queued writer waits for one listing at most.
+			let guard = state.read().await;
+			let AuthStatus::Authenticated(auth) = &guard.status else {
+				return false;
+			};
+			auth.refresh_container(Uuid::from(uuid)).await
+		}
+	}))
+	.buffer_unordered(CONTAINER_PROBE_CONCURRENCY)
+	.collect()
+	.await;
+	results.into_iter().all(|converged| converged)
+}
+
+async fn advance_watermark(state: &Arc<RwLock<CacheState>>, id: u64) {
+	let guard = state.read().await;
+	if let AuthStatus::Authenticated(auth) = &guard.status {
+		auth.advance_drive_watermark(id).await;
+	}
+}
+
+async fn notify_working_set_changed(state: &Arc<RwLock<CacheState>>) {
+	state.read().await.notify_working_set();
 }
 
 /// What the pure dispatch decided about one event: either it was applied (or dropped) locally,
@@ -587,6 +751,128 @@ impl AuthCacheState {
 			.collect()
 	}
 
+	pub(crate) fn drive_watermark(&self) -> Option<u64> {
+		*lock(&self.drive_watermark)
+	}
+
+	/// Advances the drive watermark to `id` (monotonic; a lower id is a no-op) and mirrors it to
+	/// `db_state.json`. Called AFTER an apply commits, never before — the difference between a
+	/// crash re-delivering a change and skipping it forever.
+	pub(crate) async fn advance_drive_watermark(&self, id: u64) {
+		{
+			let mut watermark = lock(&self.drive_watermark);
+			if watermark.is_some_and(|current| current >= id) {
+				return;
+			}
+			*watermark = Some(id);
+		}
+		if let Err(e) = crate::auth::update_saved_db_state(&self.cache_state_file, move |state| {
+			// Monotonic against a concurrent writer of the same file too.
+			state.drive_watermark = Some(state.drive_watermark.unwrap_or(0).max(id));
+		})
+		.await
+		{
+			tracing::warn!("failed to persist the drive watermark: {e}");
+		}
+	}
+
+	/// The reconcile debt this cache carries (see [`crate::auth::SavedDBState::pending_reconcile`]):
+	/// zero means none. Any other value means a pass is owed, and IDENTIFIES that debt — a pass
+	/// clears only the value it saw.
+	pub(crate) fn pending_reconcile(&self) -> u64 {
+		self.pending_reconcile.load(Ordering::Acquire)
+	}
+
+	/// Records that a reconcile pass is owed, durably: the flag has to outlive both the process
+	/// and the watermark advances that follow it.
+	pub(crate) async fn mark_pending_reconcile(&self) {
+		if self.pending_reconcile.fetch_add(1, Ordering::AcqRel) > 0 {
+			// Already owed and already persisted; the bump alone invalidates any pass in flight.
+			return;
+		}
+		self.persist_pending_reconcile(true).await;
+	}
+
+	/// Clears the debt `owed` — and only that one. A mark that landed since (a report of a
+	/// container this pass never listed) leaves it standing for the next pass.
+	pub(crate) async fn clear_pending_reconcile(&self, owed: u64) {
+		if owed == 0
+			|| self
+				.pending_reconcile
+				.compare_exchange(owed, 0, Ordering::AcqRel, Ordering::Acquire)
+				.is_err()
+		{
+			return;
+		}
+		self.persist_pending_reconcile(false).await;
+	}
+
+	async fn persist_pending_reconcile(&self, pending: bool) {
+		if let Err(e) = crate::auth::update_saved_db_state(&self.cache_state_file, move |state| {
+			state.pending_reconcile = Some(pending);
+		})
+		.await
+		{
+			tracing::warn!("failed to persist the pending-reconcile flag: {e}");
+		}
+	}
+
+	/// One container's share of a reconcile pass: relist it in place, `true` when it converged.
+	/// A container the cache holds no dir row for converges trivially — the seeding probes own
+	/// it, and its children cannot be staler than unknown. A listing that fails is classified
+	/// with one probe: definitively gone converges through the guarded forget; anything else is
+	/// a transient failure the next pass retries.
+	pub(crate) async fn refresh_container(&self, uuid: Uuid) -> bool {
+		let held = match DBObject::select(&self.conn(), uuid).optional() {
+			Ok(held) => held,
+			Err(e) => {
+				tracing::warn!("could not read container {uuid}: {e}");
+				return false;
+			}
+		};
+		let mut dir = match held {
+			Some(DBObject::Dir(dir)) => crate::sql::DBDirObject::Dir(dir),
+			Some(DBObject::Root(root)) => crate::sql::DBDirObject::Root(root),
+			// A file id in the set (a mis-filtered report) has nothing to list, ever.
+			Some(DBObject::File(_)) => return true,
+			// No row: the report's seeding probe failed (an offline launch). NOT convergence —
+			// claiming it would advance the watermark past a container that was never listed
+			// and re-create the stale-forever bug. Seed it here, or hold the watermark back so
+			// the next connect retries.
+			None => match self.client.get_dir(uuid).await {
+				Ok(remote) => match DBDir::upsert_from_remote(&mut self.conn(), remote) {
+					Ok(dir) => crate::sql::DBDirObject::Dir(dir),
+					Err(e) => {
+						tracing::warn!("could not seed container {uuid} for the pass: {e}");
+						return false;
+					}
+				},
+				// Definitively gone (or never a dir): nothing below it can be stale.
+				Err(e) if e.kind() == filen_sdk_rs::ErrorKind::FolderNotFound => return true,
+				Err(e) => {
+					tracing::debug!("could not seed container {uuid} for the pass: {e}");
+					return false;
+				}
+			},
+		};
+		match self.inner_update_dir(&mut dir).await {
+			Ok(()) => true,
+			Err(e) => {
+				// `CacheError` folds the SDK error kind away, so classify with one probe.
+				if matches!(
+					self.client.get_dir(uuid).await,
+					Err(probe) if probe.kind() == filen_sdk_rs::ErrorKind::FolderNotFound
+				) {
+					tracing::debug!("container {uuid} is gone; forgetting it");
+					self.forget_dir(uuid).await.is_ok()
+				} else {
+					tracing::warn!("re-listing container {uuid} failed: {e}");
+					false
+				}
+			}
+		}
+	}
+
 	/// Replaces the reported materialized-container set (see the FFI wrapper below).
 	///
 	/// The ORDER inside is load-bearing: the set is stored — in memory and in `db_state.json` —
@@ -617,10 +903,22 @@ impl AuthCacheState {
 		tracing::debug!("materialized containers reported: {} ids", parsed.len());
 
 		let mirrored: Vec<UuidStr> = parsed.iter().copied().map(UuidStr::from).collect();
-		*self
-			.materialized_containers
-			.write()
-			.unwrap_or_else(|poisoned| poisoned.into_inner()) = parsed.clone();
+		let added = {
+			let mut held = self
+				.materialized_containers
+				.write()
+				.unwrap_or_else(|poisoned| poisoned.into_inner());
+			let added = parsed.iter().any(|uuid| !held.contains(uuid));
+			*held = parsed.clone();
+			added
+		};
+		// A container reported for the first time has never been kept fresh by this cache, and
+		// the watermark says nothing about it — it may sit at the remote counter while this
+		// container's contents are months old. Owe a pass for it. (After the set is stored, so
+		// the pass that answers the debt lists it.)
+		if added {
+			self.mark_pending_reconcile().await;
+		}
 		// Mirrored durably, best-effort: a failed write costs the NEXT launch's pre-drain
 		// freshness, never this session's.
 		if let Err(e) = crate::auth::update_saved_db_state(&self.cache_state_file, move |state| {
@@ -1134,5 +1432,38 @@ mod applier_tests {
 			)
 			.unwrap();
 		assert_eq!(raw, "new-enc");
+	}
+}
+
+#[cfg(test)]
+mod gap_gate_tests {
+	use super::pass_owed;
+
+	/// The regression the durable debt exists for: a pass that failed leaves the watermark
+	/// behind, the next events carry it past the remote counter this cache ever compared
+	/// against, and from then on the counters alone say "caught up" forever. The debt must
+	/// outrank them — and, once a pass converges and clears it, stop forcing passes.
+	#[test]
+	fn an_owed_pass_runs_even_when_the_watermark_says_caught_up() {
+		assert!(
+			pass_owed(true, Some(50), 50),
+			"a pass owed by a failed container (or apply) must run past a caught-up watermark"
+		);
+		assert!(
+			pass_owed(true, Some(9000), 50),
+			"a watermark advanced by later events must not swallow the debt"
+		);
+		assert!(
+			!pass_owed(false, Some(50), 50),
+			"nothing owed and nothing missed: no pass"
+		);
+		assert!(
+			pass_owed(false, Some(49), 50),
+			"a moved remote counter still runs a pass on its own"
+		);
+		assert!(
+			pass_owed(false, None, 0),
+			"a fresh cache has missed everything by definition"
+		);
 	}
 }

@@ -78,6 +78,14 @@ pub struct AuthCacheState {
 	/// launch before the first drain still has the last-known set. The account root is NOT
 	/// stored; it is injected at query time, always.
 	pub(crate) materialized_containers: RwLock<std::collections::HashSet<Uuid>>,
+	/// See [`SavedDBState::drive_watermark`]; this is the live copy, persisted on advance.
+	pub(crate) drive_watermark: Mutex<Option<u64>>,
+	/// See [`SavedDBState::pending_reconcile`]; this is the live copy, persisted on change.
+	/// A COUNTER rather than a flag: zero means nothing is owed, and every mark bumps it, so a
+	/// pass can only clear the debt it actually saw (compare-and-clear). A report landing while
+	/// a pass is already listing would otherwise be cleared by that pass without ever having
+	/// been part of it.
+	pub(crate) pending_reconcile: std::sync::atomic::AtomicU64,
 	/// Orders server listings against the live applier (the F3 snapshot race): a `dir/content`
 	/// listing fetched BEFORE a socket event but applied AFTER it would silently revert the
 	/// event — a rename undone, a deleted row resurrected — until the item's next event. Listing
@@ -172,6 +180,21 @@ pub(crate) struct SavedDBState {
 	/// it served last time.
 	#[serde(default)]
 	pub(crate) materialized_containers: Option<Vec<UuidStr>>,
+	/// The last drive socket event this cache applied (`driveMessageId`), advanced as applies
+	/// commit — never before. Compared against `v3/messageIds` on (re)connect: a higher remote
+	/// counter means events were missed, and the materialized containers are re-listed to close
+	/// the gap. `None` (a fresh or wiped cache, or a pre-watermark file) reads as "everything
+	/// may have been missed", which runs the same pass.
+	#[serde(default)]
+	pub(crate) drive_watermark: Option<u64>,
+	/// Set while a reconcile pass is OWED — a container that failed to converge, an event that
+	/// failed to apply, or a container reported materialized for the first time — and cleared
+	/// only by a pass that converged completely. Durable because the watermark cannot express
+	/// it: the very next event advances the watermark past the gap, and a watermark-only gate
+	/// would then never run the pass the failure asked for. Same shape as the SDK engine's
+	/// `needs_resync`, and for the same reason.
+	#[serde(default)]
+	pub(crate) pending_reconcile: Option<bool>,
 }
 
 impl Default for SavedDBState {
@@ -182,6 +205,8 @@ impl Default for SavedDBState {
 			last_cache_cleanup: None,
 			owner: None,
 			materialized_containers: None,
+			drive_watermark: None,
+			pending_reconcile: None,
 		}
 	}
 }
@@ -832,6 +857,14 @@ impl AuthCacheState {
 					.map(|uuids| uuids.iter().map(|uuid| Uuid::from(*uuid)).collect())
 					.unwrap_or_default(),
 			),
+			drive_watermark: Mutex::new(state.as_ref().and_then(|s| s.drive_watermark)),
+			pending_reconcile: std::sync::atomic::AtomicU64::new(
+				state
+					.as_ref()
+					.and_then(|s| s.pending_reconcile)
+					.unwrap_or(false)
+					.into(),
+			),
 			listing_barrier: tokio::sync::RwLock::new(()),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};
@@ -880,6 +913,8 @@ impl AuthCacheState {
 			search: tokio::sync::Mutex::new(None),
 			live: Default::default(),
 			materialized_containers: RwLock::new(Default::default()),
+			drive_watermark: Mutex::new(None),
+			pending_reconcile: std::sync::atomic::AtomicU64::new(0),
 			listing_barrier: tokio::sync::RwLock::new(()),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};
@@ -1346,5 +1381,81 @@ mod owner_stamp_tests {
 
 		let conn = open(&dir, OWNER_A);
 		assert_eq!(marker_count(&conn), 1, "one re-init on upgrade, not two");
+	}
+}
+
+#[cfg(test)]
+mod pending_reconcile_state_tests {
+	use super::{SavedDBState, test_support::TempDbDir, update_saved_db_state};
+
+	async fn read(path: &std::path::Path) -> SavedDBState {
+		serde_json::from_str(&tokio::fs::read_to_string(path).await.unwrap()).unwrap()
+	}
+
+	/// The debt and the watermark are independent halves of the same file: a pass that failed
+	/// records the debt, and every event that follows advances the watermark right past the gap.
+	/// If an advance could clear (or overwrite) the debt, the failed pass would never be retried
+	/// — which is exactly the bug the flag exists to close.
+	#[tokio::test]
+	async fn a_watermark_advance_leaves_the_reconcile_debt_standing() {
+		let dir = TempDbDir::create("filen-cache-pending-reconcile");
+		let state_file = dir.0.join("db_state.json");
+
+		update_saved_db_state(&state_file, |state| state.pending_reconcile = Some(true))
+			.await
+			.unwrap();
+		for id in [7u64, 99, 1000] {
+			update_saved_db_state(&state_file, |state| state.drive_watermark = Some(id))
+				.await
+				.unwrap();
+		}
+		let state = read(&state_file).await;
+		assert_eq!(state.drive_watermark, Some(1000));
+		assert_eq!(
+			state.pending_reconcile,
+			Some(true),
+			"the watermark ran away with the events; the owed pass must still be owed"
+		);
+
+		update_saved_db_state(&state_file, |state| state.pending_reconcile = Some(false))
+			.await
+			.unwrap();
+		let state = read(&state_file).await;
+		assert_eq!(
+			state.pending_reconcile,
+			Some(false),
+			"a converged pass clears the debt"
+		);
+		assert_eq!(state.drive_watermark, Some(1000), "and keeps the watermark");
+	}
+
+	/// The upgrade path: a db_state.json written by a build without the field must PARSE, not
+	/// error — an unparseable state file is a full cache wipe, pending-upload markers included.
+	#[tokio::test]
+	async fn a_state_file_without_the_field_parses_as_nothing_owed() {
+		let dir = TempDbDir::create("filen-cache-pending-reconcile-upgrade");
+		let state_file = dir.0.join("db_state.json");
+		update_saved_db_state(&state_file, |state| state.drive_watermark = Some(4))
+			.await
+			.unwrap();
+
+		let mut json: serde_json::Value =
+			serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+		assert!(
+			json.as_object_mut()
+				.unwrap()
+				.remove("pendingReconcile")
+				.is_some(),
+			"the field must be written under its camelCase name"
+		);
+		std::fs::write(&state_file, serde_json::to_string(&json).unwrap()).unwrap();
+
+		let state = read(&state_file).await;
+		assert_eq!(state.pending_reconcile, None);
+		assert_eq!(
+			state.drive_watermark,
+			Some(4),
+			"the rest survives the parse"
+		);
 	}
 }
