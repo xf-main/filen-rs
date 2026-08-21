@@ -16,11 +16,7 @@ fn thumb(
 }
 
 fn spec(target: u32) -> ThumbSpec {
-	ThumbSpec {
-		target_width: target,
-		target_height: target,
-		mem_budget: DEFAULT_MEM_BUDGET,
-	}
+	ThumbSpec::new(target, target, DEFAULT_MEM_BUDGET)
 }
 
 fn encode(image: &RgbImage, format: ImageFormat) -> Vec<u8> {
@@ -101,6 +97,7 @@ fn webp_over_budget_is_refused_but_streaming_png_is_not() {
 		target_width: 64,
 		target_height: 64,
 		mem_budget: 1024 * 1024,
+		allow_full_decode: true,
 	};
 	let webp = encode(&image, ImageFormat::WebP);
 	assert_eq!(thumb(Box::new(MemSource(webp)), &tiny).unwrap(), None);
@@ -159,6 +156,12 @@ fn a_small_progressive_jpeg_is_at_least_attempted() {
 /// a *green* image, while the main image is red — so tests can tell exactly
 /// which path produced the pixels.
 fn jpeg_with_exif_thumbnail(orientation_: u16) -> Vec<u8> {
+	jpeg_with_exif_thumbnail_sized(orientation_, 300, 200)
+}
+
+/// As above, with a main image big enough that reading it is measurable — the
+/// preview-only path must not touch it.
+fn jpeg_with_exif_thumbnail_sized(orientation_: u16, main_w: u32, main_h: u32) -> Vec<u8> {
 	let thumb = encode(
 		&RgbImage::from_pixel(160, 120, Rgb([0, 255, 0])),
 		ImageFormat::Jpeg,
@@ -188,7 +191,9 @@ fn jpeg_with_exif_thumbnail(orientation_: u16) -> Vec<u8> {
 	tiff.extend_from_slice(&thumb);
 
 	let main = encode(
-		&RgbImage::from_pixel(300, 200, Rgb([255, 0, 0])),
+		&RgbImage::from_fn(main_w, main_h, |x, y| {
+			Rgb([255, (x % 256) as u8, (y % 256) as u8])
+		}),
 		ImageFormat::Jpeg,
 	);
 	let mut exif_payload = b"Exif\0\0".to_vec();
@@ -320,11 +325,7 @@ fn smooth_image(w: u32, h: u32) -> RgbImage {
 /// Budget that the full progressive decode cannot fit but the DC path can —
 /// forcing the routing without needing a huge fixture.
 fn dc_forcing_spec(target: u32) -> ThumbSpec {
-	ThumbSpec {
-		target_width: target,
-		target_height: target,
-		mem_budget: 400_000,
-	}
+	ThumbSpec::new(target, target, 400_000)
 }
 
 #[test]
@@ -488,6 +489,7 @@ fn a_dc_scan_with_a_huge_quantizer_and_shift_does_not_panic() {
 		target_width: 64,
 		target_height: 64,
 		mem_budget: 400 * 1024,
+		allow_full_decode: true,
 	};
 	let result = thumb(Box::new(MemSource(bytes)), &starved)
 		.expect("a hostile DC scan must not error out here")
@@ -614,6 +616,7 @@ fn a_single_huge_strip_tiff_is_refused_but_striped_is_not() {
 		target_width: 512,
 		target_height: 512,
 		mem_budget: 4 * 1024 * 1024,
+		allow_full_decode: true,
 	};
 	let huge = encode(h);
 	assert_eq!(
@@ -854,6 +857,7 @@ fn an_oversized_embedded_preview_is_not_served_unbudgeted() {
 		target_width: 16,
 		target_height: 16,
 		mem_budget: 64,
+		allow_full_decode: true,
 	};
 	// The preview would suffice for a 16px target, but 64 bytes cannot hold
 	// it twice over — and the starved budget refuses the real decode too.
@@ -976,5 +980,56 @@ fn a_progressive_jpeg_past_the_dc_block_cap_still_serves_its_embedded_thumbnail(
 	assert!(
 		mean_channel(&result.image.rgba, 1) > 200,
 		"expected the green embedded thumb"
+	);
+}
+
+#[test]
+fn preview_only_serves_the_embedded_thumbnail_without_reading_the_image() {
+	// The case this exists for: a file too large to stream over the network for
+	// one small thumbnail. Refusing on size alone threw away the cheap path
+	// too — an embedded thumbnail lives in the header region and costs a chunk
+	// or two, however big the file is.
+	// A main image large enough that reading it would be obvious: a buffered
+	// header read cannot mask the difference the way it would on a 3 KB file.
+	let bytes = jpeg_with_exif_thumbnail_sized(1, 1600, 1200);
+	let len = bytes.len() as u64;
+	let reach = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+	let source = CountingSource(MemSource(bytes), reach.clone());
+
+	let spec = ThumbSpec::preview_only(64, 64, DEFAULT_MEM_BUDGET);
+	let result = generate(Box::new(source), &spec)
+		.unwrap()
+		.expect("the embedded thumbnail must still be served");
+	assert_eq!(result.source, microthumb::ThumbSource::EmbeddedPreview);
+	assert!(
+		mean_channel(&result.image.rgba, 1) > 200,
+		"expected the green embedded thumb, not the red main image"
+	);
+	// The main image was never touched: the thumbnail sits in the APP1
+	// segment near the start, so the read never reaches the end of the file.
+	let furthest = reach.load(std::sync::atomic::Ordering::Relaxed);
+	assert!(
+		furthest * 4 < len,
+		"preview-only read to {furthest} of {len} bytes — it should stop in the header region"
+	);
+}
+
+#[test]
+fn preview_only_without_an_embedded_thumbnail_is_ok_none_not_a_decode() {
+	// No embedded preview and no permission to decode: the honest answer is
+	// "no thumbnail", NOT a full decode of a file we were told not to stream.
+	let bytes = encode(&checkerboard(600, 600), ImageFormat::Png);
+	let preview_only = ThumbSpec::preview_only(64, 64, DEFAULT_MEM_BUDGET);
+	assert_eq!(
+		generate(Box::new(MemSource(bytes)), &preview_only).unwrap(),
+		None
+	);
+
+	// The very same source decodes fine when it IS allowed to.
+	let bytes = encode(&checkerboard(600, 600), ImageFormat::Png);
+	assert!(
+		generate(Box::new(MemSource(bytes)), &spec(64))
+			.unwrap()
+			.is_some()
 	);
 }

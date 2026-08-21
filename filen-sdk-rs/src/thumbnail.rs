@@ -232,11 +232,14 @@ mod bounded {
 			inner: image_reader,
 			len: image_file_size,
 		};
+		// Local bytes: there is no download to protect, so a decode is always
+		// allowed.
 		make_thumbnail_from_source(
 			Box::new(source),
 			target_width,
 			target_height,
 			mem_budget,
+			true,
 			out,
 		)
 	}
@@ -249,6 +252,7 @@ mod bounded {
 		target_width: u32,
 		target_height: u32,
 		mem_budget: usize,
+		allow_full_decode: bool,
 		out: &mut W,
 	) -> Result<Option<ThumbnailInfo>, Error>
 	where
@@ -258,6 +262,7 @@ mod bounded {
 			target_width,
 			target_height,
 			mem_budget,
+			allow_full_decode,
 		};
 		let (small, thumb_source) = match microthumb::generate(source, &spec) {
 			Ok(Some(thumb)) => (thumb.image, thumb.source),
@@ -574,6 +579,7 @@ mod tests {
 			32,
 			32,
 			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
+			true,
 			&mut out,
 		)
 		.unwrap();
@@ -600,6 +606,7 @@ mod tests {
 			32,
 			32,
 			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
+			true,
 			&mut out,
 		);
 		assert!(result.is_err(), "expected a hard error, got {result:?}");

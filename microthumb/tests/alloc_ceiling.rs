@@ -205,11 +205,7 @@ fn measured_peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
 }
 
 fn spec(target: u32) -> ThumbSpec {
-	ThumbSpec {
-		target_width: target,
-		target_height: target,
-		mem_budget: DEFAULT_MEM_BUDGET,
-	}
+	ThumbSpec::new(target, target, DEFAULT_MEM_BUDGET)
 }
 
 /// Any real photograph downscales to more than one colour; a decode bug that
@@ -449,6 +445,7 @@ fn heif_cases() {
 		target_width: 2048,
 		target_height: 2048,
 		mem_budget: TILE_BUDGET,
+		allow_full_decode: true,
 	};
 	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bytes)), &tile_spec));
 	let result = result.unwrap().expect("device heic must thumbnail at 2048");

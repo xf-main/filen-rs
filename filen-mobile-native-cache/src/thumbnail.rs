@@ -106,17 +106,6 @@ impl AuthCacheState {
 		let local_file = match tokio::fs::File::open(&file_path).await {
 			Ok(file) => Some(file),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-				// The same bandwidth ceiling the download path enforced: the
-				// lazy source makes small and medium files cheap, this keeps
-				// enormous ones off the network entirely.
-				if file.size() > MAX_THUMBNAIL_SOURCE_BYTES {
-					debug!(
-						"File too large to thumbnail from the network ({} bytes): {}",
-						file.size(),
-						file_path.display()
-					);
-					return Ok(None);
-				}
 				debug!(
 					"No cached bytes; thumbnailing off the remote chunks: {}",
 					file_path.display()
@@ -175,19 +164,40 @@ impl AuthCacheState {
 		let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let mut cancel_guard = CancelOnDrop(Some(cancel.clone()));
 
-		let (source, mem_budget): (Box<dyn filen_sdk_rs::thumbnail::ByteSource>, usize) =
-			match local_file {
-				Some(local) => (
-					Box::new(
-						filen_sdk_rs::thumbnail::FileSource::with_cancel(
-							local.into_std().await,
-							Some(cancel),
-						)
-						.map_err(CacheError::from)?,
-					),
-					filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET,
+		// `mem_budget` bounds memory; `allow_full_decode` bounds how many bytes
+		// of SOURCE we are willing to pull. Reading a huge file off the network
+		// to make a 256 px thumbnail is the waste this guards — but refusing
+		// outright on size, as this used to, threw away the cheap paths too: a
+		// 200 MB HEIC's `thmb` item and a JPEG's EXIF thumbnail both live in
+		// the header region and cost a chunk or two. Probe those, and answer
+		// Ok(None) having read almost nothing when there is nothing to find.
+		let (source, mem_budget, allow_full_decode): (
+			Box<dyn filen_sdk_rs::thumbnail::ByteSource>,
+			usize,
+			bool,
+		) = match local_file {
+			Some(local) => (
+				Box::new(
+					filen_sdk_rs::thumbnail::FileSource::with_cancel(
+						local.into_std().await,
+						Some(cancel),
+					)
+					.map_err(CacheError::from)?,
 				),
-				None => (
+				filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET,
+				// The bytes are already on disk; nothing to protect.
+				true,
+			),
+			None => {
+				let affordable = file.size() <= MAX_THUMBNAIL_SOURCE_BYTES;
+				if !affordable {
+					debug!(
+						"File too large to stream for a thumbnail ({} bytes); embedded previews only: {}",
+						file.size(),
+						file_path.display()
+					);
+				}
+				(
 					Box::new(filen_sdk_rs::thumbnail::RemoteChunkSource::new(
 						self.client.clone(),
 						file.clone(),
@@ -199,8 +209,10 @@ impl AuthCacheState {
 					// actually left of the budget.
 					filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET
 						.saturating_sub(filen_sdk_rs::thumbnail::REMOTE_SOURCE_RESIDENT_BYTES),
-				),
-			};
+					affordable,
+				)
+			}
+		};
 
 		// Decode buffers, not downloads, are the memory hazard — serialize decodes
 		// process-wide. Acquired before the blocking task is spawned, so parked work
@@ -224,6 +236,7 @@ impl AuthCacheState {
 					target_width,
 					target_height,
 					mem_budget,
+					allow_full_decode,
 					&mut tmp_file,
 				)
 			},

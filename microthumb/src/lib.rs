@@ -65,6 +65,38 @@ pub struct ThumbSpec {
 	pub target_height: u32,
 	/// Hard ceiling on decoder peak allocation + accumulator canvas, bytes.
 	pub mem_budget: usize,
+	/// Whether a real decode may run, or only the cheap embedded-preview probe.
+	///
+	/// `mem_budget` bounds MEMORY; this bounds how many BYTES OF SOURCE the
+	/// pipeline is willing to pull. They are not the same axis: an uncompressed
+	/// 81 MP TIFF in 3-row strips decodes in ~60 KB of memory but has to be
+	/// read almost end to end, which is fine from disk and not fine over the
+	/// network for one 256 px thumbnail. Callers reading a huge remote file
+	/// clear this: the header and any embedded thumbnail still cost a chunk or
+	/// two, and a source with neither answers `Ok(None)` having read almost
+	/// nothing.
+	pub allow_full_decode: bool,
+}
+
+impl ThumbSpec {
+	/// A spec that may decode — the ordinary case (local bytes, or a remote
+	/// file small enough to stream).
+	pub fn new(target_width: u32, target_height: u32, mem_budget: usize) -> Self {
+		Self {
+			target_width,
+			target_height,
+			mem_budget,
+			allow_full_decode: true,
+		}
+	}
+
+	/// A spec restricted to embedded previews; see [`allow_full_decode`](Self::allow_full_decode).
+	pub fn preview_only(target_width: u32, target_height: u32, mem_budget: usize) -> Self {
+		Self {
+			allow_full_decode: false,
+			..Self::new(target_width, target_height, mem_budget)
+		}
+	}
 }
 
 /// Which path produced a thumbnail.
@@ -270,7 +302,7 @@ pub fn generate(
 	let spec = &ThumbSpec {
 		target_width: spec.target_width.min(cap),
 		target_height: spec.target_height.min(cap),
-		mem_budget: spec.mem_budget,
+		..*spec
 	};
 	let mut prepared = format.open(src, spec)?;
 	let orientation = prepared.orientation();
@@ -286,6 +318,15 @@ pub fn generate(
 		.filter(|p| p.rgba.len().saturating_mul(2) <= spec.mem_budget);
 	if let Some(preview) = preview.take_if(|p| preview_suffices(p, spec)) {
 		return Ok(Some(Thumbnail {
+			image: apply_orientation(preview, orientation),
+			source: ThumbSource::EmbeddedPreview,
+		}));
+	}
+
+	if !spec.allow_full_decode {
+		// The preview was already tried above; without a decode there is
+		// nothing else to offer, and we have read only the header region.
+		return Ok(preview.map(|preview| Thumbnail {
 			image: apply_orientation(preview, orientation),
 			source: ThumbSource::EmbeddedPreview,
 		}));
