@@ -3,3 +3,6 @@
 .DS_store
 *.local.*
 .vscode/
+
+# Pinned RAW sample files (fetched on demand, never committed).
+/.fixture-cache

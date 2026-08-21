@@ -23,7 +23,10 @@ png = "0.18"
 heif-decoder = { path = "../heif-decoder", optional = true }
 
 [dev-dependencies]
-# Fixtures are generated at test runtime — encoders only.
+# Synthetic fixtures are generated at test runtime — encoders only. The RAW
+# characterisation suite instead pins real sample files by hash and fetches
+# them with `curl`; `blake3` verifies them. See tests/raw_fixtures/.
+blake3 = "1.8"
 image = { version = "0.25.6", default-features = false, features = [
 	"bmp",
 	"gif",
