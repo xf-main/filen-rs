@@ -96,7 +96,7 @@ pub(super) enum Preview {
 }
 
 impl Preview {
-	fn area(&self) -> u64 {
+	pub(super) fn area(&self) -> u64 {
 		let (w, h) = match *self {
 			Preview::Jpeg { w, h, .. } | Preview::Rgb { w, h, .. } => (w, h),
 		};
@@ -112,7 +112,7 @@ impl Preview {
 
 /// Reads exactly `len` bytes, or `None` — short reads, overflowing ranges and
 /// anything past the end of the source are all the same answer here.
-fn read_exact_at(src: &mut dyn ByteSource, offset: u64, len: u64) -> Option<Vec<u8>> {
+pub(super) fn read_exact_at(src: &mut dyn ByteSource, offset: u64, len: u64) -> Option<Vec<u8>> {
 	let end = offset.checked_add(len)?;
 	if len == 0 || end > src.len() {
 		return None;

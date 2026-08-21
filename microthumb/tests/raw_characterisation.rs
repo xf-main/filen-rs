@@ -22,11 +22,10 @@
 //!   error rather than returning a demosaiced-looking lie.
 //! * **RAF — all ten** yield a preview: Fujifilm's header points straight at
 //!   one, no directory walk needed.
-//! * **CR3 is not a TIFF container** (it is ISO-BMFF) and is not recognised
-//!   yet; `generate` answers `Ok(None)` after the 64-byte sniff.
+//! * **CR3 — all ten**, at 1620x1080, from its ISO-BMFF `PRVW` box.
 //!
 //! Sizes are honest about the source: a Nikon D1H stores nothing but a 160x120
-//! uncompressed strip, so 160x120 is what comes back. 71 of the 100 samples
+//! uncompressed strip, so 160x120 is what comes back. 81 of the 100 samples
 //! reach the full 512 px request.
 //!
 //! Ignored by default: the pinned set is ~1 GiB. Run it with
@@ -115,11 +114,11 @@ const BASELINE: &[Baseline] = &[
 		nothing: 0,
 		errors: 0,
 	},
-	// Not a TIFF container; not recognised.
+	// Not a TIFF container at all: an ISO-BMFF box tree.
 	Baseline {
 		format: "CR3",
-		previews: 0,
-		nothing: 10,
+		previews: 10,
+		nothing: 0,
 		errors: 0,
 	},
 ];
@@ -130,7 +129,7 @@ const SMALLEST_PREVIEW_EDGE: u32 = 128;
 
 /// Samples whose preview reaches the full requested size. The rest are
 /// bounded by what the camera stored, not by anything this crate does.
-const SAMPLES_MEETING_THE_REQUEST: usize = 71;
+const SAMPLES_MEETING_THE_REQUEST: usize = 81;
 
 /// How far into a file the pipeline reaches before giving up on input it
 /// cannot use. Observed maximum is 21% (a Blackmagic cine DNG).

@@ -1,4 +1,5 @@
 mod bmp;
+mod cr3;
 mod gif;
 #[cfg(feature = "heif")]
 mod heif;
@@ -18,6 +19,7 @@ static GIF: gif::Gif = gif::Gif;
 static TIFF: tiff::Tiff = tiff::Tiff;
 static BMP: bmp::Bmp = bmp::Bmp;
 static RAF: raf::Raf = raf::Raf;
+static CR3: cr3::Cr3 = cr3::Cr3;
 static SIMPLE: simple::Simple = simple::Simple;
 #[cfg(feature = "heif")]
 static HEIF: heif::Heif = heif::Heif;
@@ -34,6 +36,7 @@ pub(crate) fn sniff(prefix: &[u8]) -> Option<&'static dyn FormatDecoder> {
 		&TIFF,
 		&BMP,
 		&RAF,
+		&CR3,
 		&SIMPLE,
 	];
 	registry.iter().copied().find(|d| d.detect(prefix))
