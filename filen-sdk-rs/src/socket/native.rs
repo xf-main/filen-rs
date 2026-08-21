@@ -218,14 +218,25 @@ impl
 	}
 
 	async fn connect(request: String) -> Result<UnauthedNativeSocket, Error> {
-		let (ws_stream, _) = tokio_tungstenite::connect_async(request)
-			.await
-			.map_err(|e| {
-				Error::custom(
-					ErrorKind::Server,
-					format!("failed to connect to websocket: {}", e),
-				)
-			})?;
+		// Bounded buffers: tungstenite's defaults (64 MiB message, 16 MiB frame) are sized for
+		// servers, and a socket event is a few KiB of JSON — while one consumer of this socket
+		// is an iOS file-provider extension living under a ~20 MB jetsam limit, where a single
+		// default-sized buffer is the whole process budget. 4 MiB caps the worst case at
+		// tolerable; NOT lower, because this socket also carries note/chat events whose
+		// payloads embed full encrypted content, and an over-cap frame is a connection
+		// teardown (a reconnect loop on every delivery), not a dropped message.
+		let config = tungstenite::protocol::WebSocketConfig::default()
+			.max_frame_size(Some(4 << 20))
+			.max_message_size(Some(4 << 20));
+		let (ws_stream, _) =
+			tokio_tungstenite::connect_async_with_config(request, Some(config), false)
+				.await
+				.map_err(|e| {
+					Error::custom(
+						ErrorKind::Server,
+						format!("failed to connect to websocket: {}", e),
+					)
+				})?;
 
 		// Enforce TLS without unwrapping the stream: into_inner()/re-wrap would
 		// discard tungstenite's read buffer, so a server first frame coalesced
