@@ -13,7 +13,7 @@ use crate::{
 		FilenMobileCacheState, UnauthCacheState, UnauthReason,
 		update_saved_db_state_cache_cleanup_time,
 	},
-	sql::{self, item::RawDBItem},
+	sql::{self, error::OptionalExtensionSQL, file::DBFile, item::RawDBItem},
 	traits::ProgressCallback,
 };
 use chrono::{DateTime, Utc};
@@ -410,6 +410,13 @@ impl AuthCacheState {
 		Ok((file, target_path, uuid_guard))
 	}
 
+	/// Reunites cache slots with rows whose uuid a remote edit re-minted (see [`SlotRescue`]).
+	/// Called before anything that acts on where a file's bytes are: the drain, the cleanup
+	/// sweeps, and the download freshness check.
+	pub(crate) async fn rescue_reminted_slots(&self) {
+		self.slot_rescue().rescue_all().await;
+	}
+
 	pub(crate) async fn io_delete_local(&self, uuid: Uuid) -> Result<(), io::Error> {
 		// Serialised against a concurrent download of the same item: otherwise a clear issued just
 		// before a re-request can land after the fresh download and evict it. Taken here rather
@@ -440,6 +447,178 @@ impl AuthCacheState {
 		self.drop_materialised(uuid);
 		Ok(())
 	}
+}
+
+/// Drains the slot-remint log by renaming cache slots into place.
+///
+/// The stable tier of `upsert_item` re-files a row under the uuid the server minted for a remote
+/// content edit, but the bytes on disk stay in the slot named by the OLD uuid — so a row holding
+/// an unsent local edit loses track of the only copy of that edit: the identity sweep sees an
+/// orphan slot, and the drain sees a marked row with "no local copy". The log (written by the
+/// per-connection trigger, durable across restarts) records each (old, new) pair; this moves the
+/// slots to follow their rows.
+///
+/// Its own struct, rather than methods on [`AuthCacheState`], so the whole decision table is
+/// testable against a temp dir and an in-memory database — the state cannot be built without a
+/// live client.
+pub(crate) struct SlotRescue<'a> {
+	pub(crate) conn: &'a std::sync::Mutex<rusqlite::Connection>,
+	pub(crate) cache_dir: &'a Path,
+	pub(crate) locks: &'a crate::file_locks::FileLocks,
+}
+
+impl SlotRescue<'_> {
+	fn conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+		self.conn
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+	}
+
+	/// Best-effort per entry: one failed rescue is retried on the next call, and must not stop
+	/// the rest. Entries are processed oldest-first, which is what resolves a CHAIN of re-mints
+	/// (a → b, then b → c) as two sequential renames.
+	pub(crate) async fn rescue_all(&self) {
+		let entries = match sql::select_slot_remints(&self.conn()) {
+			Ok(entries) => entries,
+			Err(e) => {
+				error!("Failed to read the slot-remint log: {e}");
+				return;
+			}
+		};
+		for (id, old_uuid, new_uuid) in entries {
+			if let Err(e) = self.rescue_one(id, old_uuid, new_uuid).await {
+				tracing::warn!("Failed to rescue reminted slot {old_uuid} -> {new_uuid}: {e}");
+			}
+		}
+	}
+
+	async fn rescue_one(
+		&self,
+		entry_id: i64,
+		old_uuid: Uuid,
+		new_uuid: Uuid,
+	) -> Result<(), io::Error> {
+		// Both slots are mutated; take both locks in OLD-THEN-NEW order — the same order the
+		// edit-upload path holds them in (`upload_edited_file` holds the old uuid's lock while
+		// `io_upload_updated_file` takes the freshly minted one), so a rescue racing an upload
+		// whose own echo logged the remint queues behind it instead of deadlocking against it.
+		// Rescuers cannot deadlock each other: a chain's entries only ever advance (old → new),
+		// never cycle back to a retired uuid.
+		let _old_guard = self.locks.lock(old_uuid).await;
+		let _new_guard = if old_uuid == new_uuid {
+			None
+		} else {
+			Some(self.locks.lock(new_uuid).await)
+		};
+
+		let drop_entry = |why: &str| {
+			trace!("Dropping slot-remint entry {old_uuid} -> {new_uuid}: {why}");
+			if let Err(e) = sql::delete_slot_remint(&self.conn(), entry_id) {
+				error!("Failed to drop slot-remint entry {entry_id}: {e}");
+			}
+		};
+
+		let old_dir = self.cache_dir.join(old_uuid.to_string());
+		// `?`, never unwrap_or(false): a stat FAILURE (as opposed to a definite absence) must
+		// keep the entry — dropping it disarms the sweep guard over what may be the only copy
+		// of an unsent edit, which is exactly the loss the log exists to prevent.
+		if !tokio::fs::try_exists(&old_dir).await? {
+			// Nothing left to move — the bytes were delivered (the upload renames the slot
+			// itself), cleared, or already rescued by the other process.
+			drop_entry("old slot is gone");
+			return Ok(());
+		}
+
+		// Where the bytes belong now, per the row the remint landed on. Read under the locks so
+		// a concurrent edit cannot move the marker mid-decision. A read ERROR keeps the entry
+		// for the next pass, for the same reason as the stat above.
+		let row = {
+			let conn = self.conn();
+			DBFile::select(&conn, new_uuid)
+				.optional()
+				.map_err(|e| io::Error::other(format!("reading the reminted row: {e}")))?
+		};
+		let new_dir = self.cache_dir.join(new_uuid.to_string());
+		let Some(file) = row else {
+			// No row under the new uuid. Either the uuid re-minted AGAIN — a later log entry
+			// carries (new → newer), and a plain rename here hands the bytes to that entry — or
+			// the row is gone for good and the slot is the sweep's to take.
+			// Re-read, not the snapshot `rescue_all` is iterating: that one predates every
+			// rename this pass has done. `?`, never unwrap_or(false), for the same reason as
+			// the stat and the row read above — a read FAILURE would drop the entry and disarm
+			// the sweep guard over what may be the only copy of an unsent edit.
+			let chained = sql::select_slot_remints(&self.conn())
+				.map(|entries| entries.iter().any(|(_, old, _)| *old == new_uuid))
+				.map_err(|e| io::Error::other(format!("reading the slot-remint log: {e}")))?;
+			if !chained {
+				drop_entry("no row under the new uuid and no chained remint");
+				return Ok(());
+			}
+			if tokio::fs::try_exists(&new_dir).await.unwrap_or(false) {
+				// The chain target already has bytes of its own; ours are the older state.
+				tokio::fs::remove_dir_all(&old_dir).await?;
+			} else {
+				tokio::fs::rename(&old_dir, &new_dir).await?;
+			}
+			drop_entry("handed to the chained remint");
+			return Ok(());
+		};
+
+		if tokio::fs::try_exists(&new_dir).await.unwrap_or(false) {
+			if file.pending_upload_at.is_some() {
+				// A download of the new head landed next to the unsent edit. The marker says the
+				// server is missing the edit, and the drain uploads whatever is in the slot — so
+				// the edit's bytes outrank the server copy.
+				tokio::fs::remove_dir_all(&new_dir).await?;
+			} else {
+				// No outstanding edit: the freshly-downloaded head is the right content, and the
+				// old slot is a stale copy of a superseded version.
+				tokio::fs::remove_dir_all(&old_dir).await?;
+				drop_entry("edit resolved; kept the fresh slot");
+				return Ok(());
+			}
+		}
+		tokio::fs::rename(&old_dir, &new_dir).await?;
+
+		// The slot layout is cache/<uuid>/<name>, and every read computes <name> from the row's
+		// current metadata — so the inner file has to follow the row's name too, or the rescued
+		// bytes are invisible to `hash_local_file`. Best-effort: a failure leaves the bytes safe
+		// under the right uuid, degraded to the same miss a remote rename leaves behind.
+		if let crate::sql::DBFileMeta::Decoded(meta) = &file.meta {
+			let target = new_dir.join(&meta.name);
+			if let Err(e) = rename_single_slot_file(&new_dir, &target).await {
+				tracing::warn!(
+					"Failed to rename the rescued file in {} to its current name: {e}",
+					new_dir.display()
+				);
+			}
+		}
+		// The bytes are in the cache directory under their row's uuid again.
+		if let Err(e) = sql::mark_materialised(
+			&self.conn(),
+			new_uuid,
+			chrono::Utc::now().timestamp_millis(),
+		) {
+			error!("Failed to record the rescued copy of {new_uuid}: {e}");
+		}
+		drop_entry("rescued");
+		Ok(())
+	}
+}
+
+/// Renames the single regular file inside a rescued slot to `target` (see the caller). A slot
+/// holds exactly one file by construction; anything else is left for `process_subdir` to judge.
+async fn rename_single_slot_file(slot_dir: &Path, target: &Path) -> Result<(), io::Error> {
+	let mut dir = tokio::fs::read_dir(slot_dir).await?;
+	while let Some(entry) = dir.next_entry().await? {
+		if entry.file_type().await?.is_file() {
+			if entry.path() != target {
+				tokio::fs::rename(entry.path(), target).await?;
+			}
+			return Ok(());
+		}
+	}
+	Ok(())
 }
 
 async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
@@ -885,6 +1064,11 @@ impl AuthCacheState {
 			}
 		};
 
+		// Before the sweeps: a rescued slot is a slot the identity sweep no longer has to be
+		// guarded away from, and the reconciliation pass below then records it as materialised
+		// under its current uuid instead of clearing the row's marker.
+		self.rescue_reminted_slots().await;
+
 		futures::join!(
 			cleanup_uuid_dir(self, &self.cache_dir),
 			cleanup_uuid_dir(self, &self.tmp_dir),
@@ -1054,5 +1238,201 @@ mod tests {
 		);
 
 		std::fs::remove_dir_all(&dir).unwrap();
+	}
+}
+
+#[cfg(test)]
+mod slot_rescue_tests {
+	use std::sync::Mutex;
+
+	use filen_types::fs::StableUuid;
+	use rusqlite::Connection;
+
+	use super::*;
+	use crate::{
+		auth::test_support::TempDbDir,
+		file_locks::FileLocks,
+		sql::{self, item::combine_parent, statements::UPSERT_ITEM},
+	};
+
+	fn uuid(byte: u8) -> Uuid {
+		Uuid::from_bytes([byte; 16])
+	}
+
+	fn stable(byte: u8) -> StableUuid {
+		StableUuid::new_for_test(uuid(byte))
+	}
+
+	fn db() -> Connection {
+		let conn = Connection::open_in_memory().unwrap();
+		crate::auth::configure_conn(&conn).unwrap();
+		conn.execute_batch(sql::statements::INIT).unwrap();
+		sql::install_slot_remint_log(&conn).unwrap();
+		conn.execute(
+			"INSERT INTO items (uuid, parent, type) VALUES (?1, NULL, 0);",
+			[uuid(9)],
+		)
+		.unwrap();
+		conn
+	}
+
+	/// A file row with decoded metadata, upserted the way a listing lands it.
+	fn upsert_file(conn: &Connection, uuid_: Uuid, stable_: StableUuid, name: &str) {
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		let (id, _, _) = crate::sql::item::upsert_file_item_with_stmts(
+			uuid_,
+			stable_,
+			combine_parent(Some(uuid(9)), false),
+			Some(name),
+			None,
+			&mut stmt,
+		)
+		.unwrap();
+		drop(stmt);
+		conn.execute(
+			"INSERT OR IGNORE INTO files (id, size, chunks, region, bucket, timestamp, metadata_state)
+			VALUES (?1, 0, 0, '', '', 0, 0);",
+			[id],
+		)
+		.unwrap();
+		conn.execute(
+			"INSERT INTO files_meta (id, name, mime, file_key, file_key_version, modified)
+			VALUES (?1, ?2, '', '', 3, 0)
+			ON CONFLICT (id) DO UPDATE SET name = excluded.name;",
+			rusqlite::params![id, name],
+		)
+		.unwrap();
+	}
+
+	fn slot_with_bytes(cache_dir: &Path, uuid_: Uuid, name: &str, bytes: &[u8]) -> PathBuf {
+		let slot = cache_dir.join(uuid_.to_string());
+		std::fs::create_dir_all(&slot).unwrap();
+		let path = slot.join(name);
+		std::fs::write(&path, bytes).unwrap();
+		path
+	}
+
+	async fn rescue_all(conn: &Mutex<Connection>, cache_dir: &Path) {
+		let locks = FileLocks::default();
+		SlotRescue {
+			conn,
+			cache_dir,
+			locks: &locks,
+		}
+		.rescue_all()
+		.await;
+	}
+
+	/// The F1 scenario end to end: a marked row's uuid re-mints under a remote edit, and the
+	/// rescue moves the slot — bytes, inner name and all — to follow the row, records the copy
+	/// as materialised, and retires the log entry.
+	#[tokio::test]
+	async fn a_reminted_pending_slot_follows_its_row() {
+		let dir = TempDbDir::create("slot-rescue-follow");
+		let conn = db();
+		upsert_file(&conn, uuid(1), stable(2), "edit.txt");
+		sql::mark_pending_upload(&conn, stable(2), 1_000).unwrap();
+		slot_with_bytes(&dir.0, uuid(1), "edit.txt", b"the only copy");
+
+		// The remote edit arrives: same stable id, fresh uuid, and (as edits often do) a new name.
+		upsert_file(&conn, uuid(11), stable(2), "renamed.txt");
+		assert_eq!(sql::select_slot_remints(&conn).unwrap().len(), 1);
+
+		let conn = Mutex::new(conn);
+		rescue_all(&conn, &dir.0).await;
+
+		assert!(!dir.0.join(uuid(1).to_string()).exists());
+		assert_eq!(
+			std::fs::read(dir.0.join(uuid(11).to_string()).join("renamed.txt")).unwrap(),
+			b"the only copy",
+			"the bytes must land under the row's current uuid and name"
+		);
+		let conn = conn.into_inner().unwrap();
+		assert!(sql::select_slot_remints(&conn).unwrap().is_empty());
+		let materialised: Option<i64> = conn
+			.query_one(
+				"SELECT materialised_at FROM items WHERE uuid = ?1;",
+				[uuid(11)],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert!(materialised.is_some(), "the rescued copy must be recorded");
+	}
+
+	/// A download of the new head can land before the rescue runs. The pending marker says the
+	/// server is missing an edit, and the drain uploads whatever is in the slot — so the edit's
+	/// bytes must win over the server copy.
+	#[tokio::test]
+	async fn pending_bytes_outrank_a_fresh_download() {
+		let dir = TempDbDir::create("slot-rescue-pending-wins");
+		let conn = db();
+		upsert_file(&conn, uuid(1), stable(2), "edit.txt");
+		sql::mark_pending_upload(&conn, stable(2), 1_000).unwrap();
+		slot_with_bytes(&dir.0, uuid(1), "edit.txt", b"unsent edit");
+		upsert_file(&conn, uuid(11), stable(2), "edit.txt");
+		slot_with_bytes(&dir.0, uuid(11), "edit.txt", b"server head");
+
+		let conn = Mutex::new(conn);
+		rescue_all(&conn, &dir.0).await;
+
+		assert_eq!(
+			std::fs::read(dir.0.join(uuid(11).to_string()).join("edit.txt")).unwrap(),
+			b"unsent edit"
+		);
+	}
+
+	/// The opposite call when the marker is gone: the fresh download is the right content and
+	/// the old slot is a stale copy of a superseded version — drop it, keep the download.
+	#[tokio::test]
+	async fn a_resolved_edit_keeps_the_fresh_slot() {
+		let dir = TempDbDir::create("slot-rescue-resolved");
+		let conn = db();
+		upsert_file(&conn, uuid(1), stable(2), "edit.txt");
+		sql::mark_pending_upload(&conn, stable(2), 1_000).unwrap();
+		slot_with_bytes(&dir.0, uuid(1), "edit.txt", b"stale");
+		upsert_file(&conn, uuid(11), stable(2), "edit.txt");
+		slot_with_bytes(&dir.0, uuid(11), "edit.txt", b"current");
+		sql::clear_pending_upload(&conn, stable(2)).unwrap();
+
+		let conn = Mutex::new(conn);
+		rescue_all(&conn, &dir.0).await;
+
+		assert!(!dir.0.join(uuid(1).to_string()).exists());
+		assert_eq!(
+			std::fs::read(dir.0.join(uuid(11).to_string()).join("edit.txt")).unwrap(),
+			b"current"
+		);
+		assert!(
+			sql::select_slot_remints(&conn.into_inner().unwrap())
+				.unwrap()
+				.is_empty()
+		);
+	}
+
+	/// Two re-mints before any rescue ran: the entries chain (a → b, b → c) and oldest-first
+	/// processing walks the bytes to the final uuid.
+	#[tokio::test]
+	async fn a_chain_of_remints_resolves_to_the_final_uuid() {
+		let dir = TempDbDir::create("slot-rescue-chain");
+		let conn = db();
+		upsert_file(&conn, uuid(1), stable(2), "edit.txt");
+		sql::mark_pending_upload(&conn, stable(2), 1_000).unwrap();
+		slot_with_bytes(&dir.0, uuid(1), "edit.txt", b"the only copy");
+		upsert_file(&conn, uuid(11), stable(2), "edit.txt");
+		upsert_file(&conn, uuid(12), stable(2), "edit.txt");
+		assert_eq!(sql::select_slot_remints(&conn).unwrap().len(), 2);
+
+		let conn = Mutex::new(conn);
+		rescue_all(&conn, &dir.0).await;
+
+		assert_eq!(
+			std::fs::read(dir.0.join(uuid(12).to_string()).join("edit.txt")).unwrap(),
+			b"the only copy"
+		);
+		assert!(
+			sql::select_slot_remints(&conn.into_inner().unwrap())
+				.unwrap()
+				.is_empty()
+		);
 	}
 }

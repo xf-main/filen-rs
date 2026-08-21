@@ -214,6 +214,12 @@ pub(crate) fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 		PRAGMA temp_store = MEMORY;
 		PRAGMA foreign_keys = ON;",
 	)?;
+	// The slot-remint TABLE (not the trigger — that needs `items` to exist and is installed by
+	// `sql::install_slot_remint_log` once the schema is up). Created here because the identity
+	// sweep's query joins against it on every connection, schema or no schema. Deliberately
+	// OUTSIDE init.sql: an init.sql edit flips DB_INIT_HASH and wipes the account's cache, which
+	// is precisely the data the log protects.
+	conn.execute_batch(sql::statements::CREATE_SLOT_REMINTS_TABLE)?;
 	conn.create_scalar_function(
 		"uuid_text",
 		1,
@@ -253,6 +259,7 @@ fn init_db(
 	let db = Connection::open(db_dir.join(DB_FILE_NAME))?;
 	configure_conn(&db)?;
 	db.execute_batch(sql::statements::INIT)?;
+	sql::install_slot_remint_log(&db)?;
 	let contents = serde_json::to_string(&SavedDBState {
 		owner: Some(owner.to_string()),
 		..SavedDBState::default()
@@ -347,6 +354,7 @@ fn db_from_dir(
 		);
 		match Connection::open(&db_path).and_then(|conn| {
 			configure_conn(&conn)?;
+			sql::install_slot_remint_log(&conn)?;
 			Ok(conn)
 		}) {
 			Ok(conn) => Ok((conn, Some(saved_state))),
@@ -800,6 +808,7 @@ impl AuthCacheState {
 		let db = Connection::open_in_memory()?;
 		configure_conn(&db)?;
 		db.execute_batch(sql::statements::INIT)?;
+		sql::install_slot_remint_log(&db)?;
 
 		let sdk_cache_path =
 			std::convert::AsRef::<Path>::as_ref(files_dir).join(crate::search::SDK_CACHE_DB_NAME);
@@ -823,6 +832,16 @@ impl AuthCacheState {
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
 		Ok(new)
+	}
+
+	/// The slot-remint rescuer over this state's connection, cache directory and per-item locks
+	/// (see [`crate::io::SlotRescue`]).
+	pub(crate) fn slot_rescue(&self) -> crate::io::SlotRescue<'_> {
+		crate::io::SlotRescue {
+			conn: &self.conn,
+			cache_dir: &self.cache_dir,
+			locks: &self.file_locks,
+		}
 	}
 
 	pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {

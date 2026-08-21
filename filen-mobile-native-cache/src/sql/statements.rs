@@ -33,6 +33,42 @@ pub(crate) const UNMARK_STALE_PENDING_TRASHED: &str =
 	include_str!("../../sql/unmark_stale_pending_trashed.sql");
 pub(crate) const SELECT_POS_NOT_IN_UUIDS: &str =
 	include_str!("../../sql/select_pos_not_in_uuids.sql");
+
+// Slot-remint log: which cache slots hold bytes whose row has moved to a new
+// uuid. A remote content edit re-mints a file's `uuid` in place (the stable
+// tier of `upsert_item`), but the local slot — cache/<uuid>/<name> — keeps the
+// OLD uuid, so a row holding an unsent edit loses track of its own bytes and
+// the identity sweep sees the slot as an orphan. The durable table records the
+// (old, new) pair; the per-connection trigger writes it exactly when a row
+// carrying a pending-upload marker changes uuid. Lives OUTSIDE init.sql on
+// purpose: an init.sql edit flips DB_INIT_HASH and wipes the account's cache,
+// which is precisely the data this log protects. Installed by
+// `install_slot_remint_log` on every connection once `items` exists (the
+// trigger is TEMP — per-connection — so each process guards its own writes).
+/// The table half, created by `configure_conn` (it depends on nothing, so it can go in before
+/// `init.sql` has run — which matters, because the sweep query above joins against it on every
+/// connection).
+pub(crate) const CREATE_SLOT_REMINTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS slot_remints (
+	id INTEGER PRIMARY KEY,
+	old_uuid BLOB NOT NULL,
+	new_uuid BLOB NOT NULL
+);";
+/// The trigger half, installed by `install_slot_remint_log` once `items` exists.
+pub(crate) const INSTALL_SLOT_REMINT_LOG: &str = "
+CREATE TEMP TRIGGER IF NOT EXISTS slot_remint_log
+AFTER UPDATE OF uuid ON items
+FOR EACH ROW
+WHEN old.uuid IS NOT new.uuid AND old.pending_upload_at IS NOT NULL
+BEGIN
+	INSERT INTO slot_remints (old_uuid, new_uuid) VALUES (old.uuid, new.uuid);
+END;";
+pub(crate) const SELECT_SLOT_REMINTS: &str =
+	"SELECT id, old_uuid, new_uuid FROM slot_remints ORDER BY id ASC;";
+pub(crate) const DELETE_SLOT_REMINT: &str = "DELETE FROM slot_remints WHERE id = ?;";
+/// Whether any logged remint still points at this row's CURRENT uuid — i.e.
+/// the row's bytes may be sitting in a slot the rescue has not moved yet.
+pub(crate) const SLOT_REMINT_TARGETS_UUID: &str =
+	"SELECT EXISTS (SELECT 1 FROM slot_remints WHERE new_uuid = ?);";
 pub(crate) const MARK_PENDING_UPLOAD: &str = include_str!("../../sql/mark_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD: &str = include_str!("../../sql/clear_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD_BY_UUID: &str =

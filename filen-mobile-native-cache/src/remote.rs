@@ -1826,6 +1826,10 @@ impl AuthCacheState {
 	/// Best effort and independent per file: one that still fails keeps its marker for the next
 	/// drain rather than aborting the rest. Returns how many reached the server.
 	pub(crate) async fn retry_pending_uploads(&self) -> Result<u32, CacheError> {
+		// A remote edit may have re-minted a marked row's uuid, leaving its bytes in a slot the
+		// row no longer names. Reunite them first, or the "no local copy" check below reads a
+		// recoverable edit as a resolved one.
+		self.rescue_reminted_slots().await;
 		let pending = sql::select_pending_uploads(&self.conn())?;
 		if pending.is_empty() {
 			return Ok(0);
@@ -1839,6 +1843,23 @@ impl AuthCacheState {
 			// branch below and fail forever trying to read a file that is not there, keeping its
 			// marker and its log noise for good.
 			if !self.has_local_copy(stable_uuid).await? {
+				// Unless the rescue above could not finish: an unrescued remint means the bytes
+				// are still on disk under a retired uuid, and dropping the marker here is
+				// exactly the silent loss the log exists to prevent. Keep it for the next drain.
+				// Two SEPARATE statements: the connection guard is a temporary, and a second
+				// `conn()` inside the same statement deadlocks on the non-reentrant mutex.
+				let row = RawDBItem::select_by_stable(&self.conn(), stable_uuid.into())?;
+				let unrescued = match row {
+					Some(item) => sql::slot_remint_targets_uuid(&self.conn(), item.uuid)?,
+					None => false,
+				};
+				if unrescued {
+					tracing::warn!(
+						"Pending upload for {stable_uuid} still has an unrescued reminted slot; \
+						 keeping the marker"
+					);
+					continue;
+				}
 				debug!(
 					"Pending upload for {stable_uuid} has no local file left, dropping the marker"
 				);
@@ -2114,6 +2135,11 @@ impl AuthCacheState {
 		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<String, CacheError> {
 		let file: RemoteFile = file.try_into()?;
+		// Before the lock (the rescue takes per-item locks of its own): a remote edit may have
+		// re-minted this row's uuid with an unsent local edit in the old slot, and the freshness
+		// check below must see those bytes under the CURRENT uuid — or it reads "no local copy",
+		// drops the marker, and downloads the server head over the only record of the edit.
+		self.rescue_reminted_slots().await;
 		// Held for the whole check-then-download: without it a concurrent clear can delete the
 		// file between the freshness check and the write, or evict what we just downloaded.
 		let _local_file_guard = self.lock_local_file(file.uuid()).await;
