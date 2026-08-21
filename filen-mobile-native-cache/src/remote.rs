@@ -2255,29 +2255,45 @@ impl AuthCacheState {
 			.client
 			.list_dir(&DirType::from(&*dir), None::<&fn(u64, Option<u64>)>)
 			.await?;
-		// A subdirectory absent from this listing is not necessarily deleted: another device may
-		// have MOVED it. The sweep treats absence as deletion, and its recursive cascade would
-		// tombstone the entire subtree — an authoritative delete of every descendant's replica,
-		// healed only by re-browsing each level of the moved tree. Ask the server which it was
-		// before the sweep runs.
-		let spare = self.reconcile_missing_subdirs(dir.uuid(), &dirs).await?;
+		// A child absent from this listing is not necessarily deleted: another device may have
+		// MOVED it. The sweep treats absence as deletion — for a dir that cascades an
+		// authoritative tombstone through the entire subtree, and for a file it retires a row
+		// whose `local_data` (Finder/Files tags) nothing can rebuild. Ask the server which it
+		// was before the sweep runs.
+		let spare = self
+			.reconcile_missing_children(dir.uuid(), &dirs, &files)
+			.await?;
 		let mut conn = self.conn();
 		dir.update_dir_last_listed_now(&conn)?;
 		dir.update_children(&mut conn, dirs, files, &spare)?;
 		Ok(())
 	}
 
-	/// Reconciles the cached child directories of `parent` that a fresh listing no longer
-	/// contains, before the listing's sweep runs: a dir the server still knows is re-parented in
-	/// place (it was moved — its subtree keeps hanging off it, no tombstones), a dir the server
-	/// definitively does not know is left for the sweep to delete, and a dir that cannot be
-	/// verified (network/server failure) is returned for the sweep to SPARE this round — the
-	/// destructive guess is the one this exists to avoid. Files are not probed: a single moved
-	/// file's tombstone has no cascade behind it, and tracked (materialised) files follow their
-	/// lineage through the working set anyway.
+	/// Reconciles the cached children of `parent` that a fresh listing no longer contains,
+	/// before the listing's sweep runs: a child the server still knows is re-parented in place
+	/// (it was moved — a dir's subtree keeps hanging off it, a file keeps its `local_data`, no
+	/// tombstones), a child the server definitively does not know is left for the sweep to
+	/// delete, and a child that cannot be verified (network/server failure) is returned for the
+	/// sweep to SPARE this round — the destructive guess is the one this exists to avoid.
 	///
-	/// The common case is an empty candidate list and zero probes; a re-parented dir whose new
-	/// parent the cache does not know yet resolves like any unknown id, one level per ask.
+	/// Dirs are asked about by uuid (never re-minted), files by their whole-life id — an edit
+	/// re-mints a file's uuid, so a head that is merely newer than our row is still IN the
+	/// listing under its stable id and is never probed. Missing files, then, are exactly the
+	/// moved/trashed/deleted ones, which is what keeps the common case at zero probes.
+	///
+	/// A re-parented child whose new parent the cache does not know yet resolves like any
+	/// unknown id, one level per ask.
+	async fn reconcile_missing_children(
+		&self,
+		parent: Uuid,
+		listed_dirs: &[RemoteDirectory],
+		listed_files: &[RemoteFile],
+	) -> Result<Vec<Uuid>, CacheError> {
+		let mut spare = self.reconcile_missing_subdirs(parent, listed_dirs).await?;
+		spare.extend(self.reconcile_missing_files(parent, listed_files).await?);
+		Ok(spare)
+	}
+
 	async fn reconcile_missing_subdirs(
 		&self,
 		parent: Uuid,
@@ -2342,6 +2358,85 @@ impl AuthCacheState {
 				Err(e) => {
 					debug!("could not verify missing dir {uuid} ({e}); sparing it this round");
 					spare.push(uuid);
+				}
+			}
+		}
+		Ok(spare)
+	}
+
+	/// The file half of [`Self::reconcile_missing_children`]. Matched and probed by the
+	/// whole-life id (see there), so a moved file is re-parented in place — row, materialised
+	/// bytes and `local_data` intact — instead of being retired with a tombstone the system
+	/// obeys by deleting a live file from disk.
+	async fn reconcile_missing_files(
+		&self,
+		parent: Uuid,
+		listed: &[RemoteFile],
+	) -> Result<Vec<Uuid>, CacheError> {
+		let cached = sql::select_child_file_stables(&self.conn(), parent)?;
+		if cached.is_empty() {
+			return Ok(Vec::new());
+		}
+		let listed_stables: HashSet<StableUuid> =
+			listed.iter().map(|file| file.stable_uuid()).collect();
+		let missing: Vec<StableUuid> = cached
+			.into_iter()
+			.filter(|stable| !listed_stables.contains(stable))
+			.collect();
+		if missing.is_empty() {
+			return Ok(Vec::new());
+		}
+		if missing.len() > RECONCILE_PROBE_CAP {
+			// A bulk delete or emptied folder: trust the listing rather than gate its
+			// presentation on a probe storm. Rows holding an unsent edit are spared by the
+			// sweep's own pending guard, so there is no data loss down this branch.
+			tracing::warn!(
+				"{} files vanished from one listing of {parent}; trusting the listing (bulk \
+				 delete) instead of probing each",
+				missing.len()
+			);
+			return Ok(Vec::new());
+		}
+		let probed: Vec<(StableUuid, Result<RemoteFile, filen_sdk_rs::error::Error>)> =
+			futures::stream::iter(missing.into_iter().map(|stable| async move {
+				(stable, self.client.get_file_by_stable_uuid(stable).await)
+			}))
+			.buffer_unordered(RECONCILE_PROBE_CONCURRENCY)
+			.collect()
+			.await;
+		let mut spare = Vec::new();
+		for (stable, result) in probed {
+			match result {
+				// Alive: moved, trashed, or edited-and-listed-late. The upsert lands the head on
+				// this very row (stable tier), re-parenting or trashing it in place. Spare the
+				// row the upsert just wrote — the sweep re-marks everything under `parent`, and
+				// a head still under this parent would otherwise be upserted and then swept.
+				Ok(head) => {
+					debug!("file lineage {stable} is alive on the server; keeping it");
+					let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
+					spare.push(file.uuid);
+				}
+				// Definitively gone — whole lineage, not just a version (`v3/file/stable`
+				// answers for the lineage). Release any pending marker so the phantom converges
+				// instead of being re-spared and re-probed forever; the edit it stood for lost
+				// its upload target with the lineage.
+				Err(e) if e.kind() == ErrorKind::FileNotFound => {
+					let row = RawDBItem::select_by_stable(&self.conn(), stable.into())?;
+					if let Some(row) = row {
+						let released = sql::clear_pending_upload_by_uuid(&self.conn(), row.uuid)?;
+						if released > 0 {
+							debug!(
+								"file lineage {stable} is permanently gone; released its pending \
+								 marker for the sweep"
+							);
+						}
+					}
+				}
+				Err(e) => {
+					debug!("could not verify missing file {stable} ({e}); sparing it this round");
+					if let Some(row) = RawDBItem::select_by_stable(&self.conn(), stable.into())? {
+						spare.push(row.uuid);
+					}
 				}
 			}
 		}

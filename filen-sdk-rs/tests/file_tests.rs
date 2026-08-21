@@ -8,7 +8,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	error::ResultExt,
 	fs::{
-		HasName, HasRemoteInfo, HasUUID,
+		HasName, HasParent, HasRemoteInfo, HasUUID,
 		categories::NonRootFileType,
 		dir::RemoteDirectory,
 		file::{
@@ -1936,5 +1936,75 @@ async fn get_file_by_stable_uuid_returns_the_edited_head() {
 		client.download_file(&head).await.unwrap(),
 		b"edited contents",
 		"the head's content metadata must describe the edit"
+	);
+}
+
+/// The definitive-not-found contract of `v3/file/stable`: a lineage the server does not know —
+/// permanently deleted, or never minted — answers `FileNotFound`, and nothing else does. The
+/// reconciliation paths treat exactly that kind as "gone for good" (and everything else as "could
+/// not ask"), so this is the answer they are built on.
+#[shared_test_runtime]
+async fn get_file_by_stable_uuid_answers_file_not_found_for_a_dead_lineage() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client
+		.upload_file(
+			client
+				.make_file_builder("stable_dead_lineage.txt", test_dir.uuid())
+				.unwrap(),
+			b"short-lived",
+		)
+		.await
+		.unwrap();
+	let stable = file.stable_uuid();
+	client.delete_file_permanently(file).await.unwrap();
+
+	let err = client
+		.get_file_by_stable_uuid(stable)
+		.await
+		.expect_err("a permanently deleted lineage must not resolve");
+	assert_eq!(
+		err.kind(),
+		ErrorKind::FileNotFound,
+		"deleted lineage must answer the typed not-found, got: {err}"
+	);
+
+	// A stable id that never existed answers the same way — the post-wipe identifier
+	// resolution path relies on this to tell "gone" from "cannot ask".
+	let err = client
+		.get_file_by_stable_uuid(filen_types::fs::StableUuid::new_for_test(Uuid::new_v4()))
+		.await
+		.expect_err("a never-minted lineage must not resolve");
+	assert_eq!(err.kind(), ErrorKind::FileNotFound);
+}
+
+/// A trashed head still resolves by its whole-life id, carrying the parent a restore would put it
+/// back in as a `Trash` parent. The trash-phantom reconciliation asks exactly this question.
+#[shared_test_runtime]
+async fn get_file_by_stable_uuid_resolves_a_trashed_head() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let mut file = client
+		.upload_file(
+			client
+				.make_file_builder("stable_trashed_head.txt", test_dir.uuid())
+				.unwrap(),
+			b"into the trash",
+		)
+		.await
+		.unwrap();
+	let stable = file.stable_uuid();
+	client.trash_file(&mut file).await.unwrap();
+
+	let head = client.get_file_by_stable_uuid(stable).await.unwrap();
+	assert_eq!(head.uuid(), file.uuid());
+	assert_eq!(
+		head.parent(),
+		&filen_types::fs::ParentUuid::Trash(test_dir.uuid()),
+		"a trashed head must carry its restore target as a Trash parent"
 	);
 }

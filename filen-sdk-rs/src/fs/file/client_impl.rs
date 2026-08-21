@@ -212,7 +212,8 @@ impl Client {
 	/// re-minted on every content edit, so this is the only way to follow a file across edits;
 	/// the returned file carries the head's (possibly new) uuid.
 	///
-	/// The `v3/file/stable` endpoint is not deployed yet — expect a server error until it is.
+	/// A lineage the server does not know answers [`crate::ErrorKind::FileNotFound`], and only
+	/// that error means gone — every other failure is a failure to ask.
 	pub async fn get_file_by_stable_uuid(
 		&self,
 		stable_uuid: StableUuid,

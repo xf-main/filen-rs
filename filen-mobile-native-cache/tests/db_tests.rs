@@ -7293,3 +7293,125 @@ pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent(
 	std::fs::remove_file(&local_path).ok();
 	rss.client.delete_file_permanently(file).await.unwrap();
 }
+
+/// A file moved OUT of a listed directory by another device must be re-parented in place when the
+/// source is relisted — never retired. The old sweep deleted the row: the system got a tombstone
+/// for a live file (and deleted any materialised copy from disk with it), and the row's
+/// `local_data` — Finder/Files tags — was unrecoverable. The reconcile probes missing files by
+/// their whole-life id (`v3/file/stable`), which is what tells a move from a delete.
+#[shared_test_runtime]
+pub async fn test_relisting_a_source_dir_reparents_a_moved_file() {
+	let (db, rss) = get_db_resources().await;
+	let src = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "reconcile_move_src")
+		.await
+		.unwrap();
+	let dst = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "reconcile_move_dst")
+		.await
+		.unwrap();
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("reconcile_moved.txt", src.uuid())
+				.unwrap(),
+			b"tagged bytes",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let src_path: FfiId = format!("{}/reconcile_move_src", test_dir_path).into();
+	db.update_dir_children(test_dir_path).await.unwrap();
+	db.update_dir_children(src_path.clone()).await.unwrap();
+
+	// Device-local state the old sweep destroyed along with the row.
+	let local_data = std::collections::HashMap::from([("tags".to_string(), "keep-me".to_string())]);
+	db.update_local_data(&file.uuid().to_string(), local_data)
+		.unwrap();
+
+	// The move happens elsewhere; this replica only ever relists the source.
+	rss.client
+		.move_file(&mut file, &(&dst).into())
+		.await
+		.unwrap();
+	db.update_dir_children(src_path).await.unwrap();
+
+	let obj = db
+		.query_item_by_uuid(&format!("stable/{}", file.stable_uuid()))
+		.unwrap()
+		.expect("a moved file must be re-parented, not tombstoned");
+	match obj {
+		FfiObject::File(f) => {
+			assert_eq!(
+				f.parent,
+				dst.uuid().to_string(),
+				"the probe must land the file under its live parent"
+			);
+			assert_eq!(
+				f.local_data
+					.as_ref()
+					.and_then(|data| data.get("tags"))
+					.map(String::as_str),
+				Some("keep-me"),
+				"the row's local_data must survive the move"
+			);
+		}
+		other => panic!("expected the moved file, got {other:?}"),
+	}
+
+	rss.client.delete_file_permanently(file).await.unwrap();
+	rss.client.delete_dir_permanently(src).await.unwrap();
+	rss.client.delete_dir_permanently(dst).await.unwrap();
+}
+
+/// The trash-phantom half of the same contract: a trashed file purged on another device (the
+/// trash was emptied there) must stop resolving here once the trash is relisted. The probe's
+/// definitive `FileNotFound` is what lets the sweep act; sparing on anything less would keep the
+/// phantom in Spotlight/Recents forever.
+#[shared_test_runtime]
+pub async fn test_relisting_the_trash_drops_a_purged_file() {
+	let (db, rss) = get_db_resources().await;
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("trash_phantom.txt", rss.dir.uuid())
+				.unwrap(),
+			b"soon purged",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	rss.client.trash_file(&mut file).await.unwrap();
+	db.update_trash().await.unwrap();
+	assert!(
+		db.query_item_by_uuid(&format!("stable/{}", file.stable_uuid()))
+			.unwrap()
+			.is_some(),
+		"the trashed row is still ours while the server holds it"
+	);
+
+	// Purged elsewhere; the fresh trash listing no longer carries it, and the by-stable probe
+	// answers the typed not-found that authorises the sweep.
+	rss.client
+		.delete_file_permanently(file.clone())
+		.await
+		.unwrap();
+	db.update_trash().await.unwrap();
+
+	assert_eq!(
+		db.query_item_by_uuid(&format!("stable/{}", file.stable_uuid()))
+			.unwrap(),
+		None,
+		"a purged lineage must not survive a trash relist as a phantom"
+	);
+}

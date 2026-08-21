@@ -15,11 +15,11 @@ pub struct Request {
 /// content edits, so this is the only way to follow a file across the uuid
 /// re-mint an edit causes.
 ///
-/// CLIENT-SIDE CONTRACT, pending server deployment: the endpoint is not live
-/// yet, so the response shape is DEFINED here as byte-identical to
-/// [`v3/file`](super::Response) — the live head of the lineage, including
-/// `stableUUID` — and the server will match it. Keeping it an alias (rather
-/// than a copied struct) is what guarantees the two cannot drift.
+/// The response shape is byte-identical to [`v3/file`](super::Response) — the
+/// live head of the lineage, including `stableUUID` (verified against the
+/// deployed endpoint). Keeping it an alias (rather than a copied struct) is
+/// what guarantees the two cannot drift. An unknown lineage answers the
+/// `file_not_found` API code.
 pub type Response<'a> = super::Response<'a>;
 
 #[cfg(test)]

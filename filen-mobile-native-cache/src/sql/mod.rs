@@ -601,6 +601,22 @@ pub(crate) fn select_child_dir_uuids(
 	.collect()
 }
 
+/// The whole-life ids of the non-trashed child FILES of `parent` — the candidates a
+/// listing-driven sweep would retire. Stable ids rather than uuids, because that is the identity
+/// a listing matches files on: an edited head arrives under a fresh uuid but the same stable id,
+/// and must not read as missing.
+pub(crate) fn select_child_file_stables(
+	conn: &Connection,
+	parent: Uuid,
+) -> Result<Vec<StableUuid>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(
+		"SELECT items.stable_uuid FROM items
+		WHERE items.parent = ?1 AND items.trashed = FALSE AND items.type = 2
+		AND items.stable_uuid IS NOT NULL;",
+	)?;
+	stmt.query_map([parent], |row| row.get(0))?.collect()
+}
+
 /// Whether an incoming trashed record would land on a row that is not it.
 ///
 /// `upsert_item` resolves identity by uuid, then stable id, then `(parent, name)` — and neither
