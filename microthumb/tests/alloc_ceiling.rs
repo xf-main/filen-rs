@@ -14,7 +14,9 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::{ImageFormat, Rgb, RgbImage};
-use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbSpec, generate};
+use microthumb::{DEFAULT_MEM_BUDGET, FileSource, MemSource, ThumbSpec, generate};
+
+mod raw_fixtures;
 
 /// Most tests care only about the pixels. The ones that care about WHICH path
 /// produced them call `generate` directly and inspect `Thumbnail::source`.
@@ -376,6 +378,8 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	#[cfg(feature = "heif")]
 	heif_cases();
 
+	raw_cases();
+
 	assert_eq!(meter::dropped(), 0, "the live-block table overflowed");
 }
 
@@ -463,4 +467,53 @@ fn heif_cases() {
 		peak <= TILE_BUDGET,
 		"heif tile decode peaked at {peak} bytes (budget {TILE_BUDGET})"
 	);
+}
+
+/// Real camera RAW files, metered. The pipeline cannot usefully thumbnail any
+/// of them yet (see tests/raw_characterisation.rs for what it does instead),
+/// but "we do not support this" is not a licence to blow the budget: a RAW
+/// file is tens of megabytes, its IFD0 can declare an enormous strip table,
+/// and every one of these paths still has to stay inside the ceiling.
+///
+/// Uses only samples already in the fixture cache — it never downloads, so a
+/// plain `cargo test` is unaffected. Populate the cache by running
+/// `cargo test -p microthumb --test raw_characterisation -- --ignored`.
+fn raw_cases() {
+	let mut worst = 0;
+	let mut worst_name = "";
+	let mut measured = 0;
+
+	for fixture in raw_fixtures::RAW_FIXTURES {
+		let Some(path) = raw_fixtures::cached(fixture) else {
+			continue;
+		};
+		let file = std::fs::File::open(&path).expect("cached fixture opens");
+		let source = FileSource::new(file).expect("file source");
+		let (result, peak) = measured_peak(|| thumb(Box::new(source), &spec(512)));
+		// The outcome itself is characterised elsewhere; here we only care that
+		// whichever path ran did so inside the budget. An error is a legitimate
+		// outcome and must be metered like any other.
+		drop(result);
+		measured += 1;
+		if peak > worst {
+			worst = peak;
+			worst_name = fixture.cache_name;
+		}
+		assert!(
+			peak <= DEFAULT_MEM_BUDGET,
+			"{} ({}) peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})",
+			fixture.cache_name,
+			fixture.format
+		);
+	}
+
+	if measured == 0 {
+		eprintln!(
+			"SKIP raw cases: no pinned RAW samples in {} — run \
+			 `cargo test -p microthumb --test raw_characterisation -- --ignored` to fetch them",
+			raw_fixtures::cache_dir().display()
+		);
+		return;
+	}
+	eprintln!("raw peak over {measured} samples: {worst} bytes ({worst_name})");
 }
