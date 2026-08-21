@@ -71,10 +71,16 @@ pub struct AuthCacheState {
 	pub(crate) sdk_cache_path: PathBuf,
 	/// The one live `cache::search` on the drive root, reused across queries via `set_config`.
 	pub(crate) search: tokio::sync::Mutex<Option<crate::search::ActiveSearch>>,
-	/// The working set's files, registered as file sync roots on the same engine (see
-	/// [`crate::working_set`]). Dropping this state — which is what deauth does — unregisters
-	/// every one of them.
-	pub(crate) tracked_files: crate::working_set::TrackedFiles,
+	/// The live socket path (subscription handle + drainer, see [`crate::live`]). Dropping this
+	/// state — which is what deauth does — unsubscribes and stops the drainer.
+	pub(crate) live: crate::live::LiveState,
+	/// Orders server listings against the live applier (the F3 snapshot race): a `dir/content`
+	/// listing fetched BEFORE a socket event but applied AFTER it would silently revert the
+	/// event — a rename undone, a deleted row resurrected — until the item's next event. Listing
+	/// paths hold this as READERS across fetch+apply; the applier takes it as a WRITER per
+	/// event, so an event can only apply once every listing already in flight has landed, and a
+	/// listing started later carries the event's effect in its own snapshot.
+	pub(crate) listing_barrier: tokio::sync::RwLock<()>,
 	/// Serialises mutations of a single item's local cache file; see [`crate::file_locks`].
 	pub(crate) file_locks: crate::file_locks::FileLocks,
 }
@@ -614,6 +620,8 @@ impl FilenMobileCacheState {
 		let auth_file = async_get_auth_file(&write_state.auth_file, write_state.dek.as_ref()).await;
 
 		update_state(&mut write_state, auth_file);
+		// A (re)established auth is what the live socket path keys off; idempotent otherwise.
+		crate::live::ensure_started(&self.state);
 
 		write_state.downgrade()
 	}
@@ -636,6 +644,7 @@ impl FilenMobileCacheState {
 
 		let file = sync_get_auth_file(&write_state.auth_file, write_state.dek.as_ref());
 		update_state(&mut write_state, file);
+		crate::live::ensure_started(&self.state);
 
 		Some(write_state.downgrade())
 	}
@@ -689,6 +698,7 @@ impl FilenMobileCacheState {
 		let auth_file = async_get_auth_file(&write_state.auth_file, write_state.dek.as_ref()).await;
 
 		update_state(&mut write_state, auth_file);
+		crate::live::ensure_started(&self.state);
 
 		write_state.downgrade()
 	}
@@ -711,6 +721,7 @@ impl FilenMobileCacheState {
 
 		let file = sync_get_auth_file(&write_state.auth_file, write_state.dek.as_ref());
 		update_state(&mut write_state, file);
+		crate::live::ensure_started(&self.state);
 
 		Some(write_state.downgrade())
 	}
@@ -781,7 +792,8 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
-			tracked_files: Default::default(),
+			live: Default::default(),
+			listing_barrier: tokio::sync::RwLock::new(()),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
@@ -827,7 +839,8 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
-			tracked_files: Default::default(),
+			live: Default::default(),
+			listing_barrier: tokio::sync::RwLock::new(()),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
@@ -842,6 +855,12 @@ impl AuthCacheState {
 			cache_dir: &self.cache_dir,
 			locks: &self.file_locks,
 		}
+	}
+
+	/// The raw connection mutex, for the helpers ([`crate::io::SlotRescue`], the live applier)
+	/// that need per-statement access without borrowing the whole state.
+	pub(crate) fn conn_mutex(&self) -> &Mutex<Connection> {
+		&self.conn
 	}
 
 	pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -859,11 +878,24 @@ impl AuthCacheState {
 }
 
 impl FilenMobileCacheState {
+	/// Keeps the live socket path up across its own failures: `ensure_started` is one atomic
+	/// load when it already is, and the auth-transition call alone would leave a failed
+	/// subscription down for the whole process (`update_state` never re-runs for a state that
+	/// stays authenticated). Production (auth-file) states only — the in-memory test
+	/// constructor is deliberately manual, so the shared test state never grows a socket by
+	/// side effect.
+	fn ensure_live_updates(&self) {
+		if self.allow_auth_disable {
+			crate::live::ensure_started(&self.state);
+		}
+	}
+
 	pub(crate) fn sync_execute_authed<T>(
 		&self,
 		f: impl FnOnce(&AuthCacheState) -> Result<T, CacheError> + Send,
 	) -> Result<T, CacheError> {
 		trace!("sync_execute_authed");
+		self.ensure_live_updates();
 		let state = self.sync_get_cache_state_borrowed();
 		match &state.status {
 			AuthStatus::Authenticated(auth_state) => f(auth_state),
@@ -890,6 +922,7 @@ impl FilenMobileCacheState {
 		+ Send,
 	) -> Result<T, CacheError> {
 		trace!("async_execute_authed_owned");
+		self.ensure_live_updates();
 		let state = self.async_get_cache_state_owned().await;
 		match &state.status {
 			AuthStatus::Authenticated(_) => {
@@ -930,6 +963,7 @@ impl FilenMobileCacheState {
 		+ 'static,
 	) -> Result<T, CacheError> {
 		trace!("sync_execute_authed_owned");
+		self.ensure_live_updates();
 		let state = self.sync_get_cache_state_owned();
 		match &state.status {
 			AuthStatus::Authenticated(_) => {

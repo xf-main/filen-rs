@@ -262,6 +262,12 @@ impl AuthCacheState {
 			"Updating items in path: {}, root: {}, name or uuid: {}",
 			path_values.full_path, path_values.root_uuid, path_values.name_or_uuid
 		);
+		// Held across fetch AND apply — see `AuthCacheState::listing_barrier`. The walk upserts
+		// every path component it fetched plus the leaf, each one a full server snapshot that
+		// overwrites parent/name/trashed: without the guard a component fetched before a
+		// `folderMove` lands after it and reverts it, and nothing re-lists that component's own
+		// parent to heal it.
+		let _listing = self.listing_barrier.read().await;
 		let (objects, all) = sql::select_objects_in_path(&self.conn(), path_values)?;
 		let mut futures = get_required_update_futures(objects, all, &self.client)?;
 

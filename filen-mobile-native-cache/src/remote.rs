@@ -180,16 +180,12 @@ impl FilenMobileCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<DownloadResponse, CacheError> {
-		let response = self
-			.async_execute_authed_owned(async move |auth_state| {
-				auth_state
-					.download_file_if_changed_with_item(id, progress_callback, abort)
-					.await
-			})
-			.await;
-		// Bytes on the device are a stake, so the file just joined the working set.
-		crate::working_set::schedule_refresh(&self.state);
-		response
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state
+				.download_file_if_changed_with_item(id, progress_callback, abort)
+				.await
+		})
+		.await
 	}
 
 	/// Replaces a file's content with the bytes at `os_path`, and hands back what it became.
@@ -214,16 +210,12 @@ impl FilenMobileCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<FileWithPathResponse, CacheError> {
-		let response = self
-			.async_execute_authed_owned(async move |auth_state| {
-				auth_state
-					.modify_file_content(id, os_path, progress_callback, abort)
-					.await
-			})
-			.await;
-		// Edited bytes are a stake whether or not they reached the server.
-		crate::working_set::schedule_refresh(&self.state);
-		response
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state
+				.modify_file_content(id, os_path, progress_callback, abort)
+				.await
+		})
+		.await
 	}
 
 	/// The item an id names, refreshed from the server first.
@@ -427,14 +419,10 @@ impl FilenMobileCacheState {
 		item: FfiId,
 		favorite_rank: i64,
 	) -> Result<ObjectWithPathResponse, CacheError> {
-		let response = self
-			.async_execute_authed_owned(async move |auth_state| {
-				auth_state.set_favorite_rank(item, favorite_rank).await
-			})
-			.await;
-		// A favourite is a stake in itself, and stops being one the moment it is cleared.
-		crate::working_set::schedule_refresh(&self.state);
-		response
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.set_favorite_rank(item, favorite_rank).await
+		})
+		.await
 	}
 }
 
@@ -488,6 +476,8 @@ impl AuthCacheState {
 	}
 
 	pub(crate) async fn update_trash(&self) -> Result<(), CacheError> {
+		// Held across fetch AND apply — see `AuthCacheState::listing_barrier`.
+		let _listing = self.listing_barrier.read().await;
 		let (dirs, files) = self
 			.client
 			.list_trash(None::<&fn(u64, Option<u64>)>)
@@ -1014,6 +1004,12 @@ impl AuthCacheState {
 		id: &FfiId,
 	) -> Result<Option<DBObject>, CacheError> {
 		debug!("Updating and querying item: {}", id.0);
+		// Held across fetch AND apply — see `AuthCacheState::listing_barrier`. Every branch below
+		// upserts a server snapshot unconditionally, and `upsert_item.sql` overwrites the row's
+		// parent, name and trashed flag with it: a snapshot fetched before a `folderMove` and
+		// written after it silently reverts the move. Unlike a listing, that revert does not heal
+		// — relisting the directory refreshes its CHILDREN, and nothing re-lists its parent.
+		let _listing = self.listing_barrier.read().await;
 		// An id that resolves to no row of ours is usually one we retired: the providers only ever
 		// ask about identifiers they learned from this cache, so it named an item that has since
 		// been deleted (or it is garbage, which answers the same way). There is nothing to refresh
@@ -2251,6 +2247,8 @@ impl AuthCacheState {
 	}
 
 	async fn inner_update_dir(&self, dir: &mut DBDirObject) -> Result<(), CacheError> {
+		// Held across fetch AND apply — see `AuthCacheState::listing_barrier`.
+		let _listing = self.listing_barrier.read().await;
 		let (dirs, files) = self
 			.client
 			.list_dir(&DirType::from(&*dir), None::<&fn(u64, Option<u64>)>)

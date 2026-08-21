@@ -6947,14 +6947,13 @@ pub async fn test_a_pre_aborted_signal_stops_before_anything_happens() {
 	tokio::fs::remove_file(&external).await.ok();
 }
 
-/// Serializes the tracking tests within this process. The cache state is a process-wide
-/// singleton, and both pieces of tracking state these tests exercise are global to it: the ONE
+/// Serializes the live-path tests within this process. The cache state is a process-wide
+/// singleton, and both pieces of live state these tests exercise are global to it: the ONE
 /// `working_set_listener` slot (a sibling test's `set_working_set_listener` silently replaces
-/// ours, after which our listener counts nothing and `wait_until_tracking_is_live` panics with
-/// "the socket loop is not live" — the 2026-08-08 nightly's macOS failures), and the ONE
-/// handle-map + drainer that `stop_working_set_tracking` tears down for everybody. An
-/// in-process mutex is the right scope: sibling CI legs run separate processes on separate
-/// cache DBs and do not share this state.
+/// ours, after which our listener counts nothing and `wait_until_live_is_delivering` panics
+/// with "the socket loop is not live"), and the ONE subscription + drainer that
+/// `stop_live_updates` tears down for everybody. An in-process mutex is the right scope:
+/// sibling CI legs run separate processes on separate cache DBs and do not share this state.
 static TRACKING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Counts the "something in your working set moved" signals the cache raises.
@@ -6973,15 +6972,15 @@ impl CountingWorkingSetListener {
 	}
 }
 
-/// Waits until tracking is actually carrying events, by driving changes we do not care about
-/// until one comes back.
+/// Waits until the live path is actually carrying events, by driving changes we do not care
+/// about until one comes back.
 ///
-/// The engine's socket connects ASYNCHRONOUSLY behind the registration — the ack fires before the
-/// convergence resync, let alone the socket — and an event that lands before it is up is never
-/// redelivered. A test that mutates the moment the registration returns is racing that window; one
-/// that waits for a signal first is not. Each pass is a real drive change, so the first one after
-/// the socket is up is delivered.
-async fn wait_until_tracking_is_live(
+/// The socket connects ASYNCHRONOUSLY behind `start_live_updates` — the subscription registers
+/// synchronously, the connection follows — and an event emitted before the connection is up is
+/// never redelivered. A test that mutates the moment the call returns is racing that window; one
+/// that waits for a signal first is not. Each pass is a real drive change whose echo comes back
+/// over the socket, so the first signal proves the loop end to end.
+async fn wait_until_live_is_delivering(
 	db: &Arc<FilenMobileCacheState>,
 	item: &FfiId,
 	listener: &CountingWorkingSetListener,
@@ -6991,7 +6990,7 @@ async fn wait_until_tracking_is_live(
 	while listener.count() == 0 {
 		assert!(
 			std::time::Instant::now() < deadline,
-			"tracking never carried a change; the socket loop is not live"
+			"the live path never carried a change; the socket loop is not live"
 		);
 		rank = 1 - rank;
 		db.set_favorite_rank(item.clone(), rank).await.unwrap();
@@ -7002,13 +7001,13 @@ async fn wait_until_tracking_is_live(
 	}
 }
 
-// The whole point of tracking: a file this device has a stake in is edited SOMEWHERE ELSE, and the
-// change reaches the cache — and through it the replica — without anybody asking for the item.
-// Nothing here calls a refreshing API for the file: the only path from the edit to the assertion
-// is the engine's socket consumer, the file sync root registered for the lineage, and the bridge
-// that lands the record in `native_cache.db`.
+// The whole point of the live path: a file this device has a stake in is edited SOMEWHERE ELSE,
+// and the change reaches the cache — and through it the replica — without anybody asking for the
+// item. Nothing here calls a refreshing API for the file: the only path from the edit to the
+// assertion is the socket subscription, the drainer, and the applier landing the record in
+// `native_cache.db`.
 #[shared_test_runtime]
-pub async fn test_tracking_delivers_a_remote_edit_without_being_asked() {
+pub async fn test_live_path_delivers_a_remote_edit_without_being_asked() {
 	let _tracking = TRACKING_TEST_LOCK.lock().await;
 	let (db, rss) = get_db_resources().await;
 
@@ -7037,8 +7036,8 @@ pub async fn test_tracking_delivers_a_remote_edit_without_being_asked() {
 		.download_file_if_changed_by_path(file_path.clone(), None)
 		.await
 		.unwrap();
-	db.refresh_working_set_tracking().await.unwrap();
-	wait_until_tracking_is_live(&db, &file_path, &listener).await;
+	db.start_live_updates();
+	wait_until_live_is_delivering(&db, &file_path, &listener).await;
 	let signals_before = listener.count();
 
 	// The edit, made the way another device would make it: same name, new content — the server
@@ -7105,8 +7104,8 @@ pub async fn test_tracking_delivers_a_remote_edit_without_being_asked() {
 		"the edit must not evict the device's copy"
 	);
 
+	db.stop_live_updates();
 	db.set_working_set_listener(None);
-	db.stop_working_set_tracking();
 	std::fs::remove_file(&local_path).ok();
 }
 
@@ -7114,7 +7113,7 @@ pub async fn test_tracking_delivers_a_remote_edit_without_being_asked() {
 /// with its original parent and its local bytes — because the user can put it back, and a
 /// retirement would have told every replica the file is gone for good.
 #[shared_test_runtime]
-pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
+pub async fn test_a_remote_trash_of_a_held_file_trashes_the_row() {
 	let _tracking = TRACKING_TEST_LOCK.lock().await;
 	let (db, rss) = get_db_resources().await;
 
@@ -7142,8 +7141,8 @@ pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
 		.unwrap();
 	let listener = Arc::new(CountingWorkingSetListener::default());
 	db.set_working_set_listener(Some(listener.clone()));
-	db.refresh_working_set_tracking().await.unwrap();
-	wait_until_tracking_is_live(&db, &file_path, &listener).await;
+	db.start_live_updates();
+	wait_until_live_is_delivering(&db, &file_path, &listener).await;
 
 	let anchor = db.current_sync_anchor().unwrap();
 	// Hold the trash lock across the trash -> restore window: another leg's account-global
@@ -7201,13 +7200,13 @@ pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 	}
 
+	db.stop_live_updates();
 	db.set_working_set_listener(None);
-	db.stop_working_set_tracking();
 	std::fs::remove_file(&local_path).ok();
 	rss.client.delete_file_permanently(file).await.unwrap();
 }
 
-/// Tracking delivers a moved file wherever it went, including into a directory this cache has
+/// The live path delivers a moved file wherever it went, including into a directory this cache has
 /// never listed — so the row lands naming a parent no row of ours answers to. The replica renders
 /// that parent and then asks about it by uuid, and the answer has to be the directory: it plainly
 /// exists, and reporting it deleted would tear the item out from under the OS.
@@ -7233,24 +7232,26 @@ pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent(
 	let file_path: FfiId = test_dir_path.join("tracked_move.txt");
 	db.update_dir_children(test_dir_path).await.unwrap();
 
-	// The stake, and with it the tracking.
+	// The stake that keeps the row interesting to the relevance gate.
 	let local_path = db
 		.download_file_if_changed_by_path(file_path.clone(), None)
 		.await
 		.unwrap();
 	let listener = Arc::new(CountingWorkingSetListener::default());
 	db.set_working_set_listener(Some(listener.clone()));
-	db.refresh_working_set_tracking().await.unwrap();
-	wait_until_tracking_is_live(&db, &file_path, &listener).await;
 
-	// The destination is made on the server and never listed: the only thing that will ever name
-	// it here is the moved file's own row.
+	// The destination is made on the server BEFORE the socket comes up, so its own creation
+	// event is never delivered: the cache must not hold it, and the only thing that will ever
+	// name it here is the moved file's own row.
 	let destination = rss
 		.client
 		.create_dir(&(&rss.dir).into(), "unlisted_move_target")
 		.await
 		.unwrap();
 	let destination_uuid = destination.uuid().to_string();
+
+	db.start_live_updates();
+	wait_until_live_is_delivering(&db, &file_path, &listener).await;
 
 	let anchor = db.current_sync_anchor().unwrap();
 	rss.client
@@ -7288,10 +7289,14 @@ pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent(
 		other => panic!("the parent the replica asks about must resolve, got {other:?}"),
 	}
 
+	db.stop_live_updates();
 	db.set_working_set_listener(None);
-	db.stop_working_set_tracking();
 	std::fs::remove_file(&local_path).ok();
 	rss.client.delete_file_permanently(file).await.unwrap();
+	rss.client
+		.delete_dir_permanently(destination)
+		.await
+		.unwrap();
 }
 
 /// A file moved OUT of a listed directory by another device must be re-parented in place when the
