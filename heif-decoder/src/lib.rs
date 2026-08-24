@@ -11,6 +11,35 @@ use std::{
 
 use image::RgbaImage;
 
+/// Runs the module's C++ static constructors, exactly once, before the first
+/// libheif call.
+///
+/// On native targets the OS loader does this; on wasm32-unknown-unknown
+/// nobody does by default — worse, when a module contains ctors and nothing
+/// references `__wasm_call_ctors`, wasm-ld wraps EVERY export in "command"
+/// semantics (ctors before the call, `__wasm_call_dtors` after), which both
+/// re-runs the ctors on every exported call and runs the C++ atexit
+/// destructors mid-life — the first wrapped export (`__wasm_init_tls`)
+/// trapped inside `__funcs_on_exit`. lld's documented escape hatch is an
+/// explicit reference to `__wasm_call_ctors`: its presence makes lld assume
+/// ctors and dtors are our responsibility and skip the wrappers entirely.
+/// libheif needs the ctors (its built-in decoder plugin is registered by a
+/// global constructor); the destructors are deliberately never run — the
+/// module's teardown is the page's.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn ensure_cpp_runtime_init() {
+	unsafe extern "C" {
+		fn __wasm_call_ctors();
+	}
+	static CTORS: std::sync::Once = std::sync::Once::new();
+	// SAFETY: lld synthesizes __wasm_call_ctors for this module; Once makes
+	// the single required invocation data-race-free.
+	CTORS.call_once(|| unsafe { __wasm_call_ctors() });
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn ensure_cpp_runtime_init() {}
+
 struct HeicContext<'a> {
 	inner: *mut heif_context,
 	_lifetime: PhantomData<&'a [u8]>,
@@ -18,6 +47,7 @@ struct HeicContext<'a> {
 
 impl HeicContext<'_> {
 	fn from_slice(data: &[u8]) -> Result<Self, HeifError> {
+		ensure_cpp_runtime_init();
 		let context = unsafe { heif_context_alloc() };
 		// Own the context immediately so it is freed by `Drop` on every early
 		// return; otherwise a failed read below leaks it (and its buffers).
@@ -41,6 +71,7 @@ impl HeicContext<'_> {
 	}
 
 	fn from_file(path: &str) -> Result<HeicContext<'static>, HeifError> {
+		ensure_cpp_runtime_init();
 		let file_name = CString::new(path)
 			.map_err(|_| HeifError::invalid_input("file path contains an interior NUL byte"))?;
 		let context = unsafe { heif_context_alloc() };
@@ -60,6 +91,7 @@ impl HeicContext<'_> {
 	}
 
 	fn from_reader<T: Read + Seek>(reader: &mut HeifReader<T>) -> Result<Self, HeifError> {
+		ensure_cpp_runtime_init();
 		let context = unsafe { heif_context_alloc() };
 		// Own the context immediately so it is freed by `Drop` on every early
 		// return; otherwise a failed read below leaks it (and its buffers).
@@ -181,6 +213,54 @@ impl Drop for ImageHandle<'_> {
 	}
 }
 
+/// Decoding options handed to every libheif decode call.
+///
+/// Native targets pass NULL and take libheif's defaults (worker threads
+/// help there). On wasm no thread can ever start, and libde265's pool
+/// startup ignores the pthread_create failure while still marking the
+/// context threaded — a WPP- or tile-coded bitstream would then queue work
+/// on a pool with no workers and deadlock. `num_codec_threads = -1` makes
+/// the libde265 plugin skip pool startup entirely, so every decode takes
+/// the sequential path.
+struct DecodeOptions(*mut heif_decoding_options);
+
+impl DecodeOptions {
+	fn for_target() -> Result<Self, HeifError> {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			// SAFETY: alloc fills in defaults and the current options version;
+			// num_codec_threads is a plain int field in that struct.
+			let options = unsafe { heif_decoding_options_alloc() };
+			if options.is_null() {
+				// Falling back to NULL here would hand libheif its defaults —
+				// the very pool-startup path this exists to avoid — so a
+				// failed allocation fails the decode instead.
+				return Err(HeifError::invalid_input(
+					"could not allocate decoding options",
+				));
+			}
+			unsafe { (*options).num_codec_threads = -1 };
+			Ok(DecodeOptions(options))
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			Ok(DecodeOptions(std::ptr::null_mut()))
+		}
+	}
+
+	fn as_ptr(&self) -> *const heif_decoding_options {
+		self.0
+	}
+}
+
+impl Drop for DecodeOptions {
+	fn drop(&mut self) {
+		if !self.0.is_null() {
+			unsafe { heif_decoding_options_free(self.0) };
+		}
+	}
+}
+
 struct OutImage<'a> {
 	inner: *mut heif_image,
 	_lifetime: PhantomData<&'a ImageHandle<'a>>,
@@ -189,13 +269,14 @@ struct OutImage<'a> {
 impl OutImage<'_> {
 	fn new(handle: &ImageHandle) -> Result<Self, HeifError> {
 		let mut heif_image_ptr = std::ptr::null_mut();
+		let options = DecodeOptions::for_target()?;
 		let result = unsafe {
 			heif_decode_image(
 				handle.inner,
 				(&mut heif_image_ptr) as *mut *mut heif_image,
 				heif_colorspace_heif_colorspace_RGB,
 				heif_chroma_heif_chroma_interleaved_RGBA,
-				std::ptr::null(),
+				options.as_ptr(),
 			)
 		};
 
@@ -603,13 +684,14 @@ impl<T: Read + Seek> HeifSession<T> {
 			self.tiles_validated.set(true);
 		}
 		let mut heif_image_ptr = std::ptr::null_mut();
+		let options = DecodeOptions::for_target()?;
 		let result = unsafe {
 			heif_image_handle_decode_image_tile(
 				primary.inner,
 				&mut heif_image_ptr,
 				heif_colorspace_heif_colorspace_RGB,
 				heif_chroma_heif_chroma_interleaved_RGBA,
-				std::ptr::null(),
+				options.as_ptr(),
 				tile_x,
 				tile_y,
 			)
@@ -826,6 +908,221 @@ impl std::error::Error for HeifError {}
 // 		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
 // 	}
 // }
+
+/// Link-time stubs for the host functions wasi-libc and the C++ runtime
+/// expect, so the browser module ends up with ZERO imports beyond
+/// wasm-bindgen's own — no JS shim to write or maintain.
+///
+/// wasi-libc's syscall wrappers reference `__imported_wasi_snapshot_preview1_*`
+/// symbols that normally become `wasi_snapshot_preview1.*` imports;
+/// wasm-bindgen's loader supplies no such module, so a live import would fail
+/// instantiation. Defining the symbols here makes the linker resolve them
+/// instead of importing. They back wasi-libc's stdio/stderr plumbing, its
+/// preopen scan, and abort: every fd answers EBADF with its out-params
+/// zeroed, the environment is empty, and the terminal paths trap, which is
+/// what abort means in a wasm module anyway.
+///
+/// Mostly, but NOT entirely, unreachable: `fd_write` is on the malformed-input
+/// path, because libde265 prints its bitstream complaints to stderr.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod wasi_stubs {
+	use std::arch::wasm32::unreachable;
+
+	/// WASI errno for "bad file descriptor" — also what ends wasi-libc's
+	/// preopen discovery loop cleanly.
+	const EBADF: i32 = 8;
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_environ_get(
+		_environ: *mut u32,
+		_buf: *mut u8,
+	) -> i32 {
+		0
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_environ_sizes_get(
+		count: *mut u32,
+		buf_size: *mut u32,
+	) -> i32 {
+		// SAFETY: wasi-libc passes pointers to two locals it reads afterwards;
+		// report an empty environment through them.
+		unsafe {
+			*count = 0;
+			*buf_size = 0;
+		}
+		0
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_close(_fd: i32) -> i32 {
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_fdstat_get(_fd: i32, _stat: *mut u8) -> i32 {
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_prestat_get(_fd: i32, _buf: *mut u8) -> i32 {
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_prestat_dir_name(
+		_fd: i32,
+		_path: *mut u8,
+		_len: usize,
+	) -> i32 {
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_read(
+		_fd: i32,
+		_iovs: *const u8,
+		_iovs_len: usize,
+		nread: *mut usize,
+	) -> i32 {
+		// SAFETY: wasi-libc passes a pointer to a local it reads back. An
+		// errno does not oblige a host to write the out-param, but leaving it
+		// untouched leaves a caller that ignores the errno reading whatever
+		// was on the stack — so answer zero as well.
+		unsafe { *nread = 0 };
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_readdir(
+		_fd: i32,
+		_buf: *mut u8,
+		_buf_len: usize,
+		_cookie: i64,
+		used: *mut usize,
+	) -> i32 {
+		// SAFETY: as in fd_read.
+		unsafe { *used = 0 };
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_seek(
+		_fd: i32,
+		_offset: i64,
+		_whence: i32,
+		new_offset: *mut u64,
+	) -> i32 {
+		// SAFETY: as in fd_read.
+		unsafe { *new_offset = 0 };
+		EBADF
+	}
+
+	/// The one stub that is genuinely reached: libde265 prints to stderr from
+	/// its bitstream sanity checks, which malformed input triggers. Failing
+	/// the write is the intended behaviour (there is nowhere to print), and
+	/// the decode carries on regardless.
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_fd_write(
+		_fd: i32,
+		_iovs: *const u8,
+		_iovs_len: usize,
+		nwritten: *mut usize,
+	) -> i32 {
+		// SAFETY: as in fd_read.
+		unsafe { *nwritten = 0 };
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_path_filestat_get(
+		_fd: i32,
+		_flags: i32,
+		_path: *const u8,
+		_path_len: usize,
+		_buf: *mut u8,
+	) -> i32 {
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_path_open(
+		_fd: i32,
+		_dirflags: i32,
+		_path: *const u8,
+		_path_len: usize,
+		_oflags: i32,
+		_rights_base: i64,
+		_rights_inheriting: i64,
+		_fdflags: i32,
+		opened_fd: *mut i32,
+	) -> i32 {
+		// SAFETY: as in fd_read — never hand back an uninitialised fd.
+		unsafe { *opened_fd = -1 };
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_path_unlink_file(
+		_fd: i32,
+		_path: *const u8,
+		_path_len: usize,
+	) -> i32 {
+		EBADF
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_sched_yield() -> i32 {
+		0
+	}
+
+	/// Referenced by the threads-libc's timed waits (pthread_cond etc.),
+	/// which stay unreachable — the pool is never started. Answers with a
+	/// frozen clock rather than an error so a hypothetical caller spins
+	/// instead of aborting.
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_clock_time_get(
+		_clock_id: i32,
+		_precision: i64,
+		time: *mut u64,
+	) -> i32 {
+		// SAFETY: wasi-libc passes a pointer to a local timestamp it reads
+		// back.
+		unsafe { *time = 0 };
+		0
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_snapshot_preview1_proc_exit(_code: i32) -> ! {
+		unreachable()
+	}
+
+	/// wasi-threads' host spawn hook (threaded sysroot only). A negative
+	/// return means "could not spawn", which pthread_create surfaces as
+	/// EAGAIN — and DecodeOptions keeps libde265 from ever asking.
+	#[unsafe(no_mangle)]
+	extern "C" fn __imported_wasi_thread_spawn(_start_arg: *mut u8) -> i32 {
+		-1
+	}
+
+	/// The vendored C++ compiles with exceptions on (heif_cxx.h forbids
+	/// -fno-exceptions) and libheif's own code never throws deliberately — but
+	/// the C++ runtime does: every `.resize()` in it can raise `length_error`
+	/// or `bad_alloc`, and a malformed file whose declared sizes are absurd is
+	/// how that happens. There is no catch on the decode path, so such a throw
+	/// TRAPS the module — the same end state as the `abort()` a native build
+	/// reaches, and the reason a HEIC decode must never be the only thing
+	/// keeping a wasm instance alive.
+	#[unsafe(no_mangle)]
+	extern "C" fn __cxa_allocate_exception(_size: usize) -> *mut u8 {
+		unreachable()
+	}
+
+	#[unsafe(no_mangle)]
+	extern "C" fn __cxa_throw(_exception: *mut u8, _type_info: *mut u8, _dtor: *mut u8) -> ! {
+		unreachable()
+	}
+}
 
 #[cfg(test)]
 mod layout_tests {
