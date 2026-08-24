@@ -105,7 +105,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run tests
-        run: cargo test -F malformed,heif-decoder,avif-decoder --no-fail-fast
+        run: cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder --no-fail-fast
         env:
           TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
           TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}

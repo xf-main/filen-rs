@@ -49,9 +49,9 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run clippy all features
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto,cache -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy single-threaded
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
@@ -104,9 +104,9 @@ jobs:
           vcpkg install dav1d:x64-windows
           echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
       - name: Run clippy all features
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto,cache -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy single-threaded
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
@@ -167,14 +167,14 @@ jobs:
           echo "SYSTEM_DEPS_DAV1D_LIB=dav1d" >> "$GITHUB_ENV"
           echo "SYSTEM_DEPS_DAV1D_SEARCH_NATIVE=$(brew --prefix dav1d)/lib" >> "$GITHUB_ENV"
       - name: Run clippy Android
-        run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder,cache -- -D warnings
+        run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy Android uniffi
         # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked.
-        run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder,uniffi,cache -- -D warnings
+        run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy all features
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto,cache -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy single-threaded
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
@@ -182,10 +182,10 @@ jobs:
       - name: Run clippy on tests with cache
         run: cargo clippy --tests -F cache -- -D warnings
       - name: Run clippy iOS
-        run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder,cache -- -D warnings
+        run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy iOS uniffi
         # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked.
-        run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder,uniffi,cache -- -D warnings
+        run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache -- -D warnings
       - name: Run unit tests
         run: cargo test --lib -F cache --no-fail-fast
         env:
