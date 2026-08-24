@@ -681,10 +681,11 @@ test("thumbnail", async () => {
 		})
 	)
 
-	// avif and heic do not currently work
+	// avif does not currently work: the wasm libheif build carries no AV1
+	// decoder (see heif-decoder's hevc_decodes_avif_does_not)
 	expect(completed).not.toContainEqual("avif")
 	expect(completed).toContainEqual("gif")
-	expect(completed).not.toContainEqual("heif")
+	expect(completed).toContainEqual("heif")
 	expect(completed).toContainEqual("jpg")
 	expect(completed).toContainEqual("png")
 	expect(completed).toContainEqual("tiff")

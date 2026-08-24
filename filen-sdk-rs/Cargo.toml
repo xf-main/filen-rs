@@ -150,6 +150,9 @@ rusqlite = { version = "0.39", features = [
 	"fallible_uint",
 ], optional = true }
 itertools = { version = "0.14.0", optional = true }
+# On wasm32 its libheif/libde265 are cross-compiled with wasi-sdk (point
+# WASI_SDK_PATH at an extracted release — see wasm-pack.sh).
+heif-decoder = { path = "../heif-decoder", optional = true }
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
@@ -168,7 +171,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 	"fmt",
 ] }
 tracing-log = "0.2"
-heif-decoder = { path = "../heif-decoder", optional = true }
 microthumb = { path = "../microthumb", features = ["svg"] }
 tokio-tungstenite = { version = "0.28.0", features = [
 	"rustls",
