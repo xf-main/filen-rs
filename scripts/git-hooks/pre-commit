@@ -98,8 +98,8 @@ if have cargo && [ -f filen-sdk-rs/Cargo.toml ]; then
 		fi
 		run "cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats (filen-sdk-rs)" \
 			bash -c "cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats -- -D warnings"
-		run "cargo clippy --target wasm32-unknown-unknown -F service-worker (filen-sdk-rs)" \
-			bash -c 'cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings'
+		run "cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker (filen-sdk-rs)" \
+			bash -c 'cd filen-sdk-rs && RUSTFLAGS="-C target-feature=-nontrapping-fptoint,+bulk-memory --cfg getrandom_backend=\"wasm_js\"" cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker -- -D warnings'
 	else
 		printf '%swasm32-unknown-unknown target not installed, skipping WASM clippy%s\n' \
 			"$yellow" "$reset"
