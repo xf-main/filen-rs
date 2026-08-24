@@ -1,8 +1,8 @@
 use std::{
 	collections::HashSet,
 	path::{Path, PathBuf},
-	sync::Arc,
-	time::Instant,
+	sync::{Arc, RwLock},
+	time::{Duration, Instant},
 };
 
 use chrono::DateTime;
@@ -31,6 +31,15 @@ const RECONCILE_PROBE_CONCURRENCY: usize = 8;
 /// reimport burst, not to serve stale listings.
 const ADOPT_RELIST_TTL_MS: i64 = 10_000;
 
+/// How recently the recents or trash listing must have run for
+/// [`FilenMobileCacheState::update_recents_if_stale`] / [`FilenMobileCacheState::update_trash_if_stale`]
+/// to reuse it instead of re-fetching.
+///
+/// Same value as [`ADOPT_RELIST_TTL_MS`] and for the same reason: it exists to coalesce the
+/// repeated asks of ONE presentation, not to serve stale listings. What it can cost is how
+/// quickly those two views pick up a change the live socket did not already apply.
+const LISTING_TTL: Duration = Duration::from_millis(ADOPT_RELIST_TTL_MS as u64);
+
 /// Above this many missing rows, probing each is abandoned and the fresh listing is trusted
 /// as-is (the pre-probe behaviour): hundreds of rows vanishing at once is a genuine bulk
 /// delete or emptied trash, and a per-row round-trip storm would gate every presentation of
@@ -38,6 +47,14 @@ const ADOPT_RELIST_TTL_MS: i64 = 10_000;
 /// (`reconcile_missing_trashed` instead probes a bounded chunk and SPARES the remainder, so
 /// repeated presentations converge — a bulk restore must never read as an emptied trash.)
 const RECONCILE_PROBE_CAP: usize = 64;
+
+/// Whether `stamp` was last set within `ttl`.
+fn stamped_within(stamp: &RwLock<Option<Instant>>, ttl: Duration) -> bool {
+	stamp
+		.read()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.is_some_and(|at| at.elapsed() < ttl)
+}
 
 use crate::{
 	CacheError,
@@ -86,6 +103,40 @@ impl FilenMobileCacheState {
 	pub async fn update_trash(&self) -> Result<(), CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| auth_state.update_trash().await)
 			.await
+	}
+
+	/// [`Self::update_recents`], skipped when one ran within [`LISTING_TTL`].
+	///
+	/// What a RE-PRESENTATION wants. The listing is a full download plus a decrypt of every item,
+	/// and it sat unconditionally at the top of the working-set `enumerateChanges`, which the
+	/// system re-invokes once per PAGE — so one diff paid for it several times over, for rows the
+	/// diff does not even read (the working-set predicate and the change feed key off
+	/// `change_seq`, never `is_recent`).
+	///
+	/// Its own entry point rather than a throttle bolted onto [`Self::update_recents`], because
+	/// the two callers mean different things: a caller that has just changed the drive and wants
+	/// the listing to reflect it must still be able to say so.
+	pub async fn update_recents_if_stale(&self) -> Result<(), CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			if stamped_within(&auth_state.last_recents_update, LISTING_TTL) {
+				return Ok(());
+			}
+			auth_state.update_recents().await
+		})
+		.await
+	}
+
+	/// [`Self::update_trash`], skipped when one ran within [`LISTING_TTL`]. See
+	/// [`Self::update_recents_if_stale`]; the trash listing additionally pays up to
+	/// [`RECONCILE_PROBE_CAP`] per-row probes, on every presentation of the trash view.
+	pub async fn update_trash_if_stale(&self) -> Result<(), CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			if stamped_within(&auth_state.last_trash_update, LISTING_TTL) {
+				return Ok(());
+			}
+			auth_state.update_trash().await
+		})
+		.await
 	}
 
 	/// Search the subtree rooted at `root_id` (the documents-provider root id, i.e. the drive-root
