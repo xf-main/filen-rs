@@ -334,7 +334,10 @@ pub fn generate(
 	mut src: Box<dyn ByteSource>,
 	spec: &ThumbSpec,
 ) -> Result<Option<Thumbnail>, ThumbError> {
-	let mut prefix = [0u8; 64];
+	// 1 KB rather than the 16 bytes the magic numbers need: SVG has no magic
+	// and its `<svg` root can sit behind an XML declaration, comments and a
+	// DOCTYPE. One read either way; a short read only narrows the sniff.
+	let mut prefix = [0u8; 1024];
 	let n = src.read_at(0, &mut prefix)?;
 	let Some(format) = formats::sniff(&prefix[..n]) else {
 		return Ok(None);

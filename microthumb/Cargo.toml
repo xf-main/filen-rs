@@ -7,6 +7,9 @@ publish = false
 [features]
 default = []
 heif = ["dep:heif-decoder"]
+# SVG rasterisation. Off by default: it pulls resvg/usvg into builds that only
+# ever see camera formats.
+svg = ["dep:resvg", "dep:roxmltree"]
 
 [dependencies]
 image = { version = "0.25.6", default-features = false, features = [
@@ -21,6 +24,10 @@ jpeg-decoder = { version = "0.3.2", default-features = false }
 tiff = "0.10"
 png = "0.18"
 heif-decoder = { path = "../heif-decoder", optional = true }
+resvg = { version = "0.48", default-features = false, optional = true }
+# Pinned to the exact version usvg 0.48 locks: the expansion pre-pass reads the
+# document with the same parser usvg will, and adds nothing to the lockfile.
+roxmltree = { version = "0.21.1", optional = true }
 
 [dev-dependencies]
 # Synthetic fixtures are generated at test runtime — encoders only. The RAW

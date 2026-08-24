@@ -375,12 +375,255 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 		"24 MP bmp peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
 	);
 
+	#[cfg(feature = "svg")]
+	svg_cases();
+
 	#[cfg(feature = "heif")]
 	heif_cases();
 
 	raw_cases();
 
 	assert_eq!(meter::dropped(), 0, "the live-block table overflowed");
+}
+
+/// Vector documents: the pixmap, the parse tree and the held text are the
+/// costs, all priced by the svg decoder's estimate.
+#[cfg(feature = "svg")]
+fn svg_cases() {
+	// A busy document — thousands of shapes plus an isolated layer.
+	let mut body = String::new();
+	for i in 0..3000u32 {
+		let (x, y) = (i % 100 * 20, i / 100 * 27);
+		body.push_str(&format!(
+			r#"<circle cx="{x}" cy="{y}" r="9" fill="rgb({},{},{})"/>"#,
+			i % 256,
+			(i * 3) % 256,
+			(i * 7) % 256
+		));
+	}
+	body.push_str(r#"<g opacity="0.5"><rect width="2000" height="800" fill="red"/></g>"#);
+	let svg_bytes = format!(
+		r#"<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="800">{body}</svg>"#
+	)
+	.into_bytes();
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(svg_bytes)), &spec(512)));
+	result.unwrap().expect("busy svg must thumbnail");
+	eprintln!("busy svg peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"busy svg peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// Marker bomb: usvg deep-copies the marker subtree once per path vertex,
+	// during the PARSE. Refusing after `Tree::from_str` returns is too late —
+	// this document peaked at a quarter of a gigabyte doing it, and with
+	// `overflow="visible"` on the marker it then answered Ok. The refusal has
+	// to come from the pre-pass, and the meter is what proves it does.
+	let mut d = String::from("M0,0");
+	for i in 0..50_000u32 {
+		d.push_str(&format!("L{},{}", 10 + i % 80, 10 + i % 70));
+	}
+	for marker_attrs in ["", r#" overflow="visible""#] {
+		let bomb = format!(
+			r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+			<defs><marker id="m" markerWidth="9" markerHeight="9"{marker_attrs}>
+			<circle cx="4" cy="4" r="4" fill="red"/></marker></defs>
+			<path d="{d}" fill="none" stroke="black" marker-mid="url(#m)"/></svg>"##
+		)
+		.into_bytes();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bomb)), &spec(512)));
+		assert!(result.is_err(), "the marker bomb must be refused");
+		eprintln!("marker bomb peak: {peak} bytes");
+		assert!(
+			peak <= DEFAULT_MEM_BUDGET,
+			"marker bomb peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+		);
+	}
+
+	// `<use>` doubling chain: 24 levels of ~40 bytes, 2^24 nodes if resolved.
+	let mut body = String::from(r#"<g id="g0"><rect width="8" height="8"/></g>"#);
+	for level in 1..24 {
+		let prev = level - 1;
+		body.push_str(&format!(
+			r##"<g id="g{level}"><use href="#g{prev}"/><use href="#g{prev}"/></g>"##
+		));
+	}
+	body.push_str(r##"<use href="#g23"/>"##);
+	let bomb =
+		format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">{body}</svg>"#)
+			.into_bytes();
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bomb)), &spec(512)));
+	assert!(result.is_err(), "the use bomb must be refused");
+	eprintln!("use bomb peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"use bomb peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// The same chain with an href usvg resolves and the pre-pass did not: an
+	// xlink decoy in front of the real link, and a leading space that
+	// `svgtypes::IRI` skips. Both peaked at 91 MiB before the pre-pass learned
+	// usvg's resolution rules.
+	for link in [
+		r##"<use xlink:href="#tiny" href="#{PREV}"/>"##,
+		r##"<use href=" #{PREV}"/>"##,
+	] {
+		let mut body = String::from(r#"<g id="tiny"/><g id="g0"><rect width="8" height="8"/></g>"#);
+		for level in 1..24 {
+			let one = link.replace("{PREV}", &format!("g{}", level - 1));
+			body.push_str(&format!(r#"<g id="g{level}">{one}{one}</g>"#));
+		}
+		body.push_str(&link.replace("{PREV}", "g23"));
+		let bomb = format!(
+			r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+			 width="100" height="100">{body}</svg>"#
+		)
+		.into_bytes();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bomb)), &spec(512)));
+		assert!(result.is_err(), "the disguised use bomb must be refused");
+		eprintln!("disguised use bomb peak: {peak} bytes");
+		assert!(
+			peak <= DEFAULT_MEM_BUDGET,
+			"disguised use bomb peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+		);
+	}
+
+	// Marker copies multiply with the `<use>` fan-out (usvg re-expands them
+	// per copy: 168 MiB), chain through a second marker (169 MiB), and land on
+	// built shapes the whitelist used to skip (70 MiB of `<circle>`).
+	let mut d = String::from("M0,0");
+	for i in 0..2000u32 {
+		d.push_str(&format!("L{},{}", 1 + i % 9, 1 + i % 7));
+	}
+	let marker = r##"<defs><marker id="m" markerWidth="9" markerHeight="9" overflow="visible">
+		<circle cx="4" cy="4" r="4" fill="red"/></marker></defs>"##;
+	let mut fan_out = format!(
+		r##"{marker}<g id="p"><path d="{d}" fill="none" stroke="black" marker-mid="url(#m)"/></g>"##
+	);
+	fan_out.push_str(&r##"<use href="#p"/>"##.repeat(100));
+	let mut inner = String::from("M0,0");
+	for i in 0..450u32 {
+		inner.push_str(&format!("L{},{}", 1 + i % 9, 1 + i % 7));
+	}
+	let chained = format!(
+		r##"<defs>
+		<marker id="m2" markerWidth="9" markerHeight="9" overflow="visible">
+		<circle cx="1" cy="1" r="1" fill="red"/></marker>
+		<marker id="m1" markerWidth="9" markerHeight="9" overflow="visible">
+		<path d="{inner}" fill="none" stroke="black" marker-mid="url(#m2)"/></marker></defs>
+		<path d="{inner}" fill="none" stroke="black" marker-mid="url(#m1)"/>"##
+	);
+	let shapes = format!(
+		r##"{marker}<g marker-mid="url(#m)" marker-start="url(#m)" marker-end="url(#m)"
+		 stroke="black">{}</g>"##,
+		r#"<circle r="9"/>"#.repeat(12_000)
+	);
+	for (what, body) in [
+		("use x marker", fan_out),
+		("marker chain", chained),
+		("markers on circles", shapes),
+	] {
+		let bomb = format!(
+			r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">{body}</svg>"#
+		)
+		.into_bytes();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bomb)), &spec(512)));
+		assert!(result.is_err(), "the {what} bomb must be refused");
+		eprintln!("{what} bomb peak: {peak} bytes");
+		assert!(
+			peak <= DEFAULT_MEM_BUDGET,
+			"{what} bomb peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+		);
+	}
+
+	// Nested viewport: 120 bytes. The pre-pass resolved percentages against
+	// the ROOT viewport, while usvg swaps `state.view_box` for each nested
+	// `<svg>` — so a 50% radius inside a 1e36 viewBox walked past the arc
+	// guard and rendered at a 65.89 MiB peak. Fifty of them peaked at 1.7 GiB.
+	let mut body = String::new();
+	for _ in 0..50 {
+		body.push_str(r#"<svg viewBox="0 0 1e36 1e36"><ellipse rx="50%" ry="50%"/></svg>"#);
+	}
+	for nested in [
+		r#"<svg viewBox="0 0 1e36 1e36"><ellipse rx="50%" ry="50%"/></svg>"#.to_string(),
+		body,
+	] {
+		let bomb = format!(
+			r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">{nested}</svg>"#
+		)
+		.into_bytes();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bomb)), &spec(512)));
+		assert!(result.is_err(), "the nested-viewport bomb must be refused");
+		eprintln!("nested viewport bomb peak: {peak} bytes");
+		assert!(
+			peak <= DEFAULT_MEM_BUDGET,
+			"nested viewport bomb peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+		);
+	}
+
+	// Filter fan-out: usvg copies the resolved chain into every group, so 8000
+	// `<use>`s of one 64-primitive filter — 130 KB — peaked at 164 MiB and
+	// still answered Ok. The byte scan counts an `fe*` tag once per physical
+	// occurrence and the layer walk runs after the parse; only the expansion
+	// pre-pass sees the product.
+	let primitives: String = (0..64)
+		.map(|i| format!(r#"<feGaussianBlur stdDeviation="{}"/>"#, 1 + i % 3))
+		.collect();
+	let bomb = format!(
+		r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+		<defs><filter id="f">{primitives}</filter>
+		<g id="p" filter="url(#f)"><rect width="9" height="9" fill="red"/></g></defs>{}</svg>"##,
+		r##"<use href="#p"/>"##.repeat(8000)
+	)
+	.into_bytes();
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bomb)), &spec(512)));
+	assert!(result.is_err(), "the filter fan-out bomb must be refused");
+	eprintln!("filter fan-out bomb peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"filter fan-out bomb peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// And the charge is calibrated, not merely present: the largest fan-out
+	// the estimate still accepts has to render inside the budget it was
+	// measured against.
+	let allowed = format!(
+		r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+		<defs><filter id="f">{primitives}</filter>
+		<g id="p" filter="url(#f)"><rect width="9" height="9" fill="red"/></g></defs>{}</svg>"##,
+		r##"<use href="#p"/>"##.repeat(340)
+	)
+	.into_bytes();
+	let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(allowed)), &spec(64)));
+	result
+		.unwrap()
+		.expect("the largest accepted filter fan-out must thumbnail");
+	eprintln!("accepted filter fan-out peak: {peak} bytes");
+	assert!(
+		peak <= DEFAULT_MEM_BUDGET,
+		"accepted filter fan-out peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+	);
+
+	// Dash bomb: 200 bytes of document, and tiny-skia builds dash segments
+	// until its own million-per-path ceiling — ~125 MB — and then returns a
+	// thumbnail. Both spellings of the same stroke.
+	for dash in [
+		r#" stroke-dasharray="0.001 0.001""#,
+		r#" style="stroke-dasharray:0.001 0.001""#,
+	] {
+		let bomb = format!(
+			r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+			<path d="M0 0 L1000000 0" stroke="black" stroke-width="1"{dash}/></svg>"#
+		)
+		.into_bytes();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bomb)), &spec(512)));
+		assert!(result.is_err(), "the dash bomb must be refused");
+		eprintln!("dash bomb peak: {peak} bytes");
+		assert!(
+			peak <= DEFAULT_MEM_BUDGET,
+			"dash bomb peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+		);
+	}
 }
 
 /// See tests/pipeline.rs — duplicated because each test binary is its own

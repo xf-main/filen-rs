@@ -1033,3 +1033,1020 @@ fn preview_only_without_an_embedded_thumbnail_is_ok_none_not_a_decode() {
 			.is_some()
 	);
 }
+
+// ---- svg ----
+
+#[cfg(feature = "svg")]
+fn svg_doc(attrs: &str, body: &str) -> Vec<u8> {
+	format!(r#"<svg xmlns="http://www.w3.org/2000/svg" {attrs}>{body}</svg>"#).into_bytes()
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_sniffs_through_a_full_xml_prologue() {
+	// BOM, declaration, comment, DOCTYPE with an (entity-free) internal
+	// subset — everything a real exporter piles in front of the root.
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+	bytes.extend_from_slice(
+		b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n\
+		  <!-- Created with Inkscape (http://www.inkscape.org/) -->\n\
+		  <!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \
+		  \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\" [ <!ATTLIST svg id ID #IMPLIED> ]>\n",
+	);
+	bytes.extend_from_slice(&svg_doc(
+		r#"width="100" height="100""#,
+		r#"<rect width="100" height="100" fill="red"/>"#,
+	));
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("prologue-heavy svg must thumbnail");
+	assert_eq!(&result.rgba[..4], &[255, 0, 0, 255]);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_sniff_rejects_non_svg_text_and_gzip() {
+	// Well-formed XML whose root is not svg.
+	let xml = b"<?xml version=\"1.0\"?><note><to>Tove</to><from>Jani</from></note>".to_vec();
+	assert_eq!(thumb(Box::new(MemSource(xml)), &spec(64)).unwrap(), None);
+	// HTML — even when an inline <svg> appears later in the body.
+	let html =
+		b"<!DOCTYPE html><html><body><p>hi</p><svg xmlns=\"http://www.w3.org/2000/svg\"/></body></html>"
+			.to_vec();
+	assert_eq!(thumb(Box::new(MemSource(html)), &spec(64)).unwrap(), None);
+	// .svgz: gzip bytes are refused by design — no inflate dependency.
+	let svgz = vec![0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+	assert_eq!(thumb(Box::new(MemSource(svgz)), &spec(64)).unwrap(), None);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_aspect_comes_from_width_height_then_view_box() {
+	// Absolute width/height decide, even in mixed units (200pt × 100pt = 2:1).
+	let bytes = svg_doc(
+		r#"width="200pt" height="100pt" viewBox="0 0 50 400""#,
+		r#"<rect width="50" height="400" fill="lime"/>"#,
+	);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(100))
+		.unwrap()
+		.expect("sized svg must thumbnail");
+	let ratio = f64::from(result.width) / f64::from(result.height);
+	assert!(
+		(1.9..=2.1).contains(&ratio),
+		"got {}x{}",
+		result.width,
+		result.height
+	);
+
+	// A percentage width carries no absolute size: the viewBox (1:4) decides.
+	let bytes = svg_doc(
+		r#"width="100%" viewBox="0 0 100 400""#,
+		r#"<rect width="100" height="400" fill="lime"/>"#,
+	);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(100))
+		.unwrap()
+		.expect("viewBox svg must thumbnail");
+	let ratio = f64::from(result.height) / f64::from(result.width);
+	assert!(
+		(3.8..=4.2).contains(&ratio),
+		"got {}x{}",
+		result.width,
+		result.height
+	);
+
+	// Neither: a square raster, not a panic.
+	let bytes = svg_doc("", r#"<circle cx="50" cy="50" r="40" fill="blue"/>"#);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("unsized svg must thumbnail");
+	assert_eq!(result.width, result.height);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_renders_a_flat_colour_and_upscales_small_nominal_sizes() {
+	// A 16px nominal size still rasterises at the target — scaling up is what
+	// vectors are for — and a full-cover rect lands exactly that colour.
+	let bytes = svg_doc(
+		r#"width="16" height="16""#,
+		r#"<rect width="16" height="16" fill="red"/>"#,
+	);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(256))
+		.unwrap()
+		.expect("small svg must thumbnail");
+	assert!(
+		result.width >= 256,
+		"vector must render at the target, got {}",
+		result.width
+	);
+	for px in result.rgba.chunks_exact(4) {
+		assert_eq!(px, &[255, 0, 0, 255]);
+	}
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_over_budget_is_refused() {
+	let bytes = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<rect width="100" height="100" fill="red"/>"#,
+	);
+	let starved = ThumbSpec {
+		target_width: 64,
+		target_height: 64,
+		mem_budget: 1024,
+		allow_full_decode: true,
+	};
+	assert_eq!(thumb(Box::new(MemSource(bytes)), &starved).unwrap(), None);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_hostile_documents_are_refused_not_expanded() {
+	// Entity declarations: roxmltree bounds billion-laughs expansion, but
+	// plain internal entities still amplify quadratically — refused outright.
+	let mut laughs = b"<?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY a \"aaaaaaaaaa\">\
+		<!ENTITY b \"&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;\">]>"
+		.to_vec();
+	laughs.extend_from_slice(&svg_doc(r#"width="100" height="100""#, "<desc>&b;</desc>"));
+	assert!(thumb(Box::new(MemSource(laughs)), &spec(64)).is_err());
+
+	// Patterns: resvg sizes the tile pixmap straight from the pattern rect.
+	let pattern = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<defs><pattern id="p" width="60000" height="60000"><rect width="1" height="1"/></pattern></defs>
+		<rect width="100" height="100" fill="url(#p)"/>"#,
+	);
+	assert!(thumb(Box::new(MemSource(pattern)), &spec(64)).is_err());
+	// The same pattern behind a long namespace prefix. The byte scan reads the
+	// local name out of a fixed 64-byte window, so a prefix long enough to push
+	// `pattern` past it used to hide the element from the refusal above — while
+	// usvg, which resolves by namespace URI, still saw a real `<pattern>` and
+	// tried to allocate its tile. That was an ABORT, not an error: a failed
+	// allocation of 163 TB, uncatchable, taking the whole process with it.
+	let prefix = "n".repeat(70);
+	let prefixed = svg_doc(
+		r#"width="100" height="100""#,
+		&format!(
+			r#"<defs><{p}:pattern xmlns:{p}="http://www.w3.org/2000/svg" id="p"
+			 width="60000" height="60000"><rect width="1" height="1"/></{p}:pattern></defs>
+			<rect width="100" height="100" fill="url(#p)"/>"#,
+			p = prefix
+		),
+	);
+	let err = thumb(Box::new(MemSource(prefixed)), &spec(64))
+		.expect_err("a namespace-prefixed <pattern> must be refused, not aborted on");
+	assert!(
+		err.to_string().contains("<pattern> is refused"),
+		"expected the pattern refusal, got {err}"
+	);
+
+	// A filter chain past the primitive cap.
+	let mut filters = String::from(r#"<filter id="f">"#);
+	for _ in 0..80 {
+		filters.push_str(r#"<feGaussianBlur stdDeviation="2"/>"#);
+	}
+	filters.push_str("</filter>");
+	let heavy = svg_doc(r#"width="100" height="100""#, &filters);
+	assert!(thumb(Box::new(MemSource(heavy)), &spec(64)).is_err());
+
+	// Nested full-canvas opacity groups: every level is an isolated layer
+	// with its own sub-pixmap, concurrent with all its ancestors' — the
+	// walk must refuse the stack before resvg allocates it.
+	let mut body = String::new();
+	for _ in 0..24 {
+		body.push_str(r#"<g opacity="0.5">"#);
+	}
+	body.push_str(r#"<rect width="100" height="100" fill="red"/>"#);
+	for _ in 0..24 {
+		body.push_str("</g>");
+	}
+	let stack = svg_doc(r#"width="100" height="100""#, &body);
+	assert!(thumb(Box::new(MemSource(stack)), &spec(64)).is_err());
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_use_sprites_decode_and_use_bombs_do_not() {
+	// The idiom `<use>` exists for: define once in <defs>, place by reference.
+	// It used to be refused outright, which cost every icon sprite in the
+	// world its thumbnail.
+	let icon = svg_doc(
+		r#"width="100" height="100""#,
+		r##"<defs><g id="i"><rect width="100" height="100" fill="red"/></g></defs>
+		<use href="#i"/>"##,
+	);
+	let result = thumb(Box::new(MemSource(icon)), &spec(64))
+		.unwrap()
+		.expect("a use/defs sprite must thumbnail");
+	assert_eq!(&result.rgba[..4], &[255, 0, 0, 255]);
+
+	// A non-recursive doubling chain: each level copies the previous one
+	// twice, so 24 levels of ~40 bytes expand to 2^24 nodes. usvg's only
+	// backstop (1M tree nodes) fires hundreds of megabytes too late, so the
+	// refusal has to come from the pre-pass — assert on ITS message, or
+	// usvg's own late error would satisfy this test without proving anything.
+	let mut body = String::from(r#"<g id="g0"><rect width="8" height="8"/></g>"#);
+	for level in 1..24 {
+		let prev = level - 1;
+		body.push_str(&format!(
+			r##"<g id="g{level}"><use href="#g{prev}"/><use href="#g{prev}"/></g>"##
+		));
+	}
+	body.push_str(r##"<use href="#g23"/>"##);
+	let bomb = svg_doc(r#"width="100" height="100""#, &body);
+	let err = thumb(Box::new(MemSource(bomb)), &spec(64)).expect_err("a use bomb must be refused");
+	assert!(
+		err.to_string().contains("expansion past the node budget"),
+		"expected the pre-pass, got {err}"
+	);
+
+	// A cycle has no fixed point at all.
+	let loopy = svg_doc(
+		r#"width="100" height="100""#,
+		r##"<g id="a"><g id="b"><use href="#a"/></g></g><use href="#b"/>"##,
+	);
+	let err =
+		thumb(Box::new(MemSource(loopy)), &spec(64)).expect_err("recursive use must be refused");
+	assert!(
+		err.to_string().contains("recursive <use>"),
+		"expected the cycle guard, got {err}"
+	);
+}
+
+/// Every reference edge but `<use>`'s href used to reach usvg unguarded, and
+/// usvg's own defence only reaches self-links and 2-cycles.
+#[cfg(feature = "svg")]
+#[test]
+fn svg_reference_cycles_are_refused_before_usvg_sees_them() {
+	// Three masks in a ring: 285 bytes, and usvg's `fix_recursive_links` —
+	// which walks a node's descendants plus one hop — does not see it. This
+	// died with `fatal runtime error: stack overflow`, an ABORT rather than a
+	// catchable panic, so a regression here takes the test binary with it
+	// exactly the way it takes an iOS file-provider extension.
+	let cycle = |element: &str, attr: &str, body: &str| {
+		let mut defs = String::new();
+		for (id, next) in [("a", "b"), ("b", "c"), ("c", "a")] {
+			defs.push_str(&format!(
+				r##"<{element} id="{id}" {attr}="url(#{next})">{body}</{element}>"##
+			));
+		}
+		svg_doc(
+			r#"width="100" height="100""#,
+			&format!(r##"<defs>{defs}</defs><rect width="99" height="99" {attr}="url(#a)"/>"##),
+		)
+	};
+	for (element, attr, body) in [
+		(
+			"mask",
+			"mask",
+			r##"<rect width="99" height="99" fill="#fff"/>"##,
+		),
+		("clipPath", "clip-path", r#"<rect width="99" height="99"/>"#),
+	] {
+		let err = thumb(Box::new(MemSource(cycle(element, attr, body))), &spec(64))
+			.expect_err("a three-element reference cycle must be refused");
+		assert!(
+			err.to_string().contains("recursive reference"),
+			"expected the reference-cycle guard, got {err}"
+		);
+	}
+
+	// Paint servers chain through `href`, and usvg's `HrefIter` rejects only
+	// the first and current node — a cycle among the ones between spins at
+	// 100% CPU and never returns.
+	let gradients = svg_doc(
+		r#"xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100""#,
+		r##"<defs><linearGradient id="a" xlink:href="#b"/><linearGradient id="b" xlink:href="#c"/>
+		<linearGradient id="c" xlink:href="#b"/></defs>
+		<rect width="99" height="99" fill="url(#a)"/>"##,
+	);
+	let err = thumb(Box::new(MemSource(gradients)), &spec(64))
+		.expect_err("a gradient href cycle must be refused");
+	assert!(
+		err.to_string().contains("recursive reference"),
+		"expected the reference-cycle guard, got {err}"
+	);
+
+	// The same ring written as CSS aborts identically, and no walk of the
+	// attributes can see it — usvg applies the stylesheet before anything
+	// here does.
+	let styled = svg_doc(
+		r#"width="100" height="100""#,
+		r##"<style>#a{mask:url(#b)}#b{mask:url(#c)}#c{mask:url(#a)}</style>
+		<defs><mask id="a"><rect width="99" height="99" fill="#fff"/></mask>
+		<mask id="b"><rect width="99" height="99" fill="#fff"/></mask>
+		<mask id="c"><rect width="99" height="99" fill="#fff"/></mask></defs>
+		<rect width="99" height="99" mask="url(#a)"/>"##,
+	);
+	let err = thumb(Box::new(MemSource(styled)), &spec(64))
+		.expect_err("a stylesheet-declared mask cycle must be refused");
+	assert!(
+		err.to_string().contains("stylesheet"),
+		"expected the stylesheet guard, got {err}"
+	);
+
+	// No cycle at all, and just as fatal: usvg resolves each link recursively,
+	// so a long CHAIN is a stack depth. 5000 links aborted; the threshold on
+	// the 2 MiB stack a decode thread gets sits between 400 and 800.
+	let mut defs = String::new();
+	for level in 0..600 {
+		defs.push_str(&format!(
+			r##"<mask id="m{level}"><rect width="9" height="9" fill="#fff"
+			 mask="url(#m{})"/></mask>"##,
+			level + 1
+		));
+	}
+	defs.push_str(r##"<mask id="m600"><rect width="9" height="9" fill="#fff"/></mask>"##);
+	let chain = svg_doc(
+		r#"width="100" height="100""#,
+		&format!(r##"<defs>{defs}</defs><rect width="99" height="99" mask="url(#m0)"/>"##),
+	);
+	let err = thumb(Box::new(MemSource(chain)), &spec(64))
+		.expect_err("a 600-link mask chain must be refused");
+	assert!(
+		err.to_string().contains("chained deeper"),
+		"expected the chain-depth guard, got {err}"
+	);
+
+	// And the shape every export in the world has — a full-canvas clip, a
+	// mask, a gradient that inherits from another gradient through `href`, and
+	// a `<use>` — is not a cycle and must still thumbnail.
+	let export = svg_doc(
+		r#"xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200"
+		 viewBox="0 0 200 200""#,
+		r##"<g clip-path="url(#clip0)"><rect width="200" height="200" fill="url(#paint0)"/>
+		<g mask="url(#mask0)"><path d="M10 10L190 190" stroke="url(#paint1)"/></g>
+		<use xlink:href="#icon" x="20"/></g>
+		<defs><g id="icon"><circle cx="10" cy="10" r="8" fill="red"/></g>
+		<clipPath id="clip0"><rect width="200" height="200"/></clipPath>
+		<mask id="mask0"><rect width="200" height="200" fill="#fff"/></mask>
+		<linearGradient id="paint0"><stop stop-color="#f00"/><stop offset="1" stop-color="#00f"/>
+		</linearGradient>
+		<linearGradient id="paint1" xlink:href="#paint0" x1="0" y1="0" x2="1" y2="1"/></defs>"##,
+	);
+	thumb(Box::new(MemSource(export)), &spec(256))
+		.unwrap()
+		.expect("an ordinary export must thumbnail");
+
+	// A stylesheet naming a GRADIENT is the common case and stays untouched:
+	// gradients carry no mask or clip-path to recurse through.
+	let css_paint = svg_doc(
+		r#"width="200" height="200""#,
+		r##"<style>.a{fill:url(#g);stroke:url(#g)}</style>
+		<defs><linearGradient id="g"><stop stop-color="#0f0"/>
+		<stop offset="1" stop-color="#00f"/></linearGradient></defs>
+		<rect class="a" width="200" height="200"/>"##,
+	);
+	thumb(Box::new(MemSource(css_paint)), &spec(64))
+		.unwrap()
+		.expect("a stylesheet naming a gradient must thumbnail");
+}
+
+/// A percentage resolves against the viewport of the `<svg>` it sits in, and
+/// usvg swaps that for every NESTED `<svg>` — so the pre-pass reading only the
+/// root's handed the radius guard a viewport 34 orders of magnitude too small.
+#[cfg(feature = "svg")]
+#[test]
+fn svg_nested_viewports_cannot_smuggle_a_giant_radius() {
+	// 120 bytes, and the identical viewBox on the ROOT was already refused.
+	let smuggled = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<svg viewBox="0 0 1e36 1e36"><ellipse rx="50%" ry="50%"/></svg>"#,
+	);
+	let err = thumb(Box::new(MemSource(smuggled)), &spec(64))
+		.expect_err("a nested viewBox must not smuggle a radius past the guard");
+	assert!(
+		err.to_string().contains("shape radius"),
+		"expected the arc-vertex guard, got {err}"
+	);
+
+	// `width`/`height` on the nested `<svg>` is the same viewport by another
+	// spelling.
+	let sized = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<svg width="1e34" height="1e34"><ellipse rx="50%" ry="50%"/></svg>"#,
+	);
+	assert!(
+		thumb(Box::new(MemSource(sized)), &spec(64)).is_err(),
+		"a nested width/height must not smuggle a radius past the guard"
+	);
+
+	// An ordinary nested viewport — the idiom for placing a sub-drawing —
+	// still thumbnails.
+	let ordinary = svg_doc(
+		r#"width="200" height="200""#,
+		r##"<svg x="10" y="10" width="100" height="100" viewBox="0 0 50 50">
+		<ellipse cx="25" cy="25" rx="50%" ry="40%" fill="orange"/></svg>
+		<rect width="20" height="20" fill="green"/>"##,
+	);
+	thumb(Box::new(MemSource(ordinary)), &spec(64))
+		.unwrap()
+		.expect("an ordinary nested viewport must thumbnail");
+}
+
+/// usvg copies the RESOLVED filter chain into every group it applies to, so a
+/// `<use>` fan-out multiplies the primitives the byte scan counted once.
+#[cfg(feature = "svg")]
+#[test]
+fn svg_filter_chains_are_charged_per_copy() {
+	let primitives: String = (0..64)
+		.map(|i| format!(r#"<feGaussianBlur stdDeviation="{}"/>"#, 1 + i % 3))
+		.collect();
+
+	// 130 KB of document: 8000 copies of one filtered group. It returned a
+	// thumbnail, at a 164 MiB peak — and raising the target until the
+	// post-parse layer walk fired refused it only after peaking at 40 MiB,
+	// because that walk runs on the PARSED tree. Only the pre-pass is early
+	// enough.
+	for placement in ["filtered group", "filter on the use"] {
+		let (on_group, on_use) = match placement {
+			"filtered group" => (r#" filter="url(#f)""#, ""),
+			_ => ("", r#" filter="url(#f)""#),
+		};
+		let body = format!(
+			r##"<defs><filter id="f">{primitives}</filter>
+			<g id="p"{on_group}><rect width="9" height="9" fill="red"/></g></defs>{}"##,
+			format!(r##"<use href="#p"{on_use}/>"##).repeat(8000)
+		);
+		let bomb = svg_doc(r#"width="100" height="100""#, &body);
+		let err = thumb(Box::new(MemSource(bomb)), &spec(64))
+			.expect_err("a filter fan-out must be refused");
+		assert!(
+			err.to_string().contains("expansion past the node budget"),
+			"expected the pre-pass ({placement}), got {err}"
+		);
+	}
+
+	// A drop shadow on fifty shapes is what filters are for, as an attribute
+	// and as a stylesheet rule.
+	let shadow = r#"<feDropShadow dx="2" dy="2" stdDeviation="2"/><feGaussianBlur
+		stdDeviation="1"/><feOffset dx="1"/><feMerge><feMergeNode/></feMerge>"#;
+	let rects = |attrs: &str| {
+		(0..50)
+			.map(|i: u32| {
+				format!(
+					r#"<rect x="{}" y="{}" width="18" height="18" fill="teal"{attrs}/>"#,
+					i % 10 * 20,
+					i / 10 * 20
+				)
+			})
+			.collect::<String>()
+	};
+	for (what, style, attrs) in [
+		("attribute", "", r#" filter="url(#f)""#),
+		("stylesheet", r#"<style>rect{filter:url(#f)}</style>"#, ""),
+	] {
+		let ordinary = svg_doc(
+			r#"width="200" height="200""#,
+			&format!(
+				r##"{style}<defs><filter id="f">{shadow}</filter></defs>{}"##,
+				rects(attrs)
+			),
+		);
+		thumb(Box::new(MemSource(ordinary)), &spec(64))
+			.unwrap()
+			.unwrap_or_else(|| panic!("fifty drop shadows ({what}) must thumbnail"));
+	}
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_marker_bombs_are_refused_and_arrow_diagrams_are_not() {
+	// usvg copies a marker's subtree once per path vertex, DURING the parse,
+	// with no cap — a sub-megabyte document peaked at a quarter of a gigabyte.
+	// With `overflow="visible"` on the marker the post-parse layer walk does
+	// not even fire, so the pre-pass is the only thing standing there.
+	for marker_attrs in ["", r#" overflow="visible""#] {
+		let mut d = String::from("M0,0");
+		for i in 0..50_000u32 {
+			d.push_str(&format!("L{},{}", 10 + i % 80, 10 + i % 70));
+		}
+		let bomb = svg_doc(
+			r#"width="100" height="100""#,
+			&format!(
+				r##"<defs><marker id="m" markerWidth="9" markerHeight="9"{marker_attrs}>
+				<circle cx="4" cy="4" r="4" fill="red"/></marker></defs>
+				<path d="{d}" fill="none" stroke="black" marker-mid="url(#m)"/>"##
+			),
+		);
+		let err =
+			thumb(Box::new(MemSource(bomb)), &spec(64)).expect_err("a marker bomb must be refused");
+		assert!(
+			err.to_string().contains("expansion past the node budget"),
+			"expected the pre-pass, got {err}"
+		);
+	}
+
+	// The whole point of markers: a five-vertex arrow diagram still renders.
+	// (usvg wraps every marker copy in a clipped group, so this also pins the
+	// layer allowance being charged honestly rather than by keyword.)
+	let arrows = svg_doc(
+		r#"width="100" height="100""#,
+		r##"<defs><marker id="a" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+		<path d="M0,0 L6,3 L0,6 z" fill="red"/></marker></defs>
+		<path d="M10,10 L30,30 L50,10 L70,30 L90,10" fill="none" stroke="red" stroke-width="3"
+		 marker-start="url(#a)" marker-mid="url(#a)" marker-end="url(#a)"/>"##,
+	);
+	let result = thumb(Box::new(MemSource(arrows)), &spec(64))
+		.unwrap()
+		.expect("an arrow diagram must thumbnail");
+	assert!(
+		mean_channel(&result.rgba, 0) > 0,
+		"the arrows rendered as nothing"
+	);
+}
+
+/// A `<use>` doubling chain — 24 levels, 2^24 nodes — whose links are spelled
+/// by `tmpl`. Only the spelling varies; every one of these resolves for usvg.
+#[cfg(feature = "svg")]
+fn svg_use_chain(tmpl: &str) -> Vec<u8> {
+	let mut body = String::from(r#"<g id="tiny"/><g id="g0"><rect width="8" height="8"/></g>"#);
+	for level in 1..24 {
+		let link = tmpl.replace("{PREV}", &format!("g{}", level - 1));
+		body.push_str(&format!(r#"<g id="g{level}">{link}{link}</g>"#));
+	}
+	body.push_str(&tmpl.replace("{PREV}", "g23"));
+	svg_doc(
+		r#"xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:z="http://example.com/z"
+		 width="100" height="100""#,
+		&body,
+	)
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_use_links_are_resolved_the_way_usvg_resolves_them() {
+	// roxmltree matches an attribute by LOCAL name and answers whichever comes
+	// first, and `strip_prefix('#')` is not what `svgtypes::IRI` does. Each of
+	// these four spellings resolves for usvg while the pre-pass saw no link at
+	// all: 1.4 KB of document, 91 MiB of expansion, and only usvg's own
+	// (far too late) node limit to end it. Pin the PRE-PASS message — usvg's
+	// backstop would satisfy an `is_err` without proving anything.
+	for tmpl in [
+		// An xlink decoy in front of the real, unprefixed href.
+		r##"<use xlink:href="#tiny" href="#{PREV}"/>"##,
+		// The same trick with a foreign namespace, which usvg drops entirely.
+		r##"<use z:href="#tiny" href="#{PREV}"/>"##,
+		// `IRI` skips leading whitespace; XML normalisation turns the newline
+		// of a pretty-printed sprite into exactly this space.
+		r##"<use href=" #{PREV}"/>"##,
+		// And the same space spelled as a character reference.
+		r##"<use href="&#32;#{PREV}"/>"##,
+		// The plain spelling, as a control: it was already costed.
+		r##"<use href="#{PREV}"/>"##,
+	] {
+		let err = thumb(Box::new(MemSource(svg_use_chain(tmpl))), &spec(64))
+			.expect_err("a use bomb must be refused however its href is spelled");
+		assert!(
+			err.to_string().contains("expansion past the node budget"),
+			"expected the pre-pass for {tmpl}, got {err}"
+		);
+	}
+
+	// The flip side: those spellings are how real sprites are written, and
+	// they still have to resolve to a picture.
+	let sprite = svg_doc(
+		r#"xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100""#,
+		r##"<defs><g id="i"><rect width="100" height="100" fill="red"/></g></defs>
+		<use xlink:href="#i"/><use href=" #i"/>"##,
+	);
+	let result = thumb(Box::new(MemSource(sprite)), &spec(64))
+		.unwrap()
+		.expect("an xlink/whitespace sprite must thumbnail");
+	assert_eq!(&result.rgba[..4], &[255, 0, 0, 255]);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_marker_copies_are_costed_per_copy_and_per_shape() {
+	// (a) usvg re-runs marker expansion for every `<use>` copy of a path, so
+	// the cost is the PRODUCT of the fan-out and the vertices — charging the
+	// vertices once per source element missed 168 MiB of it.
+	let mut d = String::from("M0,0");
+	for i in 0..2000u32 {
+		d.push_str(&format!("L{},{}", 1 + i % 9, 1 + i % 7));
+	}
+	let mut body = String::from(
+		r##"<defs><marker id="m" markerWidth="9" markerHeight="9" overflow="visible">
+		<circle cx="4" cy="4" r="4" fill="red"/></marker></defs>"##,
+	);
+	body.push_str(&format!(
+		r##"<g id="p"><path d="{d}" fill="none" stroke="black" marker-mid="url(#m)"/></g>"##
+	));
+	body.push_str(&r##"<use href="#p"/>"##.repeat(100));
+	let err = thumb(
+		Box::new(MemSource(svg_doc(r#"width="100" height="100""#, &body))),
+		&spec(64),
+	)
+	.expect_err("marker copies per <use> copy must be costed");
+	assert!(
+		err.to_string().contains("expansion past the node budget"),
+		"expected the pre-pass, got {err}"
+	);
+
+	// (b) usvg blocks only a marker that is its OWN ancestor, so a marker
+	// whose path carries a SECOND marker is copied once per vertex per vertex
+	// — 4 KB of document, 169 MiB, perfectly quadratic. There is no fixed
+	// point to solve for, so the document is refused.
+	let mut inner = String::from("M0,0");
+	for i in 0..450u32 {
+		inner.push_str(&format!("L{},{}", 1 + i % 9, 1 + i % 7));
+	}
+	let chain = format!(
+		r##"<defs>
+		<marker id="m2" markerWidth="9" markerHeight="9" overflow="visible">
+		<circle cx="1" cy="1" r="1" fill="red"/></marker>
+		<marker id="m1" markerWidth="9" markerHeight="9" overflow="visible">
+		<path d="{inner}" fill="none" stroke="black" marker-mid="url(#m2)"/></marker></defs>
+		<path d="{inner}" fill="none" stroke="black" marker-mid="url(#m1)"/>"##
+	);
+	let err = thumb(
+		Box::new(MemSource(svg_doc(r#"width="100" height="100""#, &chain))),
+		&spec(64),
+	)
+	.expect_err("a marker chain must be refused");
+	assert!(
+		err.to_string().contains("can itself carry a marker"),
+		"expected the chain guard, got {err}"
+	);
+
+	// (c) markers are not a path-only affair: usvg routes `<rect>`, `<circle>`
+	// and `<ellipse>` through the same conversion, and a marker inherited from
+	// an ancestor group reaches every one of them. Charging those zero let
+	// 120 KB of circles expand to 70 MiB.
+	for (count, shape) in [
+		(12_000, r#"<circle r="9"/>"#),
+		(5_000, r#"<rect width="9" height="9" rx="2"/>"#),
+		(5_000, r#"<ellipse rx="9" ry="5"/>"#),
+	] {
+		let mut body = String::from(
+			r##"<defs><marker id="m" markerWidth="9" markerHeight="9" overflow="visible">
+			<circle cx="4" cy="4" r="4" fill="red"/></marker></defs>
+			<g marker-mid="url(#m)" marker-start="url(#m)" marker-end="url(#m)" stroke="black">"##,
+		);
+		body.push_str(&shape.repeat(count));
+		body.push_str("</g>");
+		let err = thumb(
+			Box::new(MemSource(svg_doc(r#"width="100" height="100""#, &body))),
+			&spec(64),
+		)
+		.expect_err("a built-shape marker bomb must be refused");
+		assert!(
+			err.to_string().contains("expansion past the node budget"),
+			"expected the pre-pass for {shape}, got {err}"
+		);
+	}
+
+	// (d) and one `<circle>` is enough on its own: kurbo subdivides an arc by
+	// its RADIUS, so `r="1e30"` — four characters — flattens into millions of
+	// segments, with or without a marker to copy onto them.
+	for body in [
+		r#"<circle r="1e30" stroke="black" fill="none"/>"#,
+		r##"<defs><marker id="m" markerWidth="9" markerHeight="9"><circle r="1"/></marker></defs>
+		<circle r="1e30" stroke="black" fill="none" marker-mid="url(#m)"/>"##,
+	] {
+		let err = thumb(
+			Box::new(MemSource(svg_doc(r#"width="100" height="100""#, body))),
+			&spec(64),
+		)
+		.expect_err("an absurd radius must be refused");
+		assert!(
+			err.to_string().contains("shape radius"),
+			"expected the radius guard, got {err}"
+		);
+	}
+
+	// (e) the same arc, struck from a `<path>` instead of a built shape.
+	// usvg hands `d`'s `A` commands to the SAME kurbo flattener, so charging
+	// a path only its digit runs let an eleven-character arc buy millions of
+	// segments. The chord has to scale with the radius or f64 rounding
+	// collapses the arc to nothing, which is why the naive spelling looks
+	// harmless.
+	for body in [
+		r#"<path d="M0,0A1e30,1e30 0 1 1 1e25,1e25" fill="none" stroke="black"/>"#,
+		r#"<path d="m0,0a1e30,1e30 0 1 1 1e25,1e25" fill="none" stroke="black"/>"#,
+	] {
+		let err = thumb(
+			Box::new(MemSource(svg_doc(r#"width="100" height="100""#, body))),
+			&spec(64),
+		)
+		.expect_err("an absurd path arc must be refused");
+		assert!(
+			err.to_string().contains("shape radius"),
+			"expected the radius guard for a path arc, got {err}"
+		);
+	}
+
+	// (f) a radius whose flattened vertex count saturates the counter. The
+	// count is only ever compared against a budget, so it must saturate
+	// rather than wrap: wrapping to a small number turned the guard above
+	// into a no-op, and the intermediate `+` panicked in debug builds.
+	for body in [
+		r#"<circle r="1e307" stroke="black" fill="none"/>"#,
+		r#"<ellipse rx="1e307" ry="1e307" stroke="black" fill="none"/>"#,
+		r#"<rect width="9" height="9" rx="1e307" stroke="black" fill="none"/>"#,
+		r#"<path d="M0,0A1e307,1e307 0 1 1 1e300,1e300" fill="none" stroke="black"/>"#,
+	] {
+		let err = thumb(
+			Box::new(MemSource(svg_doc(r#"width="100" height="100""#, body))),
+			&spec(64),
+		)
+		.expect_err("a saturating radius must be refused, not wrapped past the guard");
+		assert!(
+			err.to_string().contains("shape radius"),
+			"expected the radius guard, got {err}"
+		);
+	}
+
+	// (g) and none of that may cost a real icon its thumbnail. A detailed
+	// path carries far more than MAX_SHAPE_ARC_VERTICES coordinates, which is
+	// why only the ARC half of the charge may be measured against that cap —
+	// and a minified `d` runs its numbers together (`10-5` is two numbers,
+	// `1.2.3` is two more), which the scanner has to read as written rather
+	// than as one unparseable token.
+	let mut detailed = String::from(r#"<path fill="none" stroke="black" d="M0,0"#);
+	for n in 0..3000 {
+		detailed.push_str(&format!("l{}-{}", n % 7 + 1, n % 5 + 1));
+	}
+	detailed.push_str(r#"a10,10 0 1 1 5,5l1.2.3z"/>"#);
+	let result = thumb(
+		Box::new(MemSource(svg_doc(r#"width="100" height="100""#, &detailed))),
+		&spec(64),
+	)
+	.unwrap()
+	.expect("a detailed icon path with an ordinary arc must still thumbnail");
+	assert!(result.width > 0 && result.height > 0);
+
+	// None of which may cost an ordinary diagram its thumbnail: markers on a
+	// path, a percentage-sized background rect and a plain circle together.
+	let benign = svg_doc(
+		r#"width="100" height="100""#,
+		r##"<defs><marker id="a" markerWidth="6" markerHeight="6" orient="auto">
+		<path d="M0,0 L6,3 L0,6 z" fill="red"/></marker></defs>
+		<rect width="100%" height="100%" fill="white"/>
+		<circle cx="50" cy="50" r="20" fill="none" stroke="green"/>
+		<path d="M10,10 L30,30 L50,10" fill="none" stroke="red" stroke-width="3"
+		 marker-start="url(#a)" marker-mid="url(#a)" marker-end="url(#a)"/>"##,
+	);
+	let result = thumb(Box::new(MemSource(benign)), &spec(64))
+		.unwrap()
+		.expect("an ordinary marker diagram must thumbnail");
+	// The background alone is white, so a green mean above zero proves
+	// nothing — assert on what only the drawn elements can produce: the red
+	// marker/stroke pulls the red mean clear of the green one.
+	assert!(
+		mean_channel(&result.rgba, 0) > mean_channel(&result.rgba, 1),
+		"the diagram rendered as a bare background"
+	);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_dash_bombs_are_refused_and_dashed_borders_are_not() {
+	// tiny-skia gives up past a million dash segments per path — but it
+	// BUILDS up to that many first, and these ~200-byte documents get there:
+	// ~125 MB, and then a thumbnail as if nothing had happened. Both spellings
+	// reach the same stroke.
+	for dash in [
+		r#" stroke-dasharray="0.001 0.001""#,
+		r#" style="stroke-dasharray:0.001 0.001""#,
+	] {
+		let bomb = svg_doc(
+			r#"width="100" height="100""#,
+			&format!(r#"<path d="M0 0 L1000000 0" stroke="black" stroke-width="1"{dash}/>"#),
+		);
+		let err =
+			thumb(Box::new(MemSource(bomb)), &spec(64)).expect_err("a dash bomb must be refused");
+		assert!(
+			err.to_string().contains("stroke-dasharray"),
+			"expected the dash guard, got {err}"
+		);
+	}
+
+	// A dashed border is a few dozen dashes and has to keep working.
+	let border = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<rect x="5" y="5" width="90" height="90" fill="none" stroke="red" stroke-width="6"
+		 stroke-dasharray="6 4"/>"#,
+	);
+	let result = thumb(Box::new(MemSource(border)), &spec(64))
+		.unwrap()
+		.expect("a dashed border must thumbnail");
+	assert!(
+		mean_channel(&result.rgba, 0) > 0,
+		"the dashed border rendered as nothing"
+	);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_ordinary_layered_documents_are_not_refused() {
+	// A full-canvas clipPath is in essentially every Figma/Illustrator/
+	// Inkscape export, and it costs three pixmaps — layer, clip pixmap, mask.
+	// It used to be refused outright whenever the text happened not to
+	// mention an isolation keyword, and charged against a two-pixmap
+	// allowance when it did.
+	let clipped = svg_doc(
+		r#"width="100" height="100""#,
+		r##"<defs><clipPath id="c"><rect width="100" height="100"/></clipPath></defs>
+		<g clip-path="url(#c)"><rect width="100" height="100" fill="red"/></g>"##,
+	);
+	let result = thumb(Box::new(MemSource(clipped)), &spec(64))
+		.unwrap()
+		.expect("a clipPath document must thumbnail");
+	assert_eq!(&result.rgba[..4], &[255, 0, 0, 255]);
+
+	// Three nested full-canvas opacity groups: three concurrent layers.
+	let mut body = r#"<g opacity="0.8">"#.repeat(3);
+	body.push_str(r#"<rect width="100" height="100" fill="red"/>"#);
+	body.push_str(&"</g>".repeat(3));
+	let nested = svg_doc(r#"width="100" height="100""#, &body);
+	let result = thumb(Box::new(MemSource(nested)), &spec(64))
+		.unwrap()
+		.expect("three nested opacity groups must thumbnail");
+	assert!(mean_channel(&result.rgba, 0) > 100);
+
+	// And the verdict no longer turns on a word appearing in the text: the
+	// same flat document decodes identically with and without `opacity`
+	// written into a <desc>.
+	let plain = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<rect width="100" height="100" fill="red"/>"#,
+	);
+	let with_word = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<desc>exported at full opacity</desc><rect width="100" height="100" fill="red"/>"#,
+	);
+	assert_eq!(
+		thumb(Box::new(MemSource(plain)), &spec(64)).unwrap(),
+		thumb(Box::new(MemSource(with_word)), &spec(64)).unwrap(),
+		"a word in a <desc> changed the decode"
+	);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_deep_nesting_is_refused_before_anything_parses_it() {
+	// The XML layer under usvg recurses per level and overflows a 2 MiB
+	// worker stack (an abort, not a panic) long before usvg's own depth cap
+	// can answer — so the byte scan has to refuse first, and cheaply.
+	for depth in [4000usize, 20_000] {
+		let mut body = "<g>".repeat(depth);
+		body.push_str(r#"<rect width="10" height="10" fill="red"/>"#);
+		body.push_str(&"</g>".repeat(depth));
+		let bytes = svg_doc(r#"width="100" height="100""#, &body);
+		let err = thumb(Box::new(MemSource(bytes)), &spec(64))
+			.expect_err("a {depth}-deep nest must be refused");
+		assert!(
+			err.to_string().contains("nesting"),
+			"expected the depth guard, got {err}"
+		);
+	}
+	// Right up against the cap still renders, ON THE STACK THE DECODE REALLY
+	// GETS: 2 MiB is what a `spawn_blocking` worker (the mobile cache's decode
+	// thread) has, and the cap is only honest if the deepest document it lets
+	// through survives there. Test threads get 8 MiB, which would hide it.
+	let mut body = "<g>".repeat(1022);
+	body.push_str(r#"<rect width="100" height="100" fill="red"/>"#);
+	body.push_str(&"</g>".repeat(1022));
+	let bytes = svg_doc(r#"width="100" height="100""#, &body);
+	let rgba = std::thread::Builder::new()
+		.stack_size(2 * 1024 * 1024)
+		.spawn(move || {
+			thumb(Box::new(MemSource(bytes)), &spec(64))
+				.unwrap()
+				.expect("a nest at the cap is within what usvg accepts")
+				.rgba
+		})
+		.unwrap()
+		.join()
+		.unwrap();
+	assert_eq!(&rgba[..4], &[255, 0, 0, 255]);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_sizes_with_multi_byte_units_do_not_panic() {
+	// `rfind`-based unit splitting landed mid-char on these and panicked the
+	// slice — which on wasm is a module-killing trap. Each is unparseable, so
+	// the aspect falls through to the viewBox, then to square.
+	for attrs in [
+		r#"width="1é" height="5µ" viewBox="0 0 100 400""#,
+		r#"width="١٠" height="١٠" viewBox="0 0 100 400""#,
+		r#"width="10é""#,
+	] {
+		let bytes = svg_doc(attrs, r#"<rect width="100" height="400" fill="lime"/>"#);
+		let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+			.unwrap()
+			.expect("an unparseable size must fall through, not panic");
+		assert!(result.width >= 1 && result.height >= 1);
+	}
+	// The viewBox really is what decided the first two (1:4, not square).
+	let bytes = svg_doc(
+		r#"width="1é" height="5µ" viewBox="0 0 100 400""#,
+		r#"<rect width="100" height="400" fill="lime"/>"#,
+	);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(100))
+		.unwrap()
+		.expect("viewBox svg must thumbnail");
+	let ratio = f64::from(result.height) / f64::from(result.width);
+	assert!(
+		(3.8..=4.2).contains(&ratio),
+		"got {}x{}",
+		result.width,
+		result.height
+	);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_filter_primitives_are_counted_once_per_element() {
+	// Non-self-closing primitives used to be counted twice (the closing tag
+	// matched the `fe` prefix too), so 40 real primitives read as 80 and
+	// tripped the cap of 64.
+	let mut filters = String::from(r#"<defs><filter id="f">"#);
+	for _ in 0..40 {
+		filters.push_str(r#"<feGaussianBlur stdDeviation="2"></feGaussianBlur>"#);
+	}
+	filters.push_str("</filter></defs>");
+	let bytes = svg_doc(r#"width="100" height="100""#, &filters);
+	assert!(
+		thumb(Box::new(MemSource(bytes)), &spec(64))
+			.unwrap()
+			.is_some(),
+		"40 primitives are under the cap"
+	);
+
+	// Past the cap it is still refused, paired tags or not.
+	let mut filters = String::from(r#"<defs><filter id="f">"#);
+	for _ in 0..70 {
+		filters.push_str(r#"<feGaussianBlur stdDeviation="2"></feGaussianBlur>"#);
+	}
+	filters.push_str("</filter></defs>");
+	let bytes = svg_doc(r#"width="100" height="100""#, &filters);
+	let err = thumb(Box::new(MemSource(bytes)), &spec(64)).expect_err("70 primitives are refused");
+	assert!(
+		err.to_string().contains("filter primitives"),
+		"expected the primitive cap, got {err}"
+	);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_never_resolves_external_or_embedded_images() {
+	// A real red PNG on disk, referenced by absolute path: usvg's DEFAULT
+	// string resolver would read it — ours must not, so the render is the
+	// blue background alone. (Belt and braces: raster-images is off too.)
+	let png = encode(
+		&RgbImage::from_pixel(8, 8, Rgb([255, 0, 0])),
+		ImageFormat::Png,
+	);
+	let path = std::env::temp_dir().join("microthumb-svg-external-ref-test.png");
+	std::fs::write(&path, &png).unwrap();
+	let body = format!(
+		r#"<rect width="100" height="100" fill="blue"/><image href="{}" width="100" height="100"/>"#,
+		path.display()
+	);
+	let bytes = svg_doc(r#"width="100" height="100""#, &body);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("svg with an unresolvable image must still thumbnail");
+	std::fs::remove_file(&path).ok();
+	assert!(
+		mean_channel(&result.rgba, 0) < 10,
+		"the external file leaked into the render"
+	);
+	assert!(mean_channel(&result.rgba, 2) > 245);
+
+	// Same for an embedded data URI (a valid red 1×1 PNG, base64).
+	let body = r#"<rect width="100" height="100" fill="blue"/>
+		<image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==" width="100" height="100"/>"#;
+	let bytes = svg_doc(r#"width="100" height="100""#, body);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("svg with a data uri must still thumbnail");
+	assert!(
+		mean_channel(&result.rgba, 0) < 10,
+		"the data uri leaked into the render"
+	);
+}
+
+#[cfg(feature = "svg")]
+#[test]
+fn svg_text_renders_as_nothing() {
+	// No font database ships in this build; text elements drop silently
+	// rather than pulling system fonts into an untrusted decode.
+	let bytes = svg_doc(
+		r#"width="100" height="100""#,
+		r#"<rect width="100" height="100" fill="blue"/><text x="10" y="50" font-size="40" fill="red">HELLO</text>"#,
+	);
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("svg with text must thumbnail");
+	assert!(
+		mean_channel(&result.rgba, 0) < 10,
+		"text was rendered from somewhere"
+	);
+}
