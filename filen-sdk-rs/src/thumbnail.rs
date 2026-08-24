@@ -21,6 +21,10 @@ const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
 	"image/jpeg",
 	"image/png",
 	"image/qoi",
+	// Native only: the image crate cannot decode SVG, so wasm builds (which
+	// have no microthumb) keep refusing it up front.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	"image/svg+xml",
 	"image/tiff",
 	"image/webp",
 	"image/x-qoi",
@@ -62,9 +66,11 @@ pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
 /// `avif` is deliberately absent: this build has no AV1 decoder (see
 /// `heif-decoder`'s `hevc_decodes_avif_does_not`).
 const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
-	// Formats the pipeline decodes directly.
-	"bmp", "gif", "heic", "heif", "hif", "jfif", "jpe", "jpeg", "jpg", "png", "qoi", "tif", "tiff",
-	"webp", //
+	// Formats the pipeline decodes directly. `svgz` is deliberately absent:
+	// the pipeline refuses gzipped SVG (no inflate), so looking would cost a
+	// chunk and answer nothing.
+	"bmp", "gif", "heic", "heif", "hif", "jfif", "jpe", "jpeg", "jpg", "png", "qoi", "svg", "tif",
+	"tiff", "webp", //
 	// RAW: TIFF/BMFF containers, reached for their embedded preview.
 	"3fr", "arw", "cr2", "cr3", "dng", "erf", "iiq", "kdc", "mos", "mrw", "nef", "nrw", "orf",
 	"pef", "raf", "raw", "rw2", "rwl", "srf", "srw", "x3f",
@@ -84,7 +90,7 @@ const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
 /// a browser's `File.type`, say — which is the one case where the mime knows
 /// something the name does not.
 ///
-/// This is what keeps `svg`, `psd`, `dwg`, `tga` and friends out despite their
+/// This is what keeps `psd`, `dwg`, `tga` and friends out despite their
 /// `image/*` mimes, and `avif` out despite ours being correct: nothing here
 /// decodes them, so looking costs a chunk and answers nothing. It also means a
 /// file whose extension lies (`photo.xyz` holding a JPEG) is skipped even if
@@ -128,6 +134,16 @@ mod gate_tests {
 		));
 		// Uppercase is the norm straight off a camera.
 		assert!(might_be_thumbnailable(Some("IMG_1234.JPG"), None));
+		// SVG rasterises through the bounded pipeline; gzipped SVG does not
+		// (the pipeline refuses it), so svgz stays out.
+		assert!(might_be_thumbnailable(
+			Some("logo.svg"),
+			Some("image/svg+xml")
+		));
+		assert!(!might_be_thumbnailable(
+			Some("logo.svgz"),
+			Some("image/svg+xml")
+		));
 	}
 
 	#[test]
@@ -138,10 +154,6 @@ mod gate_tests {
 		assert!(might_be_thumbnailable(None, Some("image/png")));
 		// But an extension we cannot decode wins over its own correct mime —
 		// looking would cost a chunk to learn nothing.
-		assert!(!might_be_thumbnailable(
-			Some("logo.svg"),
-			Some("image/svg+xml")
-		));
 		assert!(!might_be_thumbnailable(
 			Some("photo.avif"),
 			Some("image/avif")
@@ -198,7 +210,45 @@ impl Client {
 		let image_data = self.download_file(file).await?;
 
 		runtime::do_cpu_intensive(|| {
-			let image = if mime == "image/heic" || mime == "image/heif" {
+			let image = if mime == "image/svg+xml" {
+				// The image crate has no SVG support; the bounded pipeline
+				// (native-only, hence the mime table gate) rasterises it.
+				#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+				{
+					let spec = microthumb::ThumbSpec::new(
+						max_width,
+						max_height,
+						microthumb::DEFAULT_MEM_BUDGET,
+					);
+					let thumb =
+						microthumb::generate(Box::new(microthumb::MemSource(image_data)), &spec)
+							.map_err(|e| Error::custom(ErrorKind::ImageError, e.to_string()))?
+							.ok_or_else(|| {
+								Error::custom(
+									ErrorKind::ImageError,
+									"no svg thumbnail within the memory budget".to_string(),
+								)
+							})?;
+					let rgba = image::RgbaImage::from_vec(
+						thumb.image.width,
+						thumb.image.height,
+						thumb.image.rgba,
+					)
+					.ok_or_else(|| {
+						Error::custom(
+							ErrorKind::ImageError,
+							"svg canvas has an inconsistent buffer".to_string(),
+						)
+					})?;
+					DynamicImage::ImageRgba8(rgba)
+				}
+				#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+				{
+					unreachable!(
+						"svg support is native-only, should be handled by is_supported_thumbnail_mime"
+					)
+				}
+			} else if mime == "image/heic" || mime == "image/heif" {
 				#[cfg(feature = "heif-decoder")]
 				{
 					DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_slice(
@@ -761,6 +811,26 @@ mod tests {
 			&mut out,
 		);
 		assert!(result.is_err(), "expected a hard error, got {result:?}");
+	}
+
+	#[test]
+	fn svg_rasterises_through_the_bounded_pipeline() {
+		let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red"/></svg>"#.to_vec();
+		let len = bytes.len() as u64;
+		let mut out = Vec::new();
+		let result = make_thumbnail(
+			Some("image/svg+xml"),
+			len,
+			Cursor::new(bytes),
+			32,
+			32,
+			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
+			&mut out,
+		)
+		.unwrap();
+		let info = result.expect("an svg thumbnail");
+		assert_eq!((info.width, info.height), (32, 32));
+		assert!(!out.is_empty());
 	}
 
 	#[test]
