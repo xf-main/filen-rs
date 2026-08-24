@@ -703,6 +703,14 @@ unsafe extern "C" fn read_impl<T: Read + Seek>(
 	size: usize,
 	userdata: *mut c_void,
 ) -> c_int {
+	// A zero-length read is a no-op, and libheif does ask for them with a null
+	// pointer: `std::vector::data()` on an empty vector is allowed to return
+	// null, which is exactly what `Box_av1C::parse` hands over for an av1C
+	// with no trailing config OBUs — i.e. for most AVIF files. Answering -1
+	// there fails the whole container parse with "unexpected end of file".
+	if size == 0 {
+		return 0;
+	}
 	// from_raw_parts_mut requires a non-null pointer even for size == 0;
 	// libheif treats any non-zero return as a read failure
 	if data.is_null() {
@@ -899,6 +907,21 @@ mod api_tests {
 			)
 		};
 		assert_eq!(result, -1);
+	}
+
+	#[test]
+	fn read_impl_accepts_a_zero_length_read_through_a_null_pointer() {
+		// What libheif's av1C parse does for a config with no trailing OBUs.
+		// Refusing it fails the container parse of most AVIF files.
+		let mut reader = HeifReader::new(Cursor::new(Vec::<u8>::new()), 0);
+		let result = unsafe {
+			read_impl::<Cursor<Vec<u8>>>(
+				std::ptr::null_mut(),
+				0,
+				&mut reader as *mut _ as *mut c_void,
+			)
+		};
+		assert_eq!(result, 0);
 	}
 
 	#[test]
