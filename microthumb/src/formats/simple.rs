@@ -91,6 +91,12 @@ impl PreparedDecode for PreparedSimple {
 	fn peak_estimate(&self) -> usize {
 		// Full RGBA frame plus roughly one more copy inside the decoder /
 		// DynamicImage conversion. Honest, so the budget can refuse it.
+		//
+		// Measured against the counting allocator (7 MP sources): 7.1 B/px
+		// when the frame arrives as RGB and `into_rgba8` copies it, 4.1 B/px
+		// when it already is RGBA. 8 covers both with a little room — worth
+		// keeping, since this is the estimate an iOS extension is held to and
+		// under-charging there is an OOM, not a missing thumbnail.
 		let px = self.dims.0 as usize * self.dims.1 as usize;
 		px.saturating_mul(8)
 	}

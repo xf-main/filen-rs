@@ -23,6 +23,27 @@ use crate::sink::accumulator_bytes;
 /// after the host process' own baseline.
 pub const DEFAULT_MEM_BUDGET: usize = 12 * 1024 * 1024;
 
+/// Decode budget for a browser tab, which has no 20 MB jetsam ceiling: wasm
+/// linear memory is capped at 1 GiB by the linker and is never returned to the
+/// host, so the number to bound is the process high-water mark, not a
+/// per-decode kill threshold. 64 MiB admits the whole-frame formats (WebP, QOI,
+/// BMP, GIF, TIFF — see `formats::simple`, which charges 8 bytes per source
+/// pixel) up to ~8.4 MP, where the 12 MiB default refuses anything past
+/// ~1.5 MP. Anything larger in those formats still answers `Ok(None)`: 8 B/px
+/// is what they really cost (measured: 7.1 B/px for a 7 MP lossless WebP or
+/// QOI whose frame arrives as RGB and is copied to RGBA, 4.1 B/px when it
+/// arrives as RGBA), and buying a bigger ceiling would mean spending it.
+///
+/// The streaming formats (JPEG, PNG, HEIF) do NOT stay flat across the two
+/// budgets: their decoders do, but [`canvas_dims`] spends what the decoder
+/// leaves, so the accumulator grows until the 2× oversample of the request or
+/// [`MAX_CANVAS_LONG_SIDE`] binds. A 24 MP PNG at a 512 px request measured
+/// 10.3 MiB at the 12 MiB budget and 24.4 MiB at this one — a better
+/// thumbnail for the memory, and still a third of what its whole frame would
+/// have cost. Three concurrent decodes — the practical ceiling on a thumbnail
+/// grid — are bounded at ~192 MiB of that 1 GiB.
+pub const BROWSER_MEM_BUDGET: usize = 64 * 1024 * 1024;
+
 /// The accumulator canvas never exceeds this on its long side — oversampling
 /// past ~2× the largest sane thumbnail target buys nothing. (The budget cap
 /// in [`canvas_dims`] usually binds first, at the per-pixel canvas cost

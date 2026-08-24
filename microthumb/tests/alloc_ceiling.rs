@@ -375,6 +375,59 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 		"24 MP bmp peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
 	);
 
+	// The whole-frame path (`formats::simple`) has no streaming to fall back
+	// on: its estimate IS the guard, so what it charges has to stay above what
+	// the decode really takes. 7 MP is just under what the browser budget buys
+	// at 8 bytes a source pixel; the peak must fit that budget AND stay under
+	// the charge, or the estimate is a fiction on the host that has no jetsam
+	// to catch it.
+	let px = 3200usize * 2200;
+	let frame = RgbImage::from_fn(3200, 2200, |x, y| {
+		Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+	});
+	for format in [ImageFormat::WebP, ImageFormat::Qoi] {
+		let mut bytes = Vec::new();
+		frame
+			.write_to(&mut Cursor::new(&mut bytes), format)
+			.unwrap();
+		// At a real request the accumulator canvas is a big share of the peak
+		// and is budgeted SEPARATELY from the decoder's estimate, so the
+		// budget is what this run pins.
+		let browser = ThumbSpec::new(512, 512, microthumb::BROWSER_MEM_BUDGET);
+		// Cloned OUTSIDE the window: the source bytes belong to the baseline,
+		// not to the decode being measured.
+		let copy = bytes.clone();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(copy)), &browser));
+		result
+			.unwrap()
+			.unwrap_or_else(|| panic!("7 MP {format:?} must thumbnail inside the browser budget"));
+		eprintln!("7 MP {format:?} peak at 512: {peak} bytes");
+		assert!(
+			peak <= microthumb::BROWSER_MEM_BUDGET,
+			"7 MP {format:?} peaked at {peak} bytes (budget {})",
+			microthumb::BROWSER_MEM_BUDGET
+		);
+		// And at a small request, where the canvas is a rounding error, what
+		// is left IS the decode — which must stay under what it was charged.
+		let (result, peak) = measured_peak(|| {
+			thumb(
+				Box::new(MemSource(bytes)),
+				&ThumbSpec::new(64, 64, microthumb::BROWSER_MEM_BUDGET),
+			)
+		});
+		result.unwrap().expect("7 MP must thumbnail at 64 px too");
+		eprintln!(
+			"7 MP {format:?} decode peak: {peak} bytes ({} B/px, charged 8)",
+			peak / px
+		);
+		assert!(
+			peak <= px * 8,
+			"7 MP {format:?} decode peaked at {peak} bytes, past the {} its estimate charges",
+			px * 8
+		);
+	}
+	drop(frame);
+
 	#[cfg(feature = "svg")]
 	svg_cases();
 
