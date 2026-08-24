@@ -751,9 +751,11 @@ test("thumbnail", async () => {
 		})
 	)
 
-	// avif does not currently work: the wasm libheif build carries no AV1
-	// decoder (see heif-decoder's hevc_decodes_avif_does_not)
-	expect(completed).not.toContainEqual("avif")
+	// avif works here because libheif's AV1 backend is dav1d, which contains no
+	// setjmp/longjmp — the thing that kept libaom out of the browser, since on
+	// wasm setjmp needs the exception-handling proposal and wasm-bindgen cannot
+	// round-trip the tag that leaves behind. See heif-decoder's build_dav1d.
+	expect(completed).toContainEqual("avif")
 	expect(completed).toContainEqual("gif")
 	expect(completed).toContainEqual("heif")
 	expect(completed).toContainEqual("jpg")

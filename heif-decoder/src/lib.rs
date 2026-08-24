@@ -215,17 +215,30 @@ impl Drop for ImageHandle<'_> {
 
 /// Decoding options handed to every libheif decode call.
 ///
-/// Native targets pass NULL and take libheif's defaults (worker threads
-/// help there). On wasm no thread can ever start, and libde265's pool
-/// startup ignores the pthread_create failure while still marking the
-/// context threaded — a WPP- or tile-coded bitstream would then queue work
-/// on a pool with no workers and deadlock. `num_codec_threads = -1` makes
-/// the libde265 plugin skip pool startup entirely, so every decode takes
-/// the sequential path.
+/// Native targets pass NULL and take libheif's defaults (worker threads help
+/// there). On wasm no thread can ever start, and the two codec plugins want
+/// OPPOSITE things from the one field libheif has for this:
+///
+/// - libde265's plugin turns 0 into 1 and hands the result to
+///   `de265_start_worker_threads`. Pool startup ignores the failed
+///   `pthread_create`, while `decoder_context::start_thread_pool` records the
+///   context as threaded regardless — a WPP- or tile-coded bitstream would
+///   then queue work on a pool with no workers and deadlock. Only a NEGATIVE
+///   count makes it skip pool startup entirely.
+/// - dav1d's plugin assigns the same value straight into
+///   `Dav1dSettings::n_threads`, and `dav1d_open` REJECTS anything negative
+///   (`validate_input_or_ret(s->n_threads >= 0 …)`), failing every AVIF decode
+///   with a plugin error. 0 means "auto", i.e. ask the host for a processor
+///   count no browser module can honour; 1 is the single-threaded answer.
+///
+/// So the count is picked per file: -1 whenever the file carries an HEVC item,
+/// 1 otherwise. A file carrying both (legal, and not something any encoder
+/// produces) loses its AVIF decode rather than risking the deadlock, which is
+/// the safe direction to be wrong in.
 struct DecodeOptions(*mut heif_decoding_options);
 
 impl DecodeOptions {
-	fn for_target() -> Result<Self, HeifError> {
+	fn for_handle(handle: &ImageHandle) -> Result<Self, HeifError> {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
 			// SAFETY: alloc fills in defaults and the current options version;
@@ -239,11 +252,12 @@ impl DecodeOptions {
 					"could not allocate decoding options",
 				));
 			}
-			unsafe { (*options).num_codec_threads = -1 };
+			unsafe { (*options).num_codec_threads = wasm_codec_threads(handle) };
 			Ok(DecodeOptions(options))
 		}
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
+			let _ = handle;
 			Ok(DecodeOptions(std::ptr::null_mut()))
 		}
 	}
@@ -251,6 +265,40 @@ impl DecodeOptions {
 	fn as_ptr(&self) -> *const heif_decoding_options {
 		self.0
 	}
+}
+
+/// The `num_codec_threads` [`DecodeOptions`] must pass for this file: -1 while
+/// any HEVC item is present, 1 otherwise. See [`DecodeOptions`] for why the
+/// two plugins cannot share one value.
+///
+/// Asked per decode rather than per session because the tile path decodes
+/// through a handle too, and a grid's own item type says nothing about the
+/// codec of its tiles — the item list does.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn wasm_codec_threads(handle: &ImageHandle) -> c_int {
+	/// The `infe` item type libheif dispatches to libde265
+	/// (`Decoder::alloc_for_infe_type`); AV1 items are `av01`.
+	const HEVC_ITEM_TYPE: u32 = u32::from_be_bytes(*b"hvc1");
+
+	// A fresh wrapper around the same underlying context — it owns nothing but
+	// itself, and has to be freed.
+	// SAFETY: the handle is alive, so the context it came from is too.
+	let context = unsafe { heif_image_handle_get_context(handle.inner) };
+	if context.is_null() {
+		// Cannot tell: keep libde265 safe and lose the AVIF.
+		return -1;
+	}
+	let count = unsafe { heif_context_get_number_of_items(context) };
+	let mut ids = vec![0 as heif_item_id; count.max(0) as usize];
+	// SAFETY: `ids` has room for `count` entries, which is what libheif is
+	// told; a zero count returns without writing.
+	let filled = unsafe { heif_context_get_list_of_item_IDs(context, ids.as_mut_ptr(), count) };
+	let filled = (filled.max(0) as usize).min(ids.len());
+	let has_hevc = ids[..filled]
+		.iter()
+		.any(|&id| unsafe { heif_item_get_item_type(context, id) } == HEVC_ITEM_TYPE);
+	unsafe { heif_context_free(context) };
+	if has_hevc { -1 } else { 1 }
 }
 
 impl Drop for DecodeOptions {
@@ -269,7 +317,7 @@ struct OutImage<'a> {
 impl OutImage<'_> {
 	fn new(handle: &ImageHandle) -> Result<Self, HeifError> {
 		let mut heif_image_ptr = std::ptr::null_mut();
-		let options = DecodeOptions::for_target()?;
+		let options = DecodeOptions::for_handle(handle)?;
 		let result = unsafe {
 			heif_decode_image(
 				handle.inner,
@@ -684,7 +732,7 @@ impl<T: Read + Seek> HeifSession<T> {
 			self.tiles_validated.set(true);
 		}
 		let mut heif_image_ptr = std::ptr::null_mut();
-		let options = DecodeOptions::for_target()?;
+		let options = DecodeOptions::for_handle(&primary)?;
 		let result = unsafe {
 			heif_image_handle_decode_image_tile(
 				primary.inner,
@@ -793,8 +841,9 @@ unsafe extern "C" fn read_impl<T: Read + Seek>(
 	if size == 0 {
 		return 0;
 	}
-	// from_raw_parts_mut requires a non-null pointer even for size == 0;
-	// libheif treats any non-zero return as a read failure
+	// from_raw_parts_mut requires a non-null pointer, and libheif treats any
+	// non-zero return as a read failure. Only reads that ask for bytes reach
+	// here — the zero-length case returned above.
 	if data.is_null() {
 		return -1;
 	}
@@ -1099,7 +1148,7 @@ mod wasi_stubs {
 
 	/// wasi-threads' host spawn hook (threaded sysroot only). A negative
 	/// return means "could not spawn", which pthread_create surfaces as
-	/// EAGAIN — and DecodeOptions keeps libde265 from ever asking.
+	/// EAGAIN — and DecodeOptions keeps both codec plugins from ever asking.
 	#[unsafe(no_mangle)]
 	extern "C" fn __imported_wasi_thread_spawn(_start_arg: *mut u8) -> i32 {
 		-1
@@ -1184,6 +1233,58 @@ mod api_tests {
 	use std::io::Cursor;
 
 	use super::*;
+
+	/// Which codecs this build actually registered.
+	///
+	/// Lives in the LIB, not in `tests/`, on purpose: CI and the pre-push hook
+	/// both run `cargo test --lib`, which never builds an integration target.
+	/// A tripwire nothing executes is not a tripwire, and this is the only
+	/// thing that notices a decoder going missing — a missing decoder looks
+	/// exactly like an unsupported file everywhere else in the stack.
+	#[test]
+	fn hevc_and_av1_decode() {
+		// SAFETY: both are pure lookups over libheif's static plugin registry.
+		let (hevc, av1) = unsafe {
+			(
+				heif_have_decoder_for_format(heif_compression_format_heif_compression_HEVC),
+				heif_have_decoder_for_format(heif_compression_format_heif_compression_AV1),
+			)
+		};
+		assert_ne!(
+			hevc, 0,
+			"libde265 missing — every HEIC thumbnail would fail"
+		);
+		assert_ne!(
+			av1, 0,
+			"dav1d missing — every AVIF thumbnail would fail. If AV1 is being \
+			 dropped on purpose, drop the avif/avis brands from microthumb's \
+			 formats/heif.rs and `avif` from the SDK's thumbnail extension gate \
+			 and mime table in the same change"
+		);
+
+		// …and that both came from the ARCHIVE, not from a directory this
+		// machine happens to have. libheif defaults dav1d to a separate
+		// plugin, and the answers above cannot tell a statically registered
+		// decoder from one dlopened out of the build machine's `OUT_DIR` —
+		// which is exactly what shipped, and what makes every AVIF thumbnail
+		// fail on a device while this test passes. With plugin loading
+		// compiled out there is no dlopen at all, so `heif_load_plugin` can
+		// only answer `Unsupported_feature`: assert on that, and the two
+		// answers above are necessarily static ones.
+		//
+		// SAFETY: with plugin loading disabled this returns a constant error
+		// and never touches the path.
+		let path = c"/nonexistent/libheif-dav1d.so";
+		let mut info = std::ptr::null();
+		let error = unsafe { heif_load_plugin(path.as_ptr(), &raw mut info) };
+		assert_eq!(
+			error.code, heif_error_code_heif_error_Unsupported_feature,
+			"libheif was built with plugin loading ON — the AV1 decoder is a \
+			 separate .so with the build machine's absolute OUT_DIR baked in, \
+			 and every AVIF thumbnail fails silently on device. See \
+			 ENABLE_PLUGIN_LOADING in build.rs"
+		);
+	}
 
 	#[test]
 	fn from_file_rejects_path_with_interior_nul() {

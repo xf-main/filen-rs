@@ -1,5 +1,7 @@
-//! End-to-end pipeline tests over fixtures generated at runtime — no binary
-//! fixture files, ever.
+//! End-to-end pipeline tests over fixtures generated at runtime, so no binary
+//! fixture files land here. The one exception is AVIF: nothing in the tree can
+//! encode AV1, so that case reads the browser suite's committed `parrot.avif`
+//! and says so at the test.
 
 use std::io::Cursor;
 
@@ -1069,6 +1071,38 @@ fn preview_only_without_an_embedded_thumbnail_is_ok_none_not_a_decode() {
 		generate(Box::new(MemSource(bytes)), &spec(64))
 			.unwrap()
 			.is_some()
+	);
+}
+
+// ---- heif ----
+
+/// The one fixture-FILE case in this suite, and deliberately so: AVIF cannot
+/// be generated here — the vendored libheif is decode-only and `image` has no
+/// AV1 encoder — so this reads the committed browser fixture rather than
+/// inventing a binary. It is what proves the `avif` brand claimed in
+/// `formats/heif.rs` reaches a decoder that actually answers.
+#[cfg(feature = "heif")]
+#[test]
+fn avif_thumbnails_through_the_heif_path() {
+	let path = concat!(
+		env!("CARGO_MANIFEST_DIR"),
+		"/../filen-sdk-rs/web/test-assets/imgs/parrot.avif"
+	);
+	let bytes = std::fs::read(path).expect("committed parrot.avif fixture");
+	let result = thumb(Box::new(MemSource(bytes)), &spec(64))
+		.unwrap()
+		.expect("avif must thumbnail");
+	// `generate` returns at least the requested box (the caller does the final
+	// resize); the fixture is 1000x667, so the aspect must stay landscape.
+	assert!(result.width >= 64 && result.width <= 1000);
+	assert!(result.width > result.height);
+	assert_eq!(
+		result.rgba.len(),
+		(result.width * result.height * 4) as usize
+	);
+	assert!(
+		result.rgba.iter().any(|&b| b != 0),
+		"decoded avif thumbnail is entirely zero"
 	);
 }
 

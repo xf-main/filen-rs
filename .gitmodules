@@ -4,3 +4,6 @@
 [submodule "heif-decoder/deps/libde265"]
 	path = heif-decoder/deps/libde265
 	url = https://github.com/strukturag/libde265.git
+[submodule "heif-decoder/deps/dav1d"]
+	path = heif-decoder/deps/dav1d
+	url = https://github.com/videolan/dav1d.git

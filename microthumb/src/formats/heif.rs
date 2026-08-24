@@ -1,4 +1,5 @@
-//! HEIC/HEIF via the vendored libheif. Two memory-bounded paths, in order:
+//! HEIC/HEIF via the vendored libheif, and AVIF too where its AV1 backend
+//! exists (native — see `AV1_BRANDS`). Two memory-bounded paths, in order:
 //! the embedded `thmb` item (every iPhone HEIC carries one — the whole probe
 //! costs a couple of container reads), then tile-wise decode of the grid
 //! (Apple encodes 512×512 tiles), each tile pushed into the sink and freed
@@ -18,25 +19,36 @@ pub struct Heif;
 /// Embedded HEIF thumbnails are ~320 px; anything bigger is not a thumbnail.
 const MAX_PREVIEW_PIXELS: u64 = 1024 * 1024;
 
-/// HEVC-backed brands only.
+/// HEVC-backed brands, decoded by the vendored libde265 on every target.
 ///
-/// `avif`/`avis` are deliberately ABSENT: AVIF carries AV1, and our vendored
-/// libheif is built with only libde265 (HEVC) — `WITH_DAV1D` and
-/// `WITH_AOM_DECODER` are OFF in heif-decoder/build.rs, and
-/// `heif_have_decoder_for_format(heif_compression_AV1)` returns 0 to prove it
-/// (pinned by `heif-decoder`'s `hevc_decodes_avif_does_not`). Claiming the
-/// brand would let an AVIF into a decoder that must then fail. Enabling AV1
-/// means vendoring dav1d or aom — another C submodule and build — which is a
-/// deliberate decision, not a detail to slip in here.
+/// `mif1` is the generic ISO-BMFF image brand and turns up on both HEVC and
+/// AV1 payloads, so it stays unconditional and the decoder answers whichever
+/// it can — which is both of them, on every target this builds for.
 const BRANDS: &[&[u8; 4]] = &[
 	b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs", b"mif1", b"msf1",
 ];
+
+/// AVIF, decoded by the vendored dav1d on every target — including wasm,
+/// which is the reason the AV1 backend is dav1d and not libaom
+/// (`heif-decoder`'s `build_dav1d` documents the `setjmp` wall libaom hits
+/// there).
+///
+/// Pinned by `heif-decoder`'s `hevc_and_av1_decode`: if AV1 ever disappears
+/// from the build, these brands come out in the same change.
+///
+/// `avis` is animated AVIF; libheif hands back its primary still image, and a
+/// file that has none simply fails the container parse and answers "no
+/// thumbnail". UNTESTED — no animated fixture in the repo.
+const AV1_BRANDS: &[&[u8; 4]] = &[b"avif", b"avis"];
 
 impl FormatDecoder for Heif {
 	fn detect(&self, prefix: &[u8]) -> bool {
 		prefix.len() >= 12
 			&& &prefix[4..8] == b"ftyp"
-			&& BRANDS.iter().any(|brand| &prefix[8..12] == *brand)
+			&& BRANDS
+				.iter()
+				.chain(AV1_BRANDS)
+				.any(|brand| &prefix[8..12] == *brand)
 	}
 
 	fn open(

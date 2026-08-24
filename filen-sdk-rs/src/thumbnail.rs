@@ -15,7 +15,11 @@ use crate::{
 
 // MUST BE SORTED ALPHABETICALLY
 const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
-	#[cfg(feature = "avif-decoder")]
+	// Two independent decoders answer for AVIF: `heif-decoder` (libheif on its
+	// dav1d backend, the same path HEIC takes, and available on every target
+	// this builds for) and `avif-decoder` (the image crate's own dav1d
+	// binding). Either one is enough to claim the mime.
+	#[cfg(any(feature = "avif-decoder", feature = "heif-decoder"))]
 	"image/avif",
 	"image/gif",
 	#[cfg(feature = "heif-decoder")]
@@ -68,14 +72,15 @@ pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
 /// costs one chunk and answers "no thumbnail", which is what they do today
 /// anyway.
 ///
-/// `avif` is deliberately absent: this build has no AV1 decoder (see
-/// `heif-decoder`'s `hevc_decodes_avif_does_not`).
+/// `avif` is present because the vendored libheif carries an AV1 decoder
+/// (dav1d) alongside HEVC — the same container code path as HEIC (pinned by
+/// `heif-decoder`'s `hevc_and_av1_decode`).
 const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
 	// Formats the pipeline decodes directly. `svgz` is deliberately absent:
 	// the pipeline refuses gzipped SVG (no inflate), so looking would cost a
 	// chunk and answer nothing.
-	"bmp", "gif", "heic", "heif", "hif", "jfif", "jpe", "jpeg", "jpg", "png", "qoi", "svg", "tif",
-	"tiff", "webp", //
+	"avif", "bmp", "gif", "heic", "heif", "hif", "jfif", "jpe", "jpeg", "jpg", "png", "qoi", "svg",
+	"tif", "tiff", "webp", //
 	// RAW: TIFF/BMFF containers, reached for their embedded preview.
 	"3fr", "arw", "cr2", "cr3", "dng", "erf", "iiq", "kdc", "mos", "mrw", "nef", "nrw", "orf",
 	"pef", "raf", "raw", "rw2", "rwl", "srf", "srw", "x3f",
@@ -96,9 +101,9 @@ const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
 /// something the name does not.
 ///
 /// This is what keeps `psd`, `dwg`, `tga` and friends out despite their
-/// `image/*` mimes, and `avif` out despite ours being correct: nothing here
-/// decodes them, so looking costs a chunk and answers nothing. It also means a
-/// file whose extension lies (`photo.xyz` holding a JPEG) is skipped even if
+/// `image/*` mimes: nothing here decodes them, so looking costs a chunk and
+/// answers nothing. It also means a file whose extension lies (`photo.xyz`
+/// holding a JPEG) is skipped even if
 /// its mime says otherwise — accepted, because that mime can only have been
 /// supplied by hand, and the alternative is paying a chunk for every unknown
 /// extension on the drive.
@@ -137,6 +142,16 @@ mod gate_tests {
 			Some("DSC_0001.NEF"),
 			Some("application/octet-stream")
 		));
+		// AVIF, decoded by libheif's AV1 backend since dav1d was vendored — if
+		// this ever goes back to refusing, the decoder went away with it.
+		assert!(might_be_thumbnailable(
+			Some("photo.avif"),
+			Some("application/octet-stream")
+		));
+		assert!(might_be_thumbnailable(
+			Some("photo.avif"),
+			Some("image/avif")
+		));
 		// Uppercase is the norm straight off a camera.
 		assert!(might_be_thumbnailable(Some("IMG_1234.JPG"), None));
 		// SVG rasterises through the bounded pipeline; gzipped SVG does not
@@ -159,10 +174,6 @@ mod gate_tests {
 		assert!(might_be_thumbnailable(None, Some("image/png")));
 		// But an extension we cannot decode wins over its own correct mime —
 		// looking would cost a chunk to learn nothing.
-		assert!(!might_be_thumbnailable(
-			Some("photo.avif"),
-			Some("image/avif")
-		));
 		assert!(!might_be_thumbnailable(
 			Some("art.psd"),
 			Some("image/vnd.adobe.photoshop")
@@ -187,12 +198,6 @@ mod gate_tests {
 			Some("application/octet-stream")
 		));
 		assert!(!might_be_thumbnailable(None, None));
-		// AVIF: no AV1 decoder in this build, and admitting it would only buy
-		// a chunk and a refusal.
-		assert!(!might_be_thumbnailable(
-			Some("photo.avif"),
-			Some("application/octet-stream")
-		));
 		// A dotfile is treated as its extension, deliberately.
 		assert!(might_be_thumbnailable(Some(".jpg"), None));
 	}
@@ -284,7 +289,14 @@ impl Client {
 					)
 				})?;
 				DynamicImage::ImageRgba8(rgba)
-			} else if mime == "image/heic" || mime == "image/heif" {
+			} else if mime == "image/heic"
+				|| mime == "image/heif"
+				// libheif carries an AV1 backend (dav1d) and decodes AVIF
+				// through the same container code as HEIC. When only
+				// `avif-decoder` is enabled this stays false and AVIF falls
+				// through to the image crate's own dav1d binding.
+				|| (cfg!(feature = "heif-decoder") && mime == "image/avif")
+			{
 				#[cfg(feature = "heif-decoder")]
 				{
 					DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_slice(
