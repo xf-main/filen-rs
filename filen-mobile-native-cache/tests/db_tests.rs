@@ -6980,20 +6980,30 @@ impl CountingWorkingSetListener {
 /// never redelivered. A test that mutates the moment the call returns is racing that window; one
 /// that waits for a signal first is not. Each pass is a real drive change whose echo comes back
 /// over the socket, so the first signal proves the loop end to end.
-async fn wait_until_live_is_delivering(
-	db: &Arc<FilenMobileCacheState>,
-	item: &FfiId,
-	listener: &CountingWorkingSetListener,
-) {
+///
+/// The probe is driven through the CLIENT, never through the cache. The working-set signal is
+/// gated on the change stamp actually moving (`live::notify_if_changed`), and a change this cache
+/// made is already in the database before its echo arrives: the echo upserts identical values, the
+/// stamp stands still, and no signal is due. Only a change made ELSEWHERE proves the loop — which
+/// is also the only kind the signal exists for.
+///
+/// The probes are left where they are: `TestResources`' own cleanup takes the whole test dir, and
+/// deleting them here would only spray more events across the window the caller is about to use.
+async fn wait_until_live_is_delivering(rss: &TestResources, listener: &CountingWorkingSetListener) {
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-	let mut rank = 0;
+	let mut pass = 0;
 	while listener.count() == 0 {
 		assert!(
 			std::time::Instant::now() < deadline,
 			"the live path never carried a change; the socket loop is not live"
 		);
-		rank = 1 - rank;
-		db.set_favorite_rank(item.clone(), rank).await.unwrap();
+		// A fresh directory under the (already listed, hence relevant) test dir: a row this
+		// cache does not hold, so its `folderSubCreated` cannot land as a no-op.
+		rss.client
+			.create_dir(&(&rss.dir).into(), &format!("live_probe_{pass}"))
+			.await
+			.unwrap();
+		pass += 1;
 		let settle = std::time::Instant::now() + std::time::Duration::from_secs(6);
 		while listener.count() == 0 && std::time::Instant::now() < settle {
 			tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -7037,7 +7047,7 @@ pub async fn test_live_path_delivers_a_remote_edit_without_being_asked() {
 		.await
 		.unwrap();
 	db.start_live_updates();
-	wait_until_live_is_delivering(&db, &file_path, &listener).await;
+	wait_until_live_is_delivering(&rss, &listener).await;
 	let signals_before = listener.count();
 
 	// The edit, made the way another device would make it: same name, new content — the server
@@ -7142,7 +7152,7 @@ pub async fn test_a_remote_trash_of_a_held_file_trashes_the_row() {
 	let listener = Arc::new(CountingWorkingSetListener::default());
 	db.set_working_set_listener(Some(listener.clone()));
 	db.start_live_updates();
-	wait_until_live_is_delivering(&db, &file_path, &listener).await;
+	wait_until_live_is_delivering(&rss, &listener).await;
 
 	let anchor = db.current_sync_anchor().unwrap();
 	// Hold the trash lock across the trash -> restore window: another leg's account-global
@@ -7251,7 +7261,7 @@ pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent(
 	let destination_uuid = destination.uuid().to_string();
 
 	db.start_live_updates();
-	wait_until_live_is_delivering(&db, &file_path, &listener).await;
+	wait_until_live_is_delivering(&rss, &listener).await;
 
 	let anchor = db.current_sync_anchor().unwrap();
 	rss.client
@@ -7454,8 +7464,7 @@ pub async fn test_reconnect_closes_a_socket_gap_by_relisting_containers() {
 	let listener = Arc::new(CountingWorkingSetListener::default());
 	db.set_working_set_listener(Some(listener.clone()));
 	db.start_live_updates();
-	let container_id: FfiId = format!("stable/{container_uuid}").into();
-	wait_until_live_is_delivering(&db, &container_id, &listener).await;
+	wait_until_live_is_delivering(&rss, &listener).await;
 
 	// The outage: the socket goes away, and the drive changes without us hearing it.
 	db.stop_live_updates();

@@ -237,14 +237,16 @@ async fn drain_live_events(
 				drive_message_id,
 			} => {
 				tracing::warn!("deleteAll received; reconciling every materialized container");
+				let before = change_stamp(&state).await;
 				reconcile_pass(&state, drive_message_id).await;
-				notify_working_set_changed(&state).await;
+				notify_if_changed(&state, before).await;
 			}
 			DecryptedSocketEvent::Drive {
 				inner,
 				drive_message_id,
 			} => {
 				let event_type = inner.event_type();
+				let before = change_stamp(&state).await;
 				let applied = {
 					let guard = state.read().await;
 					let AuthStatus::Authenticated(auth) = &guard.status else {
@@ -259,8 +261,13 @@ async fn drain_live_events(
 						advance_watermark(&state, drive_message_id).await;
 						if applied {
 							tracing::debug!("applied live {event_type} event");
-							notify_working_set_changed(&state).await;
 						}
+						// NOT gated on `applied`: the change stamp is the authority on whether
+						// anything a replica can see actually moved, and it is strictly the
+						// safer test. An arm that writes while reporting `applied == false`
+						// would otherwise be a silently missed signal; the cost of asking
+						// anyway is at most one spurious signal, which is an empty diff.
+						notify_if_changed(&state, before).await;
 					}
 					Err(e) => {
 						// The event did NOT commit, so the watermark must not move past it —
@@ -326,8 +333,10 @@ async fn gap_check(state: &Arc<RwLock<CacheState>>) {
 		"drive event gap (local {watermark:?}, remote {remote}, owed {owed}); re-listing \
 		 materialized containers"
 	);
+	// A pass that wrote no row has nothing for the replica to diff (see `notify_if_changed`).
+	let before = change_stamp(state).await;
 	reconcile_pass(state, remote).await;
-	notify_working_set_changed(state).await;
+	notify_if_changed(state, before).await;
 }
 
 /// The gap gate: a pass runs when the remote counter has moved past our watermark, and ALSO
@@ -410,8 +419,45 @@ async fn advance_watermark(state: &Arc<RwLock<CacheState>>, id: u64) {
 	}
 }
 
-async fn notify_working_set_changed(state: &Arc<RwLock<CacheState>>) {
-	state.read().await.notify_working_set();
+/// The database's change stamp — the instance that issued it and the sequence it has reached —
+/// or `None` when it cannot be read (no authenticated state, or the read failed).
+///
+/// This pair IS everything a replica can be shown: `changes_since` derives both the diff and the
+/// anchor it hands back from these two values ([`crate::local`]), and every trigger that stamps a
+/// row or writes a tombstone raises the counter first (`sql/init.sql`) behind a guard that is a
+/// real OLD/NEW comparison. A pass that leaves the stamp where it was therefore has nothing to
+/// signal: the enumeration it would provoke is guaranteed to come back empty.
+async fn change_stamp(state: &Arc<RwLock<CacheState>>) -> Option<([u8; 16], i64)> {
+	let guard = state.read().await;
+	let AuthStatus::Authenticated(auth) = &guard.status else {
+		return None;
+	};
+	crate::sql::select_change_meta(&auth.conn()).ok()
+}
+
+/// Whether the change stamp moved between the two reads. Unreadable on either side counts as
+/// moved: a spurious signal costs one enumeration, a missed one costs freshness until the
+/// container is next presented.
+fn stamp_moved(before: Option<([u8; 16], i64)>, after: Option<([u8; 16], i64)>) -> bool {
+	before
+		.zip(after)
+		.is_none_or(|(before, after)| before != after)
+}
+
+/// Tells the replica its working set moved — but only if this pass actually moved it.
+///
+/// The gate exists because "applied" over-reports: `apply_file_record` answers `true` whenever
+/// the row was RELEVANT, and `RelistTrash` answers `true` unconditionally, so this device's own
+/// uploads and renames echoing back over the socket upsert to identical values and still
+/// signalled. Each signal is an `enumerateChanges` round trip.
+///
+/// The stamp is shared with every other writer on this database — the app process browsing, a
+/// listing landing on another task — so it can move for a reason this pass did not cause. That
+/// yields a spurious signal, never a missed one: our own writes can only raise it.
+async fn notify_if_changed(state: &Arc<RwLock<CacheState>>, before: Option<([u8; 16], i64)>) {
+	if stamp_moved(before, change_stamp(state).await) {
+		state.read().await.notify_working_set();
+	}
 }
 
 /// What the pure dispatch decided about one event: either it was applied (or dropped) locally,
@@ -1107,6 +1153,61 @@ mod applier_tests {
 				r.get(0)
 			})
 			.unwrap()
+	}
+
+	fn stamp(conn: &Mutex<Connection>) -> Option<([u8; 16], i64)> {
+		Some(crate::sql::select_change_meta(&super::conn(conn)).unwrap())
+	}
+
+	/// The signal gate. `Applied(true)` means the event was RELEVANT, not that anything changed —
+	/// this device's own uploads echo back over the socket and upsert to identical values — so
+	/// the working-set signal is gated on the change stamp instead, which is the very thing the
+	/// diff the signal provokes is computed from.
+	#[test]
+	fn the_signal_gate_follows_the_change_stamp_not_the_apply_result() {
+		let conn = db();
+		apply(
+			&conn,
+			DecryptedDriveEvent::FolderSubCreated(ev::FolderSubCreated(dir_record(8, ROOT))),
+		);
+
+		// A file the cache does not hold yet: a real change, and the stamp moves.
+		let before = stamp(&conn);
+		assert_eq!(
+			apply(
+				&conn,
+				DecryptedDriveEvent::FileNew(ev::FileNew(file_record(1, 2, 8)))
+			),
+			LocalApply::Applied(true)
+		);
+		let after = stamp(&conn);
+		assert!(
+			stamp_moved(before, after),
+			"a first upload must still signal"
+		);
+
+		// The same record again — the echo of our own upload. Still `Applied(true)`, still
+		// nothing for a replica to be shown.
+		assert_eq!(
+			apply(
+				&conn,
+				DecryptedDriveEvent::FileNew(ev::FileNew(file_record(1, 2, 8)))
+			),
+			LocalApply::Applied(true)
+		);
+		assert!(
+			!stamp_moved(after, stamp(&conn)),
+			"an echo that changed no row must not cost an enumerateChanges round trip"
+		);
+
+		// A pass that touched nothing at all — the `gap_check` / `deleteAll` case — is the same
+		// answer.
+		let idle = stamp(&conn);
+		assert!(!stamp_moved(idle, stamp(&conn)));
+
+		// And an unreadable stamp falls through to signalling rather than swallowing a change.
+		assert!(stamp_moved(None, idle));
+		assert!(stamp_moved(idle, None));
 	}
 
 	/// The relevance gate, both ways: an event for a container this cache has never listed is a
