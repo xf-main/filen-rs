@@ -7508,3 +7508,59 @@ pub async fn test_reconnect_closes_a_socket_gap_by_relisting_containers() {
 	rss.client.delete_file_permanently(file).await.unwrap();
 	rss.client.delete_dir_permanently(container).await.unwrap();
 }
+
+// `update_dir_children` resolves a `stable/<id>` container ROW-DIRECT — one `get_dir` on the
+// container itself, no re-validation of every path ancestor. The answer that has to survive that
+// shortcut is the not-found: the walk it replaces turned a stale display path into a typed
+// `DoesNotExist` (`.noSuchItem` on iOS), and a remote error in its place is read as
+// `.serverUnreachable`, which the system retries forever over a folder that no longer exists.
+#[shared_test_runtime]
+pub async fn test_a_stable_id_relist_still_answers_not_found_for_a_dead_container() {
+	let (db, rss) = get_db_resources().await;
+
+	let dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "relist_target")
+		.await
+		.unwrap();
+	let dir_uuid = dir.uuid();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// Warm: the row-direct branch is the one that runs, and it succeeds while the dir lives.
+	let stable_id: FfiId = format!("stable/{dir_uuid}").into();
+	db.update_dir_children(stable_id.clone()).await.unwrap();
+
+	rss.client.delete_dir_permanently(dir).await.unwrap();
+
+	// `v3/dir` keeps answering for a permanently deleted folder for a moment after `v3/dir/content`
+	// has stopped. Both the path walk this replaces and the row-direct branch key their not-found
+	// off exactly that answer, so wait for the server to agree with itself before asserting on it —
+	// otherwise this measures replication lag, not the branch.
+	let mut gone = false;
+	for _ in 0..30 {
+		if rss.client.get_dir(dir_uuid).await.is_err() {
+			gone = true;
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+	}
+	assert!(
+		gone,
+		"the server never stopped answering for the deleted dir"
+	);
+
+	let err = db
+		.update_dir_children(stable_id.clone())
+		.await
+		.expect_err("a container the server no longer has must not relist");
+	assert!(
+		matches!(err, CacheError::DoesNotExist(_)),
+		"the row-direct branch must answer not-found, not a retried remote error: {err:?}"
+	);
+	// And the refresh that produced that answer retired the row, exactly as the walk's
+	// `forget_item` did.
+	assert_eq!(db.query_item_by_uuid(&dir_uuid.to_string()).unwrap(), None);
+}

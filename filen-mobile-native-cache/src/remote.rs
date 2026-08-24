@@ -440,21 +440,39 @@ impl AuthCacheState {
 
 	pub(crate) async fn update_dir_children(&self, path: &FfiId) -> Result<(), CacheError> {
 		debug!("Updating directory children for path: {}", path.0);
-		let path = self.canonicalize_id(path)?;
-		let path_id = path.as_path()?;
-		let mut dir: DBDirObject = match self.update_items_in_path(&path_id).await? {
-			UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
-			// Same reasoning as `resolve_file_to_download`'s Partial arm: the walk
-			// REACHED the server and the path stopped resolving, so the directory is
-			// gone rather than unreachable (a transport failure propagates as its own
-			// error above). A remote error here read as `.serverUnreachable` on iOS,
-			// and since the enumerator's existence probe is a local cache read, every
-			// enumeration of a remotely-deleted directory took this path and retried
-			// instead of learning `.noSuchItem`.
-			UpdateItemsInPath::Partial(_, _) => {
-				return Err(CacheError::DoesNotExist(
-					format!("Path {} no longer resolves to an item", path_id.full_path).into(),
-				));
+		// `stable/<id>` names ONE row: resolve it row-direct (see `resolve_stable_object`),
+		// exactly as the destructive and byte-serving operations already do. The display-path
+		// walk this replaces re-validated every ANCESTOR with a round trip of its own —
+		// `get_dir` per cached component — on every presentation of the folder, warm or cold,
+		// because the enumerator hands back a nil sync anchor and re-presentation is its only
+		// refresh channel. Depth D cost D+1 requests; this costs 2.
+		//
+		// The authoritative not-found the walk produced survives: `resolve_stable_object`
+		// refreshes the container through its own `get_dir`, and only a typed `FolderNotFound`
+		// (via `forget_item`) resolves to `None` — which raises the same `DoesNotExist` the
+		// `Partial` arm below does, i.e. `.noSuchItem` on iOS. The one case `forget_item` keeps
+		// is a container sheltering an unsent edit; the relist below then fails as a remote
+		// error, which is right — those bytes exist nowhere else, and `.noSuchItem` would have
+		// the system delete the folder holding them.
+		let mut dir: DBDirObject = if path.0.starts_with(STABLE_PREFIX) {
+			self.resolve_stable_object(path).await?.try_into()?
+		} else {
+			let path = self.canonicalize_id(path)?;
+			let path_id = path.as_path()?;
+			match self.update_items_in_path(&path_id).await? {
+				UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
+				// Same reasoning as `resolve_file_to_download`'s Partial arm: the walk
+				// REACHED the server and the path stopped resolving, so the directory is
+				// gone rather than unreachable (a transport failure propagates as its own
+				// error above). A remote error here read as `.serverUnreachable` on iOS,
+				// and since the enumerator's existence probe is a local cache read, every
+				// enumeration of a remotely-deleted directory took this path and retried
+				// instead of learning `.noSuchItem`.
+				UpdateItemsInPath::Partial(_, _) => {
+					return Err(CacheError::DoesNotExist(
+						format!("Path {} no longer resolves to an item", path_id.full_path).into(),
+					));
+				}
 			}
 		};
 		self.inner_update_dir(&mut dir).await?;
