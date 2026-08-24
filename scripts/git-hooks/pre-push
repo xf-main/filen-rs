@@ -46,11 +46,16 @@ fi
 
 # All-features clippy variants (matches CI). The heif-/avif-decoder builds can
 # be slow on cold caches; gate them behind SKIP_HEAVY_CLIPPY for tight loops.
+#
+# The features are package-qualified because these names belong to filen-sdk-rs.
+# Bare `-F heif-decoder` applies to every workspace member, and microthumb takes
+# heif-decoder as an optional dependency via `dep:` — which suppresses the
+# implicit same-named feature, so cargo rejects the bare form.
 if [ "${SKIP_HEAVY_CLIPPY:-0}" != "1" ]; then
-	run "cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings" \
-		cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
-	run "cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings" \
-		cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
+	run "cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto -- -D warnings" \
+		cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto -- -D warnings
+	run "cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings" \
+		cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
 else
 	printf '%sSKIP_HEAVY_CLIPPY=1, skipping heif-/avif-decoder clippy variants%s\n' \
 		"$yellow" "$reset"
