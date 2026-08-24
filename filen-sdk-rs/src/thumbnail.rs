@@ -1,4 +1,8 @@
-use image::{DynamicImage, ImageDecoder, imageops::FilterType};
+use image::{DynamicImage, imageops::FilterType};
+// Only the native whole-frame branch reads a decoder's orientation; wasm
+// decodes through microthumb, which applies it itself.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use image::ImageDecoder;
 
 use crate::{
 	ErrorKind,
@@ -21,8 +25,9 @@ const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
 	"image/jpeg",
 	"image/png",
 	"image/qoi",
-	// Native only: the image crate cannot decode SVG, so wasm builds (which
-	// have no microthumb) keep refusing it up front.
+	// Native only: the wasm build takes microthumb without its `svg` feature
+	// (resvg is a large dependency for a format phones never produce), so
+	// wasm keeps refusing SVG up front.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	"image/svg+xml",
 	"image/tiff",
@@ -210,44 +215,75 @@ impl Client {
 		let image_data = self.download_file(file).await?;
 
 		runtime::do_cpu_intensive(|| {
+			// Browser: every format goes through the bounded pipeline. wasm
+			// linear memory only ever grows (1 GiB linker cap, never returned),
+			// so a whole-frame decode of a 48 MP photo — ~279 MiB of peak — is
+			// a permanent cost to the tab, not a transient one. microthumb
+			// streams instead, and refuses what it cannot afford.
+			//
+			// Purely CPU-bound over `MemSource`: reads are synchronous slice
+			// copies that never block, so this is safe inside the rayon pool.
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			let image = {
+				let spec = microthumb::ThumbSpec::new(
+					max_width,
+					max_height,
+					microthumb::BROWSER_MEM_BUDGET,
+				);
+				let thumb =
+					microthumb::generate(Box::new(microthumb::MemSource(image_data)), &spec)
+						.map_err(|e| Error::custom(ErrorKind::ImageError, e.to_string()))?
+						.ok_or_else(|| {
+							Error::custom(
+								ErrorKind::ImageError,
+								"no thumbnail within the browser memory budget".to_string(),
+							)
+						})?;
+				let rgba = image::RgbaImage::from_vec(
+					thumb.image.width,
+					thumb.image.height,
+					thumb.image.rgba,
+				)
+				.ok_or_else(|| {
+					Error::custom(
+						ErrorKind::ImageError,
+						"thumbnail canvas has an inconsistent buffer".to_string(),
+					)
+				})?;
+				DynamicImage::ImageRgba8(rgba)
+			};
+
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			let image = if mime == "image/svg+xml" {
 				// The image crate has no SVG support; the bounded pipeline
-				// (native-only, hence the mime table gate) rasterises it.
-				#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-				{
-					let spec = microthumb::ThumbSpec::new(
-						max_width,
-						max_height,
-						microthumb::DEFAULT_MEM_BUDGET,
-					);
-					let thumb =
-						microthumb::generate(Box::new(microthumb::MemSource(image_data)), &spec)
-							.map_err(|e| Error::custom(ErrorKind::ImageError, e.to_string()))?
-							.ok_or_else(|| {
-								Error::custom(
-									ErrorKind::ImageError,
-									"no svg thumbnail within the memory budget".to_string(),
-								)
-							})?;
-					let rgba = image::RgbaImage::from_vec(
-						thumb.image.width,
-						thumb.image.height,
-						thumb.image.rgba,
+				// rasterises it. SVG is in the mime table on native only, so
+				// this arm is unreachable on wasm anyway.
+				let spec = microthumb::ThumbSpec::new(
+					max_width,
+					max_height,
+					microthumb::DEFAULT_MEM_BUDGET,
+				);
+				let thumb =
+					microthumb::generate(Box::new(microthumb::MemSource(image_data)), &spec)
+						.map_err(|e| Error::custom(ErrorKind::ImageError, e.to_string()))?
+						.ok_or_else(|| {
+							Error::custom(
+								ErrorKind::ImageError,
+								"no svg thumbnail within the memory budget".to_string(),
+							)
+						})?;
+				let rgba = image::RgbaImage::from_vec(
+					thumb.image.width,
+					thumb.image.height,
+					thumb.image.rgba,
+				)
+				.ok_or_else(|| {
+					Error::custom(
+						ErrorKind::ImageError,
+						"svg canvas has an inconsistent buffer".to_string(),
 					)
-					.ok_or_else(|| {
-						Error::custom(
-							ErrorKind::ImageError,
-							"svg canvas has an inconsistent buffer".to_string(),
-						)
-					})?;
-					DynamicImage::ImageRgba8(rgba)
-				}
-				#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-				{
-					unreachable!(
-						"svg support is native-only, should be handled by is_supported_thumbnail_mime"
-					)
-				}
+				})?;
+				DynamicImage::ImageRgba8(rgba)
 			} else if mime == "image/heic" || mime == "image/heif" {
 				#[cfg(feature = "heif-decoder")]
 				{
@@ -365,9 +401,9 @@ mod js_impls {
 	}
 }
 
-// The bounded pipeline is native-only: its only consumer is the mobile
-// cache (wasm thumbnails run through `make_thumbnail_in_memory` above),
-// and the microthumb dependency is gated to match.
+// This wrapper around microthumb is native-only: its only consumer is the
+// mobile cache, which streams from a file or a chunked remote source. wasm
+// reaches microthumb through `make_thumbnail_in_memory` above instead.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod bounded {
 	use std::io::{BufRead, Seek, Write};

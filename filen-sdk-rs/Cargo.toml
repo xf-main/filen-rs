@@ -153,6 +153,10 @@ itertools = { version = "0.14.0", optional = true }
 # On wasm32 its libheif/libde265 are cross-compiled with wasi-sdk (point
 # WASI_SDK_PATH at an extracted release — see wasm-pack.sh).
 heif-decoder = { path = "../heif-decoder", optional = true }
+# Bounded thumbnail decoding, on every target. The `svg` feature (resvg/usvg)
+# is added only by the native target section below, so wasm builds keep
+# refusing SVG instead of carrying a rasteriser.
+microthumb = { path = "../microthumb" }
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
