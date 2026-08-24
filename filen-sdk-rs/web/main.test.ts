@@ -24,7 +24,10 @@ import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
 
 console.log("Initializing WASM...")
-await init()
+const wasm = await init()
+// wasm linear memory only ever grows (1 GiB linker cap, never returned to
+// the host), so this is a monotone high-water mark of the whole module.
+const heapBytes = () => wasm.memory.buffer.byteLength
 const threads = Math.max((navigator.hardwareConcurrency || 5) - 1, 1)
 console.log(`WASM initialized ${threads} threads`)
 const now = Date.now()
@@ -128,6 +131,63 @@ function getDirMeta(meta: DirMeta): DecryptedDirMeta | null {
 		return null
 	}
 }
+
+/// Draws a `width`x`height` gradient on an OffscreenCanvas and encodes it, so
+/// the large fixtures below cost no bytes in the repo.
+async function generateImage(width: number, height: number, type: string): Promise<Uint8Array> {
+	const canvas = new OffscreenCanvas(width, height)
+	const ctx = canvas.getContext("2d")
+	if (!ctx) {
+		throw new Error("OffscreenCanvas 2d context unavailable")
+	}
+	const gradient = ctx.createLinearGradient(0, 0, width, height)
+	gradient.addColorStop(0, "#ff0055")
+	gradient.addColorStop(0.5, "#00ccff")
+	gradient.addColorStop(1, "#ffee00")
+	ctx.fillStyle = gradient
+	ctx.fillRect(0, 0, width, height)
+	// Photographic-ish high-frequency detail, so a JPEG of this does not
+	// compress away to nothing and the decode does real work.
+	for (let i = 0; i < 4000; i++) {
+		ctx.fillStyle = `rgb(${(i * 37) % 256},${(i * 91) % 256},${(i * 53) % 256})`
+		ctx.fillRect((i * 131) % width, (i * 197) % height, 40, 40)
+	}
+	const blob = await canvas.convertToBlob({ type, quality: 0.9 })
+	if (blob.type !== type) {
+		throw new Error(`browser encoded ${type} as ${blob.type}`)
+	}
+	return new Uint8Array(await blob.arrayBuffer())
+}
+
+// FIRST in the file on purpose: wasm linear memory is a monotone high-water
+// mark, so any earlier test's peak would mask the growth this one measures.
+test("thumbnail decode stays inside a bounded memory budget", async () => {
+	// 24 MP. Decoded whole-frame that is ~72 MB of RGB8 plus ~96 MB of RGBA
+	// before the resize even starts; through microthumb the JPEG is IDCT-scaled
+	// straight into a small canvas.
+	const bytes = await generateImage(6000, 4000, "image/jpeg")
+	const file = await state.uploadFile(bytes, { parent: testDir, name: "memory-24mp.jpg" })
+	expect(file.canMakeThumbnail).toBe(true)
+
+	// Read after the upload, so the upload's own buffers are already in the mark.
+	const before = heapBytes()
+	const thumb = await state.makeThumbnailInMemory({ file, maxHeight: 512, maxWidth: 512 })
+	const after = heapBytes()
+	console.log(`24 MP thumbnail: heap ${before} -> ${after} (+${after - before} bytes)`)
+
+	expect(thumb).toBeDefined()
+	const bitmap = await createImageBitmap(new Blob([thumb!.webpData], { type: "image/webp" }))
+	expect(bitmap.width).toBeLessThanOrEqual(512)
+	expect(bitmap.height).toBeLessThanOrEqual(512)
+	bitmap.close()
+
+	// The whole-frame path this replaced needed well past 120 MiB for a source
+	// this size; the bounded pipeline needs single-digit MiB plus the resident
+	// source bytes.
+	expect(after - before).toBeLessThan(120 * 1024 * 1024)
+	// And memory is never returned, so a later reading can only be >=.
+	expect(heapBytes()).toBeGreaterThanOrEqual(after)
+}, 180000)
 
 test("login", async () => {
 	expect(state).toBeDefined()
@@ -692,6 +752,27 @@ test("thumbnail", async () => {
 	expect(completed).toContainEqual("qoi")
 	expect(completed).toContainEqual("webp")
 })
+
+test("large webp thumbnail", async () => {
+	// WebP has no streaming decoder here, so microthumb prices it at a full
+	// RGBA frame plus a copy (8 bytes per source pixel) and the budget decides.
+	// The committed parrot.webp is 0.67 MP and fits any budget; 3.84 MP does not
+	// fit the 12 MiB default, and is exactly what BROWSER_MEM_BUDGET buys.
+	const bytes = await generateImage(2400, 1600, "image/webp")
+	const file = await state.uploadFile(bytes, { parent: testDir, name: "large.webp" })
+	expect(file.canMakeThumbnail).toBe(true)
+
+	const thumb = await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 })
+	expect(thumb).toBeDefined()
+
+	const bitmap = await createImageBitmap(new Blob([thumb!.webpData], { type: "image/webp" }))
+	expect(bitmap.width).toBeLessThanOrEqual(256)
+	expect(bitmap.height).toBeLessThanOrEqual(256)
+	// Aspect preserved (resize, not resize-to-fill): 3:2 into a 256 box.
+	expect(bitmap.width).toBe(256)
+	expect(bitmap.height).toBeGreaterThan(150)
+	bitmap.close()
+}, 180000)
 
 test("exif upload applies DateTimeOriginal", async () => {
 	// Each fixture in test-assets/imgs has EXIF DateTimeOriginal=2020:06:15 10:30:00
