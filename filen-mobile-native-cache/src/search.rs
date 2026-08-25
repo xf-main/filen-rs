@@ -295,15 +295,13 @@ fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 		meta: Some(FfiFileMeta {
 			name: file.name.into_owned(),
 			mime: file.mime.into_owned(),
-			created: file
-				.created
-				.map(|c| c.timestamp_millis())
-				.unwrap_or_default(),
+			created: file.created.map(|c| c.timestamp_millis()),
 			modified: file.last_modified.timestamp_millis(),
 			hash: file.hash.map(|h| h.as_ref().to_vec()),
 		}),
 		size: file.size as i64,
 		favorite_rank: i64::from(file.favorited),
+		timestamp: file.timestamp.timestamp_millis(),
 		// Search results carry no per-device local data; the browsing cache owns that.
 		local_data: None,
 		// Same: outstanding local edits are the browsing cache's business.
@@ -326,6 +324,7 @@ fn ffi_dir(dir: CacheableDir<'_>) -> FfiDir {
 		}),
 		color: dir.color.into(),
 		favorite_rank: i64::from(dir.favorited),
+		timestamp: dir.timestamp.timestamp_millis(),
 		last_listed: 0,
 		local_data: None,
 		// Same as the file above: the search engine's database keeps no change sequence.

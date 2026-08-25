@@ -17,7 +17,10 @@ use crate::{
 pub struct FfiFileMeta {
 	pub name: String,
 	pub mime: String,
-	pub created: i64,
+	/// `None` when the metadata carries no creation date at all — plenty of
+	/// uploads wrote none. Fall back to [`FfiFile::timestamp`] rather than
+	/// treating it as a date.
+	pub created: Option<i64>,
 	pub modified: i64,
 	pub hash: Option<Vec<u8>>,
 }
@@ -42,6 +45,10 @@ pub struct FfiFile {
 	pub meta: Option<FfiFileMeta>,
 	pub size: i64,
 	pub favorite_rank: i64,
+	/// Millis at which the server minted this row. Always present, unlike the
+	/// metadata's own dates, which are missing whenever the metadata was
+	/// uploaded without them or will not decrypt — this is what to show then.
+	pub timestamp: i64,
 
 	pub local_data: Option<HashMap<String, String>>,
 	/// Millis at which a local edit of this file was marked as not yet on the
@@ -68,6 +75,7 @@ impl From<DBFile> for FfiFile {
 			original_parent: file.parent.original_parent().map(|u| u.to_string()),
 			size: file.size,
 			favorite_rank: file.favorite_rank,
+			timestamp: file.timestamp,
 			local_data: file.local_data.map(|o| o.to_map()),
 			pending_upload_at: file.pending_upload_at,
 			change_seq: file.change_seq,
@@ -75,7 +83,7 @@ impl From<DBFile> for FfiFile {
 				DBFileMeta::Decoded(meta) => Some(FfiFileMeta {
 					name: meta.name.to_string(),
 					mime: meta.mime.to_string(),
-					created: meta.created.unwrap_or_default(),
+					created: meta.created,
 					modified: meta.modified,
 					hash: meta.hash.map(|h| h.to_vec()),
 				}),
@@ -103,6 +111,9 @@ pub struct FfiDir {
 	pub meta: Option<FfiDirMeta>,
 	pub color: Option<String>,
 	pub favorite_rank: i64,
+	/// Millis at which the server minted this row; see [`FfiFile::timestamp`].
+	/// `0` for a root, which the server never dates.
+	pub timestamp: i64,
 
 	// cache info
 	pub last_listed: i64,
@@ -121,6 +132,7 @@ impl From<DBDir> for FfiDir {
 			original_parent: dir.parent.original_parent().map(|u| u.to_string()),
 			color: dir.color.into(),
 			favorite_rank: dir.favorite_rank,
+			timestamp: dir.timestamp,
 			last_listed: dir.last_listed,
 			local_data: dir.local_data.map(|o| o.to_map()),
 			change_seq: dir.change_seq,
@@ -146,6 +158,7 @@ impl From<DBDirObject> for FfiDir {
 				original_parent: None,
 				color: None,
 				favorite_rank: 0,
+				timestamp: 0,
 				last_listed: root.last_listed,
 				local_data: None,
 				change_seq: 0,
