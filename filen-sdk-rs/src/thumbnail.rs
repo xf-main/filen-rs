@@ -1,25 +1,15 @@
-use image::{DynamicImage, imageops::FilterType};
-// Only the native whole-frame branch reads a decoder's orientation; wasm
-// decodes through microthumb, which applies it itself.
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use image::ImageDecoder;
+use image::{DynamicImage, codecs::webp::WebPEncoder, imageops::FilterType};
 
-use crate::{
-	ErrorKind,
-	auth::Client,
-	error::{Error, MetadataWasNotDecryptedError},
-	fs::file::{RemoteFile, traits::HasFileInfo},
-	io::client_impl::IoSharedClientExt,
-	runtime,
-};
+use crate::{ErrorKind, error::Error};
 
 // MUST BE SORTED ALPHABETICALLY
 const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
-	// Two independent decoders answer for AVIF: `heif-decoder` (libheif on its
-	// dav1d backend, the same path HEIC takes, and available on every target
-	// this builds for) and `avif-decoder` (the image crate's own dav1d
-	// binding). Either one is enough to claim the mime.
-	#[cfg(any(feature = "avif-decoder", feature = "heif-decoder"))]
+	// AVIF goes through `heif-decoder` — libheif on its dav1d backend, the
+	// same container path HEIC takes, available on every target this builds
+	// for. The `avif-decoder` feature is NOT enough: it only teaches the
+	// `image` crate a whole-frame AVIF decode, and no thumbnail path calls
+	// into that any more.
+	#[cfg(feature = "heif-decoder")]
 	"image/avif",
 	"image/gif",
 	#[cfg(feature = "heif-decoder")]
@@ -203,413 +193,289 @@ mod gate_tests {
 	}
 }
 
-impl Client {
-	pub async fn make_thumbnail_in_memory<Id: Send + Sync>(
-		&self,
-		file: &RemoteFile<Id>,
-		max_width: u32,
-		max_height: u32,
-	) -> Result<DynamicImage, Error> {
-		let mime = file.mime().ok_or(MetadataWasNotDecryptedError)?;
-		if !is_supported_thumbnail_mime(mime) {
-			return Err(Error::custom(
-				ErrorKind::ImageError,
-				format!("unsupported thumbnail mime type: {mime}"),
-			));
-		}
-		let image_data = self.download_file(file).await?;
+// ---------------------------------------------------------------------------
+// The bounded pipeline. ONE core function; everything below it is a wrapper
+// that differs only in where the bytes come from and where they go.
+// ---------------------------------------------------------------------------
 
-		runtime::do_cpu_intensive(|| {
-			// Browser: every format goes through the bounded pipeline. wasm
-			// linear memory only ever grows (1 GiB linker cap, never returned),
-			// so a whole-frame decode of a 48 MP photo — ~279 MiB of peak — is
-			// a permanent cost to the tab, not a transient one. microthumb
-			// streams instead, and refuses what it cannot afford.
-			//
-			// Purely CPU-bound over `MemSource`: reads are synchronous slice
-			// copies that never block, so this is safe inside the rayon pool.
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			let image = {
-				let spec = microthumb::ThumbSpec::new(
-					max_width,
-					max_height,
-					microthumb::BROWSER_MEM_BUDGET,
-				);
-				let thumb =
-					microthumb::generate(Box::new(microthumb::MemSource(image_data)), &spec)
-						.map_err(|e| Error::custom(ErrorKind::ImageError, e.to_string()))?
-						.ok_or_else(|| {
-							Error::custom(
-								ErrorKind::ImageError,
-								"no thumbnail within the browser memory budget".to_string(),
-							)
-						})?;
-				let rgba = image::RgbaImage::from_vec(
-					thumb.image.width,
-					thumb.image.height,
-					thumb.image.rgba,
-				)
-				.ok_or_else(|| {
-					Error::custom(
-						ErrorKind::ImageError,
-						"thumbnail canvas has an inconsistent buffer".to_string(),
-					)
-				})?;
-				DynamicImage::ImageRgba8(rgba)
-			};
+pub use microthumb::{
+	APP_PROCESS_MEM_BUDGET as APP_PROCESS_THUMBNAIL_MEM_BUDGET, ByteSource,
+	DEFAULT_MEM_BUDGET as DEFAULT_THUMBNAIL_MEM_BUDGET, FileSource, MemSource, ThumbSource,
+	ThumbSpec,
+};
 
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			let image = if mime == "image/svg+xml" {
-				// The image crate has no SVG support; the bounded pipeline
-				// rasterises it. SVG is in the mime table on native only, so
-				// this arm is unreachable on wasm anyway.
-				let spec = microthumb::ThumbSpec::new(
-					max_width,
-					max_height,
-					microthumb::DEFAULT_MEM_BUDGET,
-				);
-				let thumb =
-					microthumb::generate(Box::new(microthumb::MemSource(image_data)), &spec)
-						.map_err(|e| Error::custom(ErrorKind::ImageError, e.to_string()))?
-						.ok_or_else(|| {
-							Error::custom(
-								ErrorKind::ImageError,
-								"no svg thumbnail within the memory budget".to_string(),
-							)
-						})?;
-				let rgba = image::RgbaImage::from_vec(
-					thumb.image.width,
-					thumb.image.height,
-					thumb.image.rgba,
-				)
-				.ok_or_else(|| {
-					Error::custom(
-						ErrorKind::ImageError,
-						"svg canvas has an inconsistent buffer".to_string(),
-					)
-				})?;
-				DynamicImage::ImageRgba8(rgba)
-			} else if mime == "image/heic"
-				|| mime == "image/heif"
-				// libheif carries an AV1 backend (dav1d) and decodes AVIF
-				// through the same container code as HEIC. When only
-				// `avif-decoder` is enabled this stays false and AVIF falls
-				// through to the image crate's own dav1d binding.
-				|| (cfg!(feature = "heif-decoder") && mime == "image/avif")
-			{
-				#[cfg(feature = "heif-decoder")]
-				{
-					DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_slice(
-						&image_data,
-					)?)
-				}
-				#[cfg(not(feature = "heif-decoder"))]
-				{
-					unreachable!(
-						"heif/heic support not enabled, should be handled by is_supported_thumbnail_mime"
-					)
-				}
-			} else {
-				let reader = image::ImageReader::new(std::io::Cursor::new(&image_data))
-					.with_guessed_format()?;
-				let mut decoder = reader.into_decoder()?;
-				let orientation = decoder.orientation()?;
-				let mut image = DynamicImage::from_decoder(decoder)?;
-				image.apply_orientation(orientation);
-				image
-			};
+/// Sources bigger than this are not worth streaming end to end to make one
+/// small thumbnail. Past it the pipeline is restricted to embedded previews
+/// ([`ThumbSpec::allow_full_decode`] off), which cost a chunk or two whatever
+/// the file size — so a 200 MB HEIC still gets its `thmb` item, and a source
+/// with nothing embedded answers [`ThumbnailOutcome::OverBudget`] having read
+/// almost nothing.
+pub const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
-			// Never above what was decoded. microthumb's canvas is routinely
-			// SMALLER than the request — the budget clamps it, and an
-			// embedded preview can be smaller still — and `resize` would
-			// happily blow that back up: a blurry thumbnail in a BIGGER
-			// lossless-WebP payload. `make_thumbnail_from_source` clamps the
-			// same way.
-			let width = max_width.min(image.width());
-			let height = max_height.min(image.height());
-			Ok(image.resize(width, height, FilterType::CatmullRom))
-		})
-		.await
-	}
+/// Resident bytes a [`RemoteChunkSource`] keeps for the whole decode (its two
+/// chunk slots) — callers subtract this from the budget they hand
+/// [`make_thumbnail_from_source`], because the pipeline's own accounting
+/// cannot see the source's memory.
+pub const REMOTE_SOURCE_RESIDENT_BYTES: usize = 2 * crate::consts::CHUNK_SIZE_U64 as usize;
+
+/// The thumbnail that was written, and how it was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbnailInfo {
+	pub width: u32,
+	pub height: u32,
+	/// Cheap embedded preview vs a real decode — orders of magnitude apart in
+	/// bytes fetched and CPU spent, and otherwise indistinguishable from the
+	/// outside.
+	pub source: ThumbSource,
 }
 
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
-mod js_impls {
-	use filen_macros::js_type;
-	use image::codecs::webp::WebPEncoder;
+/// How a thumbnail attempt ended, short of transport/system trouble (which
+/// stays an `Err`).
+///
+/// Every variant here is a CACHEABLE answer about these bytes: a caller that
+/// remembers "no thumbnail" per item — which both mobile platforms do — may
+/// store any of them without risking a permanent wrong verdict from an offline
+/// blip. They are kept apart because they mean different things: `Unsupported`
+/// is final, `OverBudget` is a verdict about the spec (the same file may
+/// thumbnail once its bytes are local, or under a roomier budget), and
+/// `Corrupt` is about the bitstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbnailOutcome {
+	Thumbnail(ThumbnailInfo),
+	/// Not an image format this build decodes. Decided by the magic-byte
+	/// sniff, not by the stored mime.
+	Unsupported,
+	/// A recognised image, but nothing fit: over the memory budget, over the
+	/// pipeline's work ceiling, or a full decode was needed and the spec only
+	/// allowed an embedded preview.
+	OverBudget,
+	/// A recognised format whose bitstream the decoder refused. Carries the
+	/// decoder's message for logging.
+	Corrupt(String),
+}
 
+/// How the bounded canvas is fitted into the requested box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailFit {
+	/// Aspect preserved, fitted INSIDE the box — the result is usually shorter
+	/// than the box on one axis.
+	Contain,
+	/// Cropped to fill the box exactly, which is what a fixed-size grid tile
+	/// wants.
+	Cover,
+}
+
+/// Encodes a webp thumbnail of `source` into `out` without ever materialising
+/// a full decoded frame: microthumb streams every format it can (IDCT-scaled
+/// JPEG, PNG scanlines, HEIF tiles, embedded previews) and refuses anything
+/// whose honest decode peak exceeds `spec.mem_budget`
+/// ([`DEFAULT_THUMBNAIL_MEM_BUDGET`] fits an iOS file-provider extension's
+/// ~20 MB jetsam ceiling; [`APP_PROCESS_THUMBNAIL_MEM_BUDGET`] is for a whole
+/// app process or browser tab).
+///
+/// Nothing is written to `out` unless the returned outcome is
+/// [`ThumbnailOutcome::Thumbnail`]. The output is never upscaled past what was
+/// decoded — microthumb's canvas is routinely SMALLER than the request (the
+/// budget clamps it, and an embedded preview can be smaller still) and
+/// blowing that back up would only mean a blurrier thumbnail in a BIGGER
+/// payload.
+///
+/// This is the single decode path in the SDK. It is synchronous by contract:
+/// callers run it off their async runtime's threads and hand it a `source`
+/// that knows how to fetch bytes from wherever it lives.
+pub fn make_thumbnail_from_source<W>(
+	source: Box<dyn ByteSource>,
+	spec: &ThumbSpec,
+	fit: ThumbnailFit,
+	out: &mut W,
+) -> Result<ThumbnailOutcome, Error>
+where
+	W: std::io::Write,
+{
+	let thumb = match microthumb::generate(source, spec) {
+		Ok(microthumb::ThumbOutcome::Thumbnail(thumb)) => thumb,
+		Ok(microthumb::ThumbOutcome::Unsupported) => return Ok(ThumbnailOutcome::Unsupported),
+		Ok(microthumb::ThumbOutcome::OverBudget) => return Ok(ThumbnailOutcome::OverBudget),
+		// Corrupt or refused bytes are a verdict about the image, not a
+		// failure of the request — the caller may cache them exactly like the
+		// other two. Only transport/system errors stay hard: an offline blip
+		// must never stick a permanent "no thumbnail" in a platform cache.
+		Err(e @ (microthumb::ThumbError::Decode(_) | microthumb::ThumbError::Geometry)) => {
+			return Ok(ThumbnailOutcome::Corrupt(e.to_string()));
+		}
+		// A decoder that ran off the end of the bytes is describing the IMAGE,
+		// not the transport, and some report it as an io error rather than a
+		// decode one (the `png` crate does; `jpeg-decoder` does not). None of
+		// the sources here can produce `UnexpectedEof`: a read past the end
+		// answers `Ok(0)`, a cancel answers `Interrupted`, and a failed fetch
+		// answers `Other`. So this can only have been synthesised by a decoder
+		// reading a truncated file — and left classified as transport it would
+		// make a truncated PNG retry forever instead of settling.
+		Err(microthumb::ThumbError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+			return Ok(ThumbnailOutcome::Corrupt(e.to_string()));
+		}
+		Err(microthumb::ThumbError::Io(e)) => return Err(e.into()),
+	};
+	let Some(rgba) =
+		image::RgbaImage::from_vec(thumb.image.width, thumb.image.height, thumb.image.rgba)
+	else {
+		return Err(Error::custom(
+			ErrorKind::ImageError,
+			"thumbnail canvas has an inconsistent buffer".to_string(),
+		));
+	};
+	let img = DynamicImage::ImageRgba8(rgba);
+	let width = spec.target_width.min(img.width());
+	let height = spec.target_height.min(img.height());
+	let thumbnail = match fit {
+		ThumbnailFit::Contain => img.resize(width, height, FilterType::CatmullRom),
+		ThumbnailFit::Cover => img.resize_to_fill(width, height, FilterType::CatmullRom),
+	};
+	thumbnail.write_with_encoder(WebPEncoder::new_lossless(out))?;
+	Ok(ThumbnailOutcome::Thumbnail(ThumbnailInfo {
+		width: thumbnail.width(),
+		height: thumbnail.height(),
+		source: thumb.source,
+	}))
+}
+
+// Everything from here on needs a way to fetch remote bytes and a thread it may
+// block. The `service-worker` profile has neither — it is built WITHOUT atomics,
+// where `std`'s parker is a silent no-op rather than a real wait — so none of it
+// is compiled there.
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+mod remote_chunks {
+	use super::{ByteSource, Error};
+	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+	use super::{ErrorKind, ThumbSpec, ThumbnailFit, ThumbnailOutcome, make_thumbnail_from_source};
 	use crate::{
-		Error,
-		auth::JsClient,
-		fs::file::AnonymousRemoteFile,
-		js::File,
-		runtime::{self, do_on_commander},
+		auth::Client,
+		fs::file::{RemoteFile, traits::HasFileInfo},
+	};
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
 	};
 
-	#[js_type(import)]
-	pub struct MakeThumbnailInMemoryParams {
-		pub file: File,
-		pub max_width: u32,
-		pub max_height: u32,
+	/// Reads one plaintext byte range of a remote file.
+	///
+	/// Shared by both bridges below: what a synchronous `read_at` awaits is the
+	/// same everywhere, only HOW it gets to await it differs per target.
+	async fn fetch_range(
+		client: &Client,
+		file: &dyn crate::fs::file::traits::File,
+		start: u64,
+		end: u64,
+	) -> Result<Vec<u8>, Error> {
+		use futures::AsyncReadExt;
+
+		let mut reader = crate::fs::file::read::FileReaderBuilder::new(client.unauthed(), file)
+			.with_start(start)
+			.with_end(end)
+			.build();
+		let mut data = Vec::with_capacity((end - start) as usize);
+		reader.read_to_end(&mut data).await?;
+		Ok(data)
 	}
 
-	#[js_type(export)]
-	pub struct MakeThumbnailInMemoryResult {
-		// this is correct, ts requires the specifity
-		// because of https://github.com/microsoft/typescript/issues/62546
-		// not sure who to upstream this to, tsify, js_sys, or wasm-bindgen
-		#[cfg(feature = "wasm-full")]
-		#[tsify(type = "Uint8Array<ArrayBuffer>")]
-		pub webp_data: serde_bytes::ByteBuf,
-		#[cfg(feature = "uniffi")]
-		pub webp_data: Vec<u8>,
-	}
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
-	)]
-	impl JsClient {
-		#[cfg_attr(
-			all(target_family = "wasm", target_os = "unknown"),
-			wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailInMemory")
-		)]
-		pub async fn make_thumbnail_in_memory(
-			&self,
-			params: MakeThumbnailInMemoryParams,
-		) -> Result<Option<MakeThumbnailInMemoryResult>, Error> {
-			let this = self.inner();
-			do_on_commander(move || async move {
-				let image = match this
-					.make_thumbnail_in_memory(
-						// Thumbnailing only reads the file, so a file from a link
-						// or shared-in listing (which reports no stable id) is fine.
-						&AnonymousRemoteFile::try_from(params.file)?,
-						params.max_width,
-						params.max_height,
-					)
-					.await
-				{
-					Ok(image) => image,
-					Err(e) => {
-						tracing::debug!("failed to create thumbnail: {}", e);
-						return Ok(None);
-					}
-				};
-				runtime::do_cpu_intensive(
-					|| -> Result<Option<MakeThumbnailInMemoryResult>, Error> {
-						// really wish I knew the exact size beforehand so we could preallocate
-						let mut image_data = Vec::new();
-						image.write_with_encoder(WebPEncoder::new_lossless(&mut image_data))?;
-						let webp_data = {
-							#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-							{
-								serde_bytes::ByteBuf::from(image_data)
-							}
-							#[cfg(feature = "uniffi")]
-							{
-								image_data
-							}
-						};
-						Ok(Some(MakeThumbnailInMemoryResult { webp_data }))
-					},
-				)
-				.await
-			})
-			.await
-		}
-	}
-}
-
-// This wrapper around microthumb is native-only: its only consumer is the
-// mobile cache, which streams from a file or a chunked remote source. wasm
-// reaches microthumb through `make_thumbnail_in_memory` above instead.
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-mod bounded {
-	use std::io::{BufRead, Seek, Write};
-
-	use image::codecs::webp::WebPEncoder;
-
-	use super::*;
-
-	pub use microthumb::DEFAULT_MEM_BUDGET as DEFAULT_THUMBNAIL_MEM_BUDGET;
-	pub use microthumb::{ByteSource, FileSource};
-	use microthumb::{ThumbError, ThumbSpec};
-
-	/// [`microthumb::ByteSource`] over any `BufRead + Seek` — the local-file
-	/// path. `len` is the caller-declared size; reads past it answer 0.
-	struct ReadSeekSource<R> {
-		inner: R,
-		len: u64,
-	}
-
-	impl<R: BufRead + Seek + Send> ByteSource for ReadSeekSource<R> {
-		fn len(&self) -> u64 {
-			self.len
-		}
-
-		fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-			if offset >= self.len {
-				return Ok(0);
-			}
-			self.inner.seek(std::io::SeekFrom::Start(offset))?;
-			self.inner.read(buf)
-		}
-	}
-
-	/// Resident bytes a [`RemoteChunkSource`] keeps for the whole decode (its
-	/// two chunk slots) — callers subtract this from the budget they hand
-	/// [`make_thumbnail_from_source`], because the pipeline's own accounting
-	/// cannot see the source's memory.
-	pub const REMOTE_SOURCE_RESIDENT_BYTES: usize = 2 * crate::consts::CHUNK_SIZE_U64 as usize;
-
-	/// Encodes a `target_width`×`target_height` webp thumbnail of `image_reader`
-	/// into `out` without ever materialising a full decoded frame: microthumb
-	/// streams every format it can (IDCT-scaled JPEG, PNG scanlines, HEIF tiles,
-	/// embedded previews) and refuses anything whose honest decode peak exceeds
-	/// `mem_budget` bytes ([`DEFAULT_THUMBNAIL_MEM_BUDGET`] fits an iOS
-	/// file-provider extension's ~20 MB jetsam ceiling). `Ok(None)` means no
-	/// thumbnail could be made within the budget — or the bytes are not a
-	/// supported image, which the sniff decides; `mime` is unused and kept for
-	/// callers that log it.
-	pub fn make_thumbnail<R, W>(
-		_mime: Option<&str>,
-		image_file_size: u64,
-		image_reader: R,
-		target_width: u32,
-		target_height: u32,
-		mem_budget: usize,
-		out: &mut W,
-	) -> Result<Option<ThumbnailInfo>, Error>
-	where
-		R: BufRead + Seek + Send + 'static,
-		W: Write,
-	{
-		let source = ReadSeekSource {
-			inner: image_reader,
-			len: image_file_size,
-		};
-		// Local bytes: there is no download to protect, so a decode is always
-		// allowed.
-		make_thumbnail_from_source(
-			Box::new(source),
-			target_width,
-			target_height,
-			mem_budget,
-			true,
-			out,
-		)
-	}
-
-	/// [`make_thumbnail`] for callers that already hold a [`ByteSource`] —
-	/// notably [`RemoteChunkSource`], where lazy chunk fetches mean an
-	/// embedded-preview hit never downloads the rest of the file.
-	pub fn make_thumbnail_from_source<W>(
-		source: Box<dyn ByteSource>,
-		target_width: u32,
-		target_height: u32,
-		mem_budget: usize,
-		allow_full_decode: bool,
-		out: &mut W,
-	) -> Result<Option<ThumbnailInfo>, Error>
-	where
-		W: Write,
-	{
-		let spec = ThumbSpec {
-			target_width,
-			target_height,
-			mem_budget,
-			allow_full_decode,
-		};
-		let (small, thumb_source) = match microthumb::generate(source, &spec) {
-			Ok(Some(thumb)) => (thumb.image, thumb.source),
-			Ok(None) => return Ok(None),
-			// Corrupt or refused bytes are the same cacheable "no thumbnail"
-			// verdict the sniff gives unsupported formats — parity with the
-			// old image-crate path, whose Unsupported errors the mobile layer
-			// mapped to NoThumbnail. Only transport/system errors stay hard:
-			// an offline blip must never stick a permanent "no thumbnail"
-			// verdict in the platform's cache.
-			Err(e @ (ThumbError::Decode(_) | ThumbError::Geometry)) => {
-				tracing::debug!("thumbnail decode refused: {e}");
-				return Ok(None);
-			}
-			Err(ThumbError::Io(e)) => return Err(e.into()),
-		};
-		let Some(rgba) = image::RgbaImage::from_vec(small.width, small.height, small.rgba) else {
-			return Err(Error::custom(
-				ErrorKind::ImageError,
-				"thumbnail canvas has an inconsistent buffer".to_string(),
-			));
-		};
-		let img = DynamicImage::ImageRgba8(rgba);
-		let created_width = target_width.min(img.width());
-		let created_height = target_height.min(img.height());
-		let thumbnail = img.resize_to_fill(created_width, created_height, FilterType::CatmullRom);
-		let encoder = WebPEncoder::new_lossless(out);
-		thumbnail.write_with_encoder(encoder)?;
-		Ok(Some(ThumbnailInfo {
-			width: created_width,
-			height: created_height,
-			source: thumb_source,
-		}))
-	}
-
-	/// Which path produced a thumbnail, re-exported so callers can log it
-	/// without depending on `microthumb` directly.
-	pub use microthumb::ThumbSource;
-
-	/// The thumbnail that was written, and how it was obtained.
-	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-	pub struct ThumbnailInfo {
-		pub width: u32,
-		pub height: u32,
-		/// Cheap embedded preview vs a real decode — orders of magnitude apart
-		/// in bytes fetched and CPU spent, and otherwise indistinguishable
-		/// from the outside.
-		pub source: ThumbSource,
-	}
-
-	/// [`microthumb::ByteSource`] that fetches and decrypts 1 MiB chunks of a
-	/// remote file on demand, keeping only the last two — so a thumbnail served
-	/// by an embedded preview costs one chunk of download, not the file. Sync by
-	/// contract (microthumb runs inside `spawn_blocking`); each miss bridges to
-	/// the async chunk fetch via `Handle::block_on`, which is legal there.
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	/// [`ByteSource`] that fetches and decrypts 1 MiB chunks of a remote file on
+	/// demand, keeping only the last two — so a thumbnail served by an embedded
+	/// preview costs one chunk of download, not the file.
+	///
+	/// Synchronous by contract, because the pipeline is. The bridge to the async
+	/// fetch is the one genuinely per-target piece: on native a
+	/// `Handle::block_on` inside `spawn_blocking`, on wasm a channel round-trip
+	/// to the async runtime from a dedicated worker (see
+	/// [`over_requests`](Self::over_requests)). Everything else — the two-slot
+	/// cache, the cancel contract, the short reads at chunk boundaries — is
+	/// shared.
 	pub struct RemoteChunkSource {
-		// Owned, so the source can move into the `spawn_blocking` closure the
-		// pipeline runs in.
-		client: std::sync::Arc<crate::auth::Client>,
-		file: crate::fs::file::RemoteFile,
-		handle: tokio::runtime::Handle,
-		/// Checked before every fetch: cancellation surfaces as
+		fetch: Box<dyn FnMut(u64, u64) -> std::io::Result<Vec<u8>> + Send>,
+		/// Checked before every read: cancellation surfaces as
 		/// `ErrorKind::Interrupted`, which unwinds the decode through its normal
 		/// error path at chunk granularity — the same points an async decoder
 		/// would get to cancel at.
-		cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+		cancel: Option<Arc<AtomicBool>>,
 		len: u64,
 		slots: [Option<(u64, Vec<u8>)>; 2],
 		next_evict: usize,
 	}
 
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	impl RemoteChunkSource {
-		pub fn new(
-			client: std::sync::Arc<crate::auth::Client>,
-			file: crate::fs::file::RemoteFile,
-			handle: tokio::runtime::Handle,
-			cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+		fn with_fetcher(
+			len: u64,
+			cancel: Option<Arc<AtomicBool>>,
+			fetch: Box<dyn FnMut(u64, u64) -> std::io::Result<Vec<u8>> + Send>,
 		) -> Self {
-			let len = file.size();
 			RemoteChunkSource {
-				client,
-				file,
-				handle,
+				fetch,
 				cancel,
 				len,
 				slots: [None, None],
 				next_evict: 0,
 			}
+		}
+
+		/// The native bridge: a miss blocks the calling thread on the async
+		/// fetch, which is legal because the pipeline runs inside
+		/// `spawn_blocking`.
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		pub fn new<Id: Send + Sync + 'static>(
+			client: Arc<Client>,
+			file: RemoteFile<Id>,
+			handle: tokio::runtime::Handle,
+			cancel: Option<Arc<AtomicBool>>,
+		) -> Self {
+			let len = file.size();
+			Self::with_fetcher(
+				len,
+				cancel,
+				Box::new(move |start, end| {
+					handle
+						.block_on(fetch_range(&client, &file, start, end))
+						.map_err(std::io::Error::other)
+				}),
+			)
+		}
+
+		/// The wasm bridge: a miss posts the range to the async runtime and
+		/// parks this thread on the reply.
+		///
+		/// Only ever driven from [`decode_worker`], which is where the parking
+		/// is legal; the driver side is [`thumbnail_remote_file`].
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		fn over_requests(
+			len: u64,
+			cancel: Option<Arc<AtomicBool>>,
+			requests: tokio::sync::mpsc::UnboundedSender<ChunkRequest>,
+		) -> Self {
+			// One reply channel for the whole decode, not one per request: the
+			// source blocks until each answer arrives, so there is never more
+			// than one in flight.
+			let (reply, replies) = std::sync::mpsc::channel();
+			Self::with_fetcher(
+				len,
+				cancel,
+				Box::new(move |start, end| {
+					// A dropped driver (the caller's future went away) closes
+					// one of these; either way the decode unwinds at the same
+					// chunk granularity a cancel flag would give it.
+					let cancelled = || {
+						std::io::Error::new(std::io::ErrorKind::Interrupted, "thumbnail cancelled")
+					};
+					requests
+						.send(ChunkRequest {
+							start,
+							end,
+							reply: reply.clone(),
+						})
+						.map_err(|_| cancelled())?;
+					replies.recv().map_err(|_| cancelled())?
+				}),
+			)
 		}
 
 		fn chunk(&mut self, index: u64) -> std::io::Result<&Vec<u8>> {
@@ -622,7 +488,7 @@ mod bounded {
 			if self
 				.cancel
 				.as_ref()
-				.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+				.is_some_and(|c| c.load(Ordering::Relaxed))
 			{
 				return Err(std::io::Error::new(
 					std::io::ErrorKind::Interrupted,
@@ -640,21 +506,7 @@ mod bounded {
 			}
 			let start = index * crate::consts::CHUNK_SIZE_U64;
 			let end = (start + crate::consts::CHUNK_SIZE_U64).min(self.len);
-			let (client, file) = (&self.client, &self.file);
-			let data = self
-				.handle
-				.block_on(async move {
-					use futures::AsyncReadExt;
-					let mut reader =
-						crate::fs::file::read::FileReaderBuilder::new(client.unauthed(), file)
-							.with_start(start)
-							.with_end(end)
-							.build();
-					let mut data = Vec::with_capacity((end - start) as usize);
-					reader.read_to_end(&mut data).await?;
-					Ok::<_, Error>(data)
-				})
-				.map_err(std::io::Error::other)?;
+			let data = (self.fetch)(start, end)?;
 			let slot = self.next_evict;
 			self.next_evict = (self.next_evict + 1) % self.slots.len();
 			self.slots[slot] = Some((index, data));
@@ -662,7 +514,6 @@ mod bounded {
 		}
 	}
 
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	impl ByteSource for RemoteChunkSource {
 		fn len(&self) -> u64 {
 			self.len
@@ -684,101 +535,420 @@ mod bounded {
 			Ok(n)
 		}
 	}
+
+	/// One chunk fetch, crossing from the decode worker to the async runtime.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	struct ChunkRequest {
+		start: u64,
+		end: u64,
+		reply: std::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+	}
+
+	/// Runs the synchronous pipeline on ONE long-lived dedicated wasm worker.
+	///
+	/// Which thread this is matters, in three ways:
+	/// - **Not the commander.** It drives every async task in the SDK, the very
+	///   chunk fetches a blocked decode waits for included.
+	/// - **Not a rayon worker.** `runtime::do_cpu_intensive` IS the rayon pool,
+	///   and chunk DECRYPTION runs there too — a decode parked on a rayon worker
+	///   would be waiting on the pool that has to run to unblock it.
+	/// - **One worker, not one per call.** Each `runtime::spawn` instantiates a
+	///   fresh wasm module and its thread state in the shared linear memory that
+	///   is never returned to the host, and retains the worker's JS wrapper for
+	///   the life of the spawning thread. A worker per thumbnail would grow
+	///   exactly the memory this pipeline exists to bound. Serialising decodes
+	///   is what the budget assumes anyway.
+	///
+	/// Parking here is legal: `wasm-full` builds with `+atomics`, where `std`
+	/// selects the futex parker, and this is a dedicated worker rather than the
+	/// JS main thread.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	mod decode_worker {
+		use std::sync::{OnceLock, mpsc};
+
+		type Job = Box<dyn FnOnce() + Send>;
+
+		static JOBS: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
+
+		pub(super) fn submit<T: Send + 'static>(
+			job: impl FnOnce() -> T + Send + 'static,
+		) -> tokio::sync::oneshot::Receiver<T> {
+			let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+			let jobs = JOBS.get_or_init(|| {
+				let (tx, rx) = mpsc::channel::<Job>();
+				crate::runtime::spawn(move || {
+					// `recv` parks this worker between jobs. The sender lives in
+					// a static, so it never errors and the worker never exits —
+					// which is the point: the wasm module is instantiated once.
+					while let Ok(job) = rx.recv() {
+						job();
+					}
+				});
+				tx
+			});
+			// The receiving worker never exits, so this cannot fail.
+			let _ = jobs.send(Box::new(move || {
+				let _ = result_tx.send(job());
+			}));
+			result_rx
+		}
+	}
+
+	/// Thumbnails a remote file straight from its chunks, off the async
+	/// runtime's threads: the webp bytes and the verdict, without the file ever
+	/// being resident in full.
+	///
+	/// The two arms differ only in how the synchronous pipeline is taken off the
+	/// runtime and how its source gets back on it.
+	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+	pub(crate) async fn thumbnail_remote_file<Id: Send + Sync + 'static>(
+		client: Arc<Client>,
+		file: RemoteFile<Id>,
+		spec: ThumbSpec,
+	) -> Result<(ThumbnailOutcome, Vec<u8>), Error> {
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			// A dropped caller (a cancelled request, a closed view) leaves the
+			// blocking closure running detached with live network fetches. The
+			// guard flips the source's cancel flag so its next read answers
+			// Interrupted instead.
+			struct CancelOnDrop(Option<Arc<AtomicBool>>);
+			impl Drop for CancelOnDrop {
+				fn drop(&mut self) {
+					if let Some(flag) = self.0.take() {
+						flag.store(true, Ordering::Relaxed);
+					}
+				}
+			}
+			let cancel = Arc::new(AtomicBool::new(false));
+			let mut guard = CancelOnDrop(Some(cancel.clone()));
+			let source = RemoteChunkSource::new(
+				client,
+				file,
+				tokio::runtime::Handle::current(),
+				Some(cancel),
+			);
+			let joined = tokio::task::spawn_blocking(move || {
+				let mut webp = Vec::new();
+				let outcome = make_thumbnail_from_source(
+					Box::new(source),
+					&spec,
+					ThumbnailFit::Contain,
+					&mut webp,
+				)?;
+				Ok::<_, Error>((outcome, webp))
+			})
+			.await;
+			// The decode is over — nothing is left for a late drop to cancel.
+			guard.0 = None;
+			joined.map_err(|e| {
+				Error::custom(
+					ErrorKind::ImageError,
+					format!("thumbnail decode task failed: {e}"),
+				)
+			})?
+		}
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+			// No cancel flag: dropping this future drops `incoming`, and the
+			// source's next request fails the same way.
+			let source = RemoteChunkSource::over_requests(file.size(), None, requests);
+			let mut done = decode_worker::submit(move || {
+				let mut webp = Vec::new();
+				make_thumbnail_from_source(
+					Box::new(source),
+					&spec,
+					ThumbnailFit::Contain,
+					&mut webp,
+				)
+				.map(|outcome| (outcome, webp))
+			});
+			let died = || {
+				Error::custom(
+					ErrorKind::ImageError,
+					"thumbnail decode worker died".to_string(),
+				)
+			};
+			loop {
+				tokio::select! {
+					biased;
+					result = &mut done => return result.map_err(|_| died())?,
+					request = incoming.recv() => {
+						let Some(request) = request else {
+							// The source was dropped inside the worker: no
+							// further chunk can be asked for, only a result.
+							return done.await.map_err(|_| died())?;
+						};
+						let data = fetch_range(&client, &file, request.start, request.end)
+							.await
+							.map_err(std::io::Error::other);
+						let _ = request.reply.send(data);
+					}
+				}
+			}
+		}
+	}
 }
 
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub use bounded::{
-	ByteSource, DEFAULT_THUMBNAIL_MEM_BUDGET, FileSource, REMOTE_SOURCE_RESIDENT_BYTES,
-	RemoteChunkSource, ThumbSource, ThumbnailInfo, make_thumbnail, make_thumbnail_from_source,
-};
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+pub use remote_chunks::RemoteChunkSource;
+
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+mod js_impls {
+	use filen_macros::js_type;
+
+	use super::{
+		APP_PROCESS_THUMBNAIL_MEM_BUDGET, MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES,
+		ThumbSource, ThumbSpec, ThumbnailOutcome, is_supported_thumbnail_mime,
+		remote_chunks::thumbnail_remote_file,
+	};
+	use crate::{
+		Error,
+		auth::JsClient,
+		error::MetadataWasNotDecryptedError,
+		fs::file::{AnonymousRemoteFile, traits::HasFileInfo},
+		js::File,
+		runtime::do_on_commander,
+	};
+
+	#[js_type(import)]
+	pub struct MakeThumbnailInMemoryParams {
+		pub file: File,
+		pub max_width: u32,
+		pub max_height: u32,
+	}
+
+	/// A thumbnail, and what it cost to make.
+	#[js_type(export)]
+	pub struct InMemoryThumbnail {
+		// this is correct, ts requires the specifity
+		// because of https://github.com/microsoft/typescript/issues/62546
+		// not sure who to upstream this to, tsify, js_sys, or wasm-bindgen
+		#[cfg(feature = "wasm-full")]
+		#[tsify(type = "Uint8Array<ArrayBuffer>")]
+		pub webp_data: serde_bytes::ByteBuf,
+		#[cfg(feature = "uniffi")]
+		pub webp_data: Vec<u8>,
+		/// Dimensions of the encoded image. Never larger than the request and
+		/// often smaller: the memory budget clamps the decode canvas, an
+		/// embedded preview can be smaller still, and nothing is ever upscaled.
+		pub width: u32,
+		pub height: u32,
+		/// True when this came from the image's own embedded preview (EXIF
+		/// IFD1, a HEIF `thmb` item) rather than a decode of the full image —
+		/// a couple of container reads against, at worst, a whole-file stream.
+		/// The first question worth asking when thumbnails feel slow.
+		pub from_embedded_preview: bool,
+	}
+
+	/// What came of a thumbnail request.
+	///
+	/// Only the transport can fail outright (that arrives as a rejected
+	/// promise / a thrown error); every variant here is a settled, CACHEABLE
+	/// answer about this file, and they are kept apart because they mean
+	/// different things to a UI: `unsupported` is final, `overBudget` says the
+	/// image was recognised but too expensive for this host to render at this
+	/// size, and `corrupt` says the bytes themselves are broken.
+	#[js_type(export, no_deser, tagged)]
+	pub enum MakeThumbnailInMemoryResult {
+		Thumbnail {
+			thumbnail: InMemoryThumbnail,
+		},
+		/// Not an image format this build decodes — decided by the file's
+		/// magic bytes, not by its stored mime.
+		Unsupported,
+		/// A recognised image, but no thumbnail fits: over the host's memory
+		/// budget, over the pipeline's work ceiling, or too large to stream and
+		/// carrying no embedded preview.
+		OverBudget,
+		/// A recognised format whose bitstream the decoder refused.
+		Corrupt {
+			message: String,
+		},
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+	)]
+	// Every sibling `impl JsClient` carries this and this one did not, so the
+	// method compiled for uniffi (its result type even has a `Vec<u8>` field
+	// written specifically for that boundary) but never reached the generated
+	// Kotlin/Swift — the one consumer of the unbounded path was unable to call
+	// it. Exported now that the path is bounded.
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
+	impl JsClient {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailInMemory")
+		)]
+		pub async fn make_thumbnail_in_memory(
+			&self,
+			params: MakeThumbnailInMemoryParams,
+		) -> Result<MakeThumbnailInMemoryResult, Error> {
+			let this = self.inner();
+			do_on_commander(move || async move {
+				// Thumbnailing only reads the file, so a file from a link or a
+				// shared-in listing (which reports no stable id) is fine.
+				let file = AnonymousRemoteFile::try_from(params.file)?;
+				let mime = file.mime().ok_or(MetadataWasNotDecryptedError)?;
+				if !is_supported_thumbnail_mime(mime) {
+					return Ok(MakeThumbnailInMemoryResult::Unsupported);
+				}
+				let spec = ThumbSpec {
+					target_width: params.max_width,
+					target_height: params.max_height,
+					// The chunk source's two resident slots live outside the
+					// pipeline's own accounting; hand the decode what is
+					// actually left.
+					mem_budget: APP_PROCESS_THUMBNAIL_MEM_BUDGET
+						.saturating_sub(REMOTE_SOURCE_RESIDENT_BYTES),
+					// Past the cap, the embedded preview is still worth a
+					// chunk or two — streaming the whole thing is not.
+					allow_full_decode: file.size() <= MAX_THUMBNAIL_SOURCE_BYTES,
+				};
+				let (outcome, webp_data) = thumbnail_remote_file(this, file, spec).await?;
+				Ok(match outcome {
+					ThumbnailOutcome::Thumbnail(info) => MakeThumbnailInMemoryResult::Thumbnail {
+						thumbnail: InMemoryThumbnail {
+							#[cfg(feature = "wasm-full")]
+							webp_data: serde_bytes::ByteBuf::from(webp_data),
+							#[cfg(feature = "uniffi")]
+							webp_data,
+							width: info.width,
+							height: info.height,
+							from_embedded_preview: info.source == ThumbSource::EmbeddedPreview,
+						},
+					},
+					ThumbnailOutcome::Unsupported => MakeThumbnailInMemoryResult::Unsupported,
+					ThumbnailOutcome::OverBudget => MakeThumbnailInMemoryResult::OverBudget,
+					ThumbnailOutcome::Corrupt(message) => {
+						MakeThumbnailInMemoryResult::Corrupt { message }
+					}
+				})
+			})
+			.await
+		}
+	}
+}
 
 #[cfg(test)]
 mod tests {
-	use std::io::Cursor;
+	use microthumb::MemSource;
 
-	use image::{ImageFormat, RgbImage};
-
-	use super::make_thumbnail;
+	use super::{
+		DEFAULT_THUMBNAIL_MEM_BUDGET, ThumbSpec, ThumbnailFit, ThumbnailOutcome,
+		make_thumbnail_from_source,
+	};
 
 	fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+		use image::{ImageFormat, RgbImage};
 		let image = RgbImage::from_fn(width, height, |x, y| {
 			image::Rgb([(x % 256) as u8, (y % 256) as u8, 0])
 		});
 		let mut bytes = Vec::new();
 		image
-			.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+			.write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
 			.unwrap();
 		bytes
+	}
+
+	/// The shape every caller uses: bytes in, webp out, plus a verdict.
+	fn thumbnail(
+		bytes: Vec<u8>,
+		target: u32,
+		mem_budget: usize,
+		fit: ThumbnailFit,
+	) -> (ThumbnailOutcome, Vec<u8>) {
+		let mut out = Vec::new();
+		let outcome = make_thumbnail_from_source(
+			Box::new(MemSource(bytes)),
+			&ThumbSpec::new(target, target, mem_budget),
+			fit,
+			&mut out,
+		)
+		.unwrap();
+		(outcome, out)
 	}
 
 	#[test]
 	fn refuses_sources_above_the_memory_budget() {
 		// A budget too small even for PNG's row buffers: the pipeline must
-		// answer None (no thumbnail) rather than decode past its ceiling.
-		let bytes = png_bytes(100, 80);
-		let mut out = Vec::new();
-		let len = bytes.len() as u64;
-		let result = make_thumbnail(
-			Some("image/png"),
-			len,
-			Cursor::new(bytes),
-			32,
-			32,
-			1024,
-			&mut out,
-		)
-		.unwrap();
-		assert_eq!(result, None);
+		// refuse rather than decode past its ceiling — and say that the FORMAT
+		// was fine, which is what makes the verdict retryable elsewhere.
+		let (outcome, out) = thumbnail(png_bytes(100, 80), 32, 1024, ThumbnailFit::Cover);
+		assert_eq!(outcome, ThumbnailOutcome::OverBudget);
 		assert!(out.is_empty());
 	}
 
 	#[test]
 	fn makes_a_thumbnail_within_the_default_budget() {
-		let bytes = png_bytes(100, 80);
-		let mut out = Vec::new();
-		let len = bytes.len() as u64;
-		let result = make_thumbnail(
-			Some("image/png"),
-			len,
-			Cursor::new(bytes),
+		let (outcome, out) = thumbnail(
+			png_bytes(100, 80),
 			32,
-			32,
-			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
-			&mut out,
-		)
-		.unwrap();
-		let info = result.expect("a thumbnail");
+			DEFAULT_THUMBNAIL_MEM_BUDGET,
+			ThumbnailFit::Cover,
+		);
+		let ThumbnailOutcome::Thumbnail(info) = outcome else {
+			panic!("expected a thumbnail, got {outcome:?}");
+		};
 		assert_eq!((info.width, info.height), (32, 32));
 		assert!(!out.is_empty());
 	}
 
 	#[test]
+	fn cover_crops_to_the_box_and_contain_keeps_the_aspect() {
+		// The one thing the two wrappers ask for differently: a grid tile wants
+		// an exact square, an in-memory preview wants the picture's shape.
+		let (cover, _) = thumbnail(
+			png_bytes(400, 200),
+			64,
+			DEFAULT_THUMBNAIL_MEM_BUDGET,
+			ThumbnailFit::Cover,
+		);
+		let ThumbnailOutcome::Thumbnail(cover) = cover else {
+			panic!("expected a thumbnail");
+		};
+		assert_eq!((cover.width, cover.height), (64, 64));
+
+		let (contain, _) = thumbnail(
+			png_bytes(400, 200),
+			64,
+			DEFAULT_THUMBNAIL_MEM_BUDGET,
+			ThumbnailFit::Contain,
+		);
+		let ThumbnailOutcome::Thumbnail(contain) = contain else {
+			panic!("expected a thumbnail");
+		};
+		assert_eq!((contain.width, contain.height), (64, 32));
+	}
+
+	#[test]
 	fn never_upscales_small_sources() {
-		let bytes = png_bytes(16, 16);
-		let mut out = Vec::new();
-		let len = bytes.len() as u64;
-		let result = make_thumbnail(
-			Some("image/png"),
-			len,
-			Cursor::new(bytes),
+		let (outcome, _) = thumbnail(
+			png_bytes(16, 16),
 			64,
-			64,
-			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
-			&mut out,
-		)
-		.unwrap();
-		let info = result.expect("a thumbnail");
+			DEFAULT_THUMBNAIL_MEM_BUDGET,
+			ThumbnailFit::Cover,
+		);
+		let ThumbnailOutcome::Thumbnail(info) = outcome else {
+			panic!("expected a thumbnail, got {outcome:?}");
+		};
 		assert_eq!((info.width, info.height), (16, 16));
 	}
 
 	use std::sync::Arc;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-	/// A [`super::ByteSource`] with [`super::RemoteChunkSource`]'s observable
-	/// behavior, minus the network: short reads at every chunk boundary, and a
-	/// cancel flag answered with `Interrupted` — optionally flipped by the
-	/// source itself after N reads, standing in for a batch cancel landing
-	/// mid-decode.
+	/// A [`microthumb::ByteSource`] with [`super::RemoteChunkSource`]'s
+	/// observable behavior, minus the network: short reads at every chunk
+	/// boundary, and a cancel flag answered with `Interrupted` — optionally
+	/// flipped by the source itself after N reads, standing in for a batch
+	/// cancel landing mid-decode.
 	struct ChunkySource {
 		data: Vec<u8>,
 		chunk: usize,
@@ -787,7 +957,7 @@ mod tests {
 		reads: AtomicUsize,
 	}
 
-	impl super::ByteSource for ChunkySource {
+	impl microthumb::ByteSource for ChunkySource {
 		fn len(&self) -> u64 {
 			self.data.len() as u64
 		}
@@ -831,16 +1001,16 @@ mod tests {
 			reads: AtomicUsize::new(0),
 		};
 		let mut out = Vec::new();
-		let result = super::make_thumbnail_from_source(
+		let outcome = make_thumbnail_from_source(
 			Box::new(source),
-			32,
-			32,
-			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
-			true,
+			&ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET),
+			ThumbnailFit::Cover,
 			&mut out,
 		)
 		.unwrap();
-		let info = result.expect("a thumbnail");
+		let ThumbnailOutcome::Thumbnail(info) = outcome else {
+			panic!("expected a thumbnail, got {outcome:?}");
+		};
 		assert_eq!((info.width, info.height), (32, 32));
 		assert!(!out.is_empty());
 	}
@@ -849,7 +1019,7 @@ mod tests {
 	fn a_cancel_mid_decode_is_a_hard_error_not_a_cached_verdict() {
 		// The flag flips after the header reads succeed, the way a batch
 		// cancel lands mid-decode. Interrupted must surface as Err — never as
-		// Ok(None), which the platform would cache as "no thumbnail" forever.
+		// a settled verdict, which the platform would cache forever.
 		let source = ChunkySource {
 			data: png_bytes(300, 200),
 			chunk: 1024,
@@ -858,57 +1028,69 @@ mod tests {
 			reads: AtomicUsize::new(0),
 		};
 		let mut out = Vec::new();
-		let result = super::make_thumbnail_from_source(
+		let result = make_thumbnail_from_source(
 			Box::new(source),
-			32,
-			32,
-			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
-			true,
+			&ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET),
+			ThumbnailFit::Cover,
 			&mut out,
 		);
 		assert!(result.is_err(), "expected a hard error, got {result:?}");
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[test]
 	fn svg_rasterises_through_the_bounded_pipeline() {
 		let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red"/></svg>"#.to_vec();
-		let len = bytes.len() as u64;
-		let mut out = Vec::new();
-		let result = make_thumbnail(
-			Some("image/svg+xml"),
-			len,
-			Cursor::new(bytes),
-			32,
-			32,
-			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
-			&mut out,
-		)
-		.unwrap();
-		let info = result.expect("an svg thumbnail");
+		let (outcome, out) =
+			thumbnail(bytes, 32, DEFAULT_THUMBNAIL_MEM_BUDGET, ThumbnailFit::Cover);
+		let ThumbnailOutcome::Thumbnail(info) = outcome else {
+			panic!("expected an svg thumbnail, got {outcome:?}");
+		};
 		assert_eq!((info.width, info.height), (32, 32));
 		assert!(!out.is_empty());
 	}
 
 	#[test]
-	fn corrupt_bytes_are_the_cacheable_no_thumbnail_verdict() {
-		// Sniffable as JPEG, undecodable past the marker: the same cacheable
-		// None the sniff gives unsupported formats — not an error the caller
-		// retries forever.
+	fn corrupt_bytes_are_a_settled_verdict_not_an_error() {
+		// Sniffable as JPEG, undecodable past the marker: a verdict the caller
+		// may cache, not an error it retries forever — and distinguishable
+		// from "we do not decode this format".
 		let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
 		bytes.extend_from_slice(&[0x00; 64]);
-		let len = bytes.len() as u64;
-		let mut out = Vec::new();
-		let result = make_thumbnail(
-			Some("image/jpeg"),
-			len,
-			Cursor::new(bytes),
+		let (outcome, out) =
+			thumbnail(bytes, 32, DEFAULT_THUMBNAIL_MEM_BUDGET, ThumbnailFit::Cover);
+		assert!(
+			matches!(outcome, ThumbnailOutcome::Corrupt(_)),
+			"got {outcome:?}"
+		);
+		assert!(out.is_empty());
+	}
+
+	#[test]
+	fn a_truncated_image_is_a_verdict_too_even_when_its_decoder_calls_it_io() {
+		// `png` reports running off the end as an io error, not a decode one.
+		// That must not be mistaken for the network dropping: only the sources
+		// can speak for the transport, and none of them produce UnexpectedEof.
+		let mut bytes = png_bytes(300, 200);
+		bytes.truncate(bytes.len() / 3);
+		let (outcome, out) =
+			thumbnail(bytes, 32, DEFAULT_THUMBNAIL_MEM_BUDGET, ThumbnailFit::Cover);
+		assert!(
+			matches!(outcome, ThumbnailOutcome::Corrupt(_)),
+			"got {outcome:?}"
+		);
+		assert!(out.is_empty());
+	}
+
+	#[test]
+	fn bytes_that_are_not_an_image_are_unsupported() {
+		let (outcome, out) = thumbnail(
+			b"this is not an image at all, not even close".to_vec(),
 			32,
-			32,
-			super::DEFAULT_THUMBNAIL_MEM_BUDGET,
-			&mut out,
-		)
-		.unwrap();
-		assert_eq!(result, None);
+			DEFAULT_THUMBNAIL_MEM_BUDGET,
+			ThumbnailFit::Cover,
+		);
+		assert_eq!(outcome, ThumbnailOutcome::Unsupported);
 		assert!(out.is_empty());
 	}
 }

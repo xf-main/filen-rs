@@ -197,8 +197,12 @@ fn run(path: &Path, spec: &ThumbSpec) -> (Outcome, u64) {
 	let file = std::fs::File::open(path).expect("fixture opens");
 	let src = Counting(FileSource::new(file).expect("file source"), read.clone());
 	let outcome = match generate(Box::new(src), spec) {
-		Ok(Some(t)) => Outcome::Thumb(t.image.width, t.image.height, t.source),
-		Ok(None) => Outcome::Nothing,
+		Ok(microthumb::ThumbOutcome::Thumbnail(t)) => {
+			Outcome::Thumb(t.image.width, t.image.height, t.source)
+		}
+		Ok(microthumb::ThumbOutcome::Unsupported | microthumb::ThumbOutcome::OverBudget) => {
+			Outcome::Nothing
+		}
 		Err(e) => Outcome::Failed(e.to_string()),
 	};
 	(outcome, read.load(Ordering::Relaxed))

@@ -18,7 +18,9 @@ import init, {
 	EntryNameErrorJS,
 	type AnyLinkedDirWithContext,
 	type CacheStatusMessage,
-	type CacheSearchSnapshot
+	type CacheSearchSnapshot,
+	type MakeThumbnailInMemoryResult,
+	type InMemoryThumbnail
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
@@ -33,6 +35,18 @@ console.log(`WASM initialized ${threads} threads`)
 const now = Date.now()
 await initThreadPool(threads)
 console.log(`WASM initialized ${threads} in ${Date.now() - now}ms`)
+
+/// `makeThumbnailInMemory` now answers with a verdict, not `undefined`: a
+/// caller can tell "we do not decode this" from "too expensive here" from
+/// "these bytes are broken". Tests that expect a picture assert the happy
+/// variant and narrow to it.
+function expectThumbnail(result: MakeThumbnailInMemoryResult): InMemoryThumbnail {
+	expect(result.type).toBe("thumbnail")
+	if (result.type !== "thumbnail") {
+		throw new Error(`expected a thumbnail, got ${JSON.stringify(result)}`)
+	}
+	return result.thumbnail
+}
 
 let state: Client
 let shareClient: Client
@@ -175,20 +189,21 @@ test("thumbnail decode stays inside a bounded memory budget", async () => {
 	const file = await state.uploadFile(bytes, { parent: testDir, name: "memory-12mp.png" })
 	expect(file.canMakeThumbnail).toBe(true)
 
-	const thumb = await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 })
+	const thumb = expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
 	const after = heapBytes()
 	console.log(
 		`12 MP png thumbnail: source ${bytes.length} B, heap ${before} -> ${after} (+${after - before} bytes)`
 	)
 
-	expect(thumb).toBeDefined()
-	const bitmap = await createImageBitmap(new Blob([thumb!.webpData], { type: "image/webp" }))
+	const bitmap = await createImageBitmap(new Blob([thumb.webpData], { type: "image/webp" }))
 	expect(bitmap.width).toBeLessThanOrEqual(256)
 	expect(bitmap.height).toBeLessThanOrEqual(256)
 	bitmap.close()
 
-	// Upload buffers, the resident source bytes and a ~7 MiB accumulator: the
-	// bounded pipeline lands around 20 MiB. The 48 MB frame alone would clear
+	// Upload buffers, the decode worker's own thread state and a ~7 MiB
+	// accumulator: the bounded pipeline lands around 20 MiB. The source bytes
+	// are NOT in here any more — the decode streams them a chunk at a time
+	// straight off the network. The 48 MB frame alone would clear
 	// this bound, which is the regression the test exists to catch. The
 	// remaining headroom is the upload's, not the decode's — the mark is taken
 	// before `uploadFile` so that growth is inside the delta. A change that
@@ -728,19 +743,24 @@ test("thumbnail", async () => {
 				return
 			}
 
-			const thumb = await state.makeThumbnailInMemory({
-				file: file,
-				maxHeight: 100,
-				maxWidth: 100
-			})
+			const thumb = expectThumbnail(
+				await state.makeThumbnailInMemory({
+					file: file,
+					maxHeight: 100,
+					maxWidth: 100
+				})
+			)
 
-			expect(thumb).toBeDefined()
+			// The reported size is what was really encoded, so it must agree
+			// with the decoded bitmap below.
+			expect(thumb.width).toBeLessThanOrEqual(100)
+			expect(thumb.height).toBeLessThanOrEqual(100)
 
-			const blob = new Blob([thumb!.webpData], { type: "image/webp" })
+			const blob = new Blob([thumb.webpData], { type: "image/webp" })
 			const bitmap = await createImageBitmap(blob)
 
-			expect(bitmap.width).toBeLessThanOrEqual(100)
-			expect(bitmap.height).toBeLessThanOrEqual(100)
+			expect(bitmap.width).toBe(thumb.width)
+			expect(bitmap.height).toBe(thumb.height)
 
 			expect(blob.type).toBe("image/webp")
 
@@ -769,22 +789,42 @@ test("large webp thumbnail", async () => {
 	// WebP has no streaming decoder here, so microthumb prices it at a full
 	// RGBA frame plus a copy (8 bytes per source pixel) and the budget decides.
 	// The committed parrot.webp is 0.67 MP and fits any budget; 3.84 MP does not
-	// fit the 12 MiB default, and is exactly what BROWSER_MEM_BUDGET buys.
+	// fit the 12 MiB default, and is exactly what APP_PROCESS_MEM_BUDGET buys.
 	const bytes = await generateImage(2400, 1600, "image/webp")
 	const file = await state.uploadFile(bytes, { parent: testDir, name: "large.webp" })
 	expect(file.canMakeThumbnail).toBe(true)
 
-	const thumb = await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 })
-	expect(thumb).toBeDefined()
+	const thumb = expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
 
-	const bitmap = await createImageBitmap(new Blob([thumb!.webpData], { type: "image/webp" }))
+	const bitmap = await createImageBitmap(new Blob([thumb.webpData], { type: "image/webp" }))
 	expect(bitmap.width).toBeLessThanOrEqual(256)
 	expect(bitmap.height).toBeLessThanOrEqual(256)
-	// Aspect preserved (resize, not resize-to-fill): 3:2 into a 256 box.
+	// Aspect preserved (contain, not cover): 3:2 into a 256 box.
 	expect(bitmap.width).toBe(256)
 	expect(bitmap.height).toBeGreaterThan(150)
+	// A generated WebP carries no embedded preview, so this can only have been
+	// a real (streamed, bounded) decode.
+	expect(thumb.fromEmbeddedPreview).toBe(false)
 	bitmap.close()
 }, 180000)
+
+test("thumbnail verdicts are distinguishable", async () => {
+	// The point of the verdicts: three different "no picture" answers that a UI
+	// treats differently. Previously all three arrived as `undefined`, and a
+	// transport failure arrived that way too.
+	const notAnImage = new TextEncoder().encode("this is not an image at all, not even close")
+	const bogus = await state.uploadFile(notAnImage, { parent: testDir, name: "bogus.png" })
+	const bogusVerdict = await state.makeThumbnailInMemory({ file: bogus, maxHeight: 64, maxWidth: 64 })
+	expect(bogusVerdict.type).toBe("unsupported")
+
+	// Real PNG magic and a real IHDR, truncated mid-image: the bytes ARE a
+	// format we decode, they are just broken — a different answer.
+	const png = await generateImage(64, 64, "image/png")
+	const truncated = png.slice(0, Math.floor(png.length / 3))
+	const broken = await state.uploadFile(truncated, { parent: testDir, name: "broken.png" })
+	const brokenVerdict = await state.makeThumbnailInMemory({ file: broken, maxHeight: 64, maxWidth: 64 })
+	expect(brokenVerdict.type).toBe("corrupt")
+})
 
 test("exif upload applies DateTimeOriginal", async () => {
 	// Each fixture in test-assets/imgs has EXIF DateTimeOriginal=2020:06:15 10:30:00

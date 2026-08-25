@@ -23,13 +23,16 @@ use crate::sink::accumulator_bytes;
 /// after the host process' own baseline.
 pub const DEFAULT_MEM_BUDGET: usize = 12 * 1024 * 1024;
 
-/// Decode budget for a browser tab, which has no 20 MB jetsam ceiling: wasm
-/// linear memory is capped at 1 GiB by the linker and is never returned to the
-/// host, so the number to bound is the process high-water mark, not a
-/// per-decode kill threshold. 64 MiB admits the whole-frame formats (WebP, QOI,
+/// Decode budget for a host that is a whole application process — a browser
+/// tab, the phone app itself — rather than a memory-capped extension: there is
+/// no 20 MB jetsam ceiling, so the number to bound is the process high-water
+/// mark, not a per-decode kill threshold. (Sized against the tightest such
+/// host, a wasm tab, whose linear memory is capped at 1 GiB by the linker and
+/// is never returned to the OS.) 64 MiB admits the whole-frame formats (WebP, QOI,
 /// BMP, GIF, TIFF — see `formats::simple`, which charges 8 bytes per source
 /// pixel) up to ~8.4 MP, where the 12 MiB default refuses anything past
-/// ~1.5 MP. Anything larger in those formats still answers `Ok(None)`: 8 B/px
+/// ~1.5 MP. Anything larger in those formats still answers
+/// [`ThumbOutcome::OverBudget`]: 8 B/px
 /// is what they really cost (measured: 7.1 B/px for a 7 MP lossless WebP or
 /// QOI whose frame arrives as RGB and is copied to RGBA, 4.1 B/px when it
 /// arrives as RGBA), and buying a bigger ceiling would mean spending it.
@@ -42,7 +45,7 @@ pub const DEFAULT_MEM_BUDGET: usize = 12 * 1024 * 1024;
 /// thumbnail for the memory, and still a third of what its whole frame would
 /// have cost. Three concurrent decodes — the practical ceiling on a thumbnail
 /// grid — are bounded at ~192 MiB of that 1 GiB.
-pub const BROWSER_MEM_BUDGET: usize = 64 * 1024 * 1024;
+pub const APP_PROCESS_MEM_BUDGET: usize = 64 * 1024 * 1024;
 
 /// The accumulator canvas never exceeds this on its long side — oversampling
 /// past ~2× the largest sane thumbnail target buys nothing. (The budget cap
@@ -152,6 +155,36 @@ impl std::fmt::Display for ThumbSource {
 pub struct Thumbnail {
 	pub image: SmallImage,
 	pub source: ThumbSource,
+}
+
+/// How a [`generate`] call ended when it did not fail outright.
+///
+/// The two no-thumbnail verdicts are deliberately distinct. They mean opposite
+/// things to a caller: `Unsupported` is final for these bytes (nothing here
+/// will ever decode them), while `OverBudget` is a verdict about the SPEC —
+/// the same source may well thumbnail under a roomier budget, or once its
+/// bytes are local and a full decode is allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbOutcome {
+	Thumbnail(Thumbnail),
+	/// The magic-byte sniff matched no format this build decodes.
+	Unsupported,
+	/// A recognised image, but nothing fit the spec: over `mem_budget`, over
+	/// the work ceiling ([`MAX_SOURCE_AREA_PIXELS`] /
+	/// [`MAX_SOURCE_SIDE_PIXELS`]), or a full decode was needed and
+	/// [`ThumbSpec::allow_full_decode`] is off.
+	OverBudget,
+}
+
+impl ThumbOutcome {
+	/// The thumbnail, if there is one — for callers that do not care WHY there
+	/// isn't.
+	pub fn thumbnail(self) -> Option<Thumbnail> {
+		match self {
+			ThumbOutcome::Thumbnail(thumb) => Some(thumb),
+			ThumbOutcome::Unsupported | ThumbOutcome::OverBudget => None,
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -348,20 +381,20 @@ pub(crate) fn decode_bounded(
 }
 
 /// Produces a downscaled (never exact-size, never upscaled) RGBA image for
-/// the request, or `Ok(None)` when the source is unsupported or nothing fits
-/// the memory budget. The caller does the final exact resize + encode — both
-/// operate on buffers this crate already bounded.
+/// the request, or says why it could not — see [`ThumbOutcome`]. The caller
+/// does the final exact resize + encode — both operate on buffers this crate
+/// already bounded.
 pub fn generate(
 	mut src: Box<dyn ByteSource>,
 	spec: &ThumbSpec,
-) -> Result<Option<Thumbnail>, ThumbError> {
+) -> Result<ThumbOutcome, ThumbError> {
 	// 1 KB rather than the 16 bytes the magic numbers need: SVG has no magic
 	// and its `<svg` root can sit behind an XML declaration, comments and a
 	// DOCTYPE. One read either way; a short read only narrows the sniff.
 	let mut prefix = [0u8; 1024];
 	let n = src.read_at(0, &mut prefix)?;
 	let Some(format) = formats::sniff(&prefix[..n]) else {
-		return Ok(None);
+		return Ok(ThumbOutcome::Unsupported);
 	};
 	// Clamped before `open`, because a decoder with an in-format scaler commits
 	// to its output resolution there.
@@ -383,24 +416,25 @@ pub fn generate(
 		.embedded_preview()
 		.unwrap_or_default()
 		.filter(|p| p.rgba.len().saturating_mul(2) <= spec.mem_budget);
-	if let Some(preview) = preview.take_if(|p| preview_suffices(p, spec)) {
-		return Ok(Some(Thumbnail {
+	let as_preview = |preview: SmallImage| {
+		ThumbOutcome::Thumbnail(Thumbnail {
 			image: apply_orientation(preview, orientation),
 			source: ThumbSource::EmbeddedPreview,
-		}));
+		})
+	};
+
+	if let Some(preview) = preview.take_if(|p| preview_suffices(p, spec)) {
+		return Ok(as_preview(preview));
 	}
 
 	if !spec.allow_full_decode {
 		// The preview was already tried above; without a decode there is
 		// nothing else to offer, and we have read only the header region.
-		return Ok(preview.map(|preview| Thumbnail {
-			image: apply_orientation(preview, orientation),
-			source: ThumbSource::EmbeddedPreview,
-		}));
+		return Ok(preview.map_or(ThumbOutcome::OverBudget, as_preview));
 	}
 
 	if let Some(image) = decode_bounded(prepared, spec)? {
-		return Ok(Some(Thumbnail {
+		return Ok(ThumbOutcome::Thumbnail(Thumbnail {
 			image: apply_orientation(image, orientation),
 			source: ThumbSource::Decoded,
 		}));
@@ -408,10 +442,7 @@ pub fn generate(
 
 	// Over budget (or over the work ceiling): an undersized preview beats no
 	// thumbnail at all.
-	Ok(preview.map(|preview| Thumbnail {
-		image: apply_orientation(preview, orientation),
-		source: ThumbSource::EmbeddedPreview,
-	}))
+	Ok(preview.map_or(ThumbOutcome::OverBudget, as_preview))
 }
 
 #[cfg(test)]

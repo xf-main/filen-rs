@@ -6,7 +6,7 @@
 use std::io::Cursor;
 
 use image::{ImageFormat, Rgb, RgbImage};
-use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbError, ThumbSpec, generate};
+use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbError, ThumbOutcome, ThumbSpec, generate};
 
 /// Most tests care only about the pixels. The ones that care about WHICH path
 /// produced them call `generate` directly and inspect `Thumbnail::source`.
@@ -14,7 +14,7 @@ fn thumb(
 	src: Box<dyn microthumb::ByteSource>,
 	spec: &ThumbSpec,
 ) -> Result<Option<microthumb::SmallImage>, microthumb::ThumbError> {
-	Ok(generate(src, spec)?.map(|t| t.image))
+	Ok(generate(src, spec)?.thumbnail().map(|t| t.image))
 }
 
 fn spec(target: u32) -> ThumbSpec {
@@ -110,7 +110,16 @@ fn webp_over_budget_is_refused_but_streaming_png_is_not() {
 #[test]
 fn unsupported_bytes_are_ok_none_not_an_error() {
 	let bytes = b"this is not an image at all, not even close".to_vec();
-	assert_eq!(thumb(Box::new(MemSource(bytes)), &spec(64)).unwrap(), None);
+	assert_eq!(
+		thumb(Box::new(MemSource(bytes.clone())), &spec(64)).unwrap(),
+		None
+	);
+	// And it is the FINAL kind of "no": no budget will ever make these bytes
+	// decode, which is what separates this from `OverBudget`.
+	assert_eq!(
+		generate(Box::new(MemSource(bytes)), &spec(64)).unwrap(),
+		ThumbOutcome::Unsupported
+	);
 }
 
 #[test]
@@ -941,6 +950,7 @@ fn the_reported_source_distinguishes_the_two_paths() {
 	let with_thumb = jpeg_with_exif_thumbnail(1);
 	let served = generate(Box::new(MemSource(with_thumb.clone())), &spec(64))
 		.unwrap()
+		.thumbnail()
 		.expect("the embedded thumbnail must serve this");
 	assert_eq!(served.source, microthumb::ThumbSource::EmbeddedPreview);
 
@@ -948,6 +958,7 @@ fn the_reported_source_distinguishes_the_two_paths() {
 	// 160 px thumb (preview_suffices needs half the requested long side).
 	let decoded = generate(Box::new(MemSource(with_thumb)), &spec(512))
 		.unwrap()
+		.thumbnail()
 		.expect("the main image must decode");
 	assert_eq!(decoded.source, microthumb::ThumbSource::Decoded);
 
@@ -955,6 +966,7 @@ fn the_reported_source_distinguishes_the_two_paths() {
 	let plain = encode(&checkerboard(256, 256), ImageFormat::Png);
 	let plain = generate(Box::new(MemSource(plain)), &spec(64))
 		.unwrap()
+		.thumbnail()
 		.expect("png must thumbnail");
 	assert_eq!(plain.source, microthumb::ThumbSource::Decoded);
 }
@@ -1015,6 +1027,7 @@ fn a_progressive_jpeg_past_the_dc_block_cap_still_serves_its_embedded_thumbnail(
 
 	let result = generate(Box::new(MemSource(bytes)), &spec(64))
 		.unwrap()
+		.thumbnail()
 		.expect("the embedded thumbnail must survive the DC parser's refusal");
 	assert_eq!(result.source, microthumb::ThumbSource::EmbeddedPreview);
 	assert!(
@@ -1039,6 +1052,7 @@ fn preview_only_serves_the_embedded_thumbnail_without_reading_the_image() {
 	let spec = ThumbSpec::preview_only(64, 64, DEFAULT_MEM_BUDGET);
 	let result = generate(Box::new(source), &spec)
 		.unwrap()
+		.thumbnail()
 		.expect("the embedded thumbnail must still be served");
 	assert_eq!(result.source, microthumb::ThumbSource::EmbeddedPreview);
 	assert!(
@@ -1055,14 +1069,16 @@ fn preview_only_serves_the_embedded_thumbnail_without_reading_the_image() {
 }
 
 #[test]
-fn preview_only_without_an_embedded_thumbnail_is_ok_none_not_a_decode() {
+fn preview_only_without_an_embedded_thumbnail_refuses_instead_of_decoding() {
 	// No embedded preview and no permission to decode: the honest answer is
 	// "no thumbnail", NOT a full decode of a file we were told not to stream.
 	let bytes = encode(&checkerboard(600, 600), ImageFormat::Png);
 	let preview_only = ThumbSpec::preview_only(64, 64, DEFAULT_MEM_BUDGET);
+	// And it says WHICH kind of "no": the format WAS recognised, so this is a
+	// verdict about the spec, not about the bytes.
 	assert_eq!(
 		generate(Box::new(MemSource(bytes)), &preview_only).unwrap(),
-		None
+		ThumbOutcome::OverBudget
 	);
 
 	// The very same source decodes fine when it IS allowed to.
@@ -1070,6 +1086,7 @@ fn preview_only_without_an_embedded_thumbnail_is_ok_none_not_a_decode() {
 	assert!(
 		generate(Box::new(MemSource(bytes)), &spec(64))
 			.unwrap()
+			.thumbnail()
 			.is_some()
 	);
 }

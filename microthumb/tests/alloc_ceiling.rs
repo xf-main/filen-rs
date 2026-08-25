@@ -24,7 +24,7 @@ fn thumb(
 	src: Box<dyn microthumb::ByteSource>,
 	spec: &ThumbSpec,
 ) -> Result<Option<microthumb::SmallImage>, microthumb::ThumbError> {
-	Ok(generate(src, spec)?.map(|t| t.image))
+	Ok(generate(src, spec)?.thumbnail().map(|t| t.image))
 }
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -393,7 +393,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 		// At a real request the accumulator canvas is a big share of the peak
 		// and is budgeted SEPARATELY from the decoder's estimate, so the
 		// budget is what this run pins.
-		let browser = ThumbSpec::new(512, 512, microthumb::BROWSER_MEM_BUDGET);
+		let browser = ThumbSpec::new(512, 512, microthumb::APP_PROCESS_MEM_BUDGET);
 		// Cloned OUTSIDE the window: the source bytes belong to the baseline,
 		// not to the decode being measured.
 		let copy = bytes.clone();
@@ -403,16 +403,16 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 			.unwrap_or_else(|| panic!("7 MP {format:?} must thumbnail inside the browser budget"));
 		eprintln!("7 MP {format:?} peak at 512: {peak} bytes");
 		assert!(
-			peak <= microthumb::BROWSER_MEM_BUDGET,
+			peak <= microthumb::APP_PROCESS_MEM_BUDGET,
 			"7 MP {format:?} peaked at {peak} bytes (budget {})",
-			microthumb::BROWSER_MEM_BUDGET
+			microthumb::APP_PROCESS_MEM_BUDGET
 		);
 		// And at a small request, where the canvas is a rounding error, what
 		// is left IS the decode — which must stay under what it was charged.
 		let (result, peak) = measured_peak(|| {
 			thumb(
 				Box::new(MemSource(bytes)),
-				&ThumbSpec::new(64, 64, microthumb::BROWSER_MEM_BUDGET),
+				&ThumbSpec::new(64, 64, microthumb::APP_PROCESS_MEM_BUDGET),
 			)
 		});
 		result.unwrap().expect("7 MP must thumbnail at 64 px too");

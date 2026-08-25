@@ -6,6 +6,11 @@ use filen_sdk_rs::{
 		file::{RemoteFile, traits::HasFileInfo},
 	},
 	io::FilenMetaExt,
+	thumbnail::{
+		ByteSource, DEFAULT_THUMBNAIL_MEM_BUDGET, FileSource, MAX_THUMBNAIL_SOURCE_BYTES,
+		REMOTE_SOURCE_RESIDENT_BYTES, RemoteChunkSource, ThumbSpec, ThumbnailFit, ThumbnailOutcome,
+		make_thumbnail_from_source,
+	},
 };
 use futures::StreamExt;
 use tokio::sync::OwnedRwLockReadGuard;
@@ -19,9 +24,6 @@ use crate::{
 	sql::{self, object::DBObject},
 };
 
-/// Sources larger than this are not worth downloading just to thumbnail them.
-const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-
 /// Files.app hands over entire grid batches at once; bound how many ITEMS are
 /// in flight so a 1000-photo directory cannot queue hundreds of concurrent
 /// downloads. Wider than the decode bound: downloads are disk-streamed and
@@ -30,7 +32,7 @@ const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const THUMBNAIL_CONCURRENCY: usize = 4;
 
 /// How many DECODES may run at once, process-wide. ONE: the decode pipeline
-/// bounds itself to [`filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET`]
+/// bounds itself to [`DEFAULT_THUMBNAIL_MEM_BUDGET`]
 /// (~12 MB) per decode, and the iOS file-provider extension has ~20 MB total
 /// before jetsam — two concurrent decodes could not both fit. Global on
 /// purpose: it also covers the single-item `get_thumbnail` path (Android's
@@ -173,50 +175,43 @@ impl AuthCacheState {
 		// to make a 256 px thumbnail is the waste this guards — but refusing
 		// outright on size, as this used to, threw away the cheap paths too: a
 		// 200 MB HEIC's `thmb` item and a JPEG's EXIF thumbnail both live in
-		// the header region and cost a chunk or two. Probe those, and answer
-		// Ok(None) having read almost nothing when there is nothing to find.
-		let (source, mem_budget, allow_full_decode): (
-			Box<dyn filen_sdk_rs::thumbnail::ByteSource>,
-			usize,
-			bool,
-		) = match local_file {
-			Some(local) => (
-				Box::new(
-					filen_sdk_rs::thumbnail::FileSource::with_cancel(
-						local.into_std().await,
-						Some(cancel),
-					)
-					.map_err(CacheError::from)?,
+		// the header region and cost a chunk or two. Probe those, and settle on
+		// `OverBudget` having read almost nothing when there is nothing to find.
+		let (source, mem_budget, allow_full_decode): (Box<dyn ByteSource>, usize, bool) =
+			match local_file {
+				Some(local) => (
+					Box::new(
+						FileSource::with_cancel(local.into_std().await, Some(cancel))
+							.map_err(CacheError::from)?,
+					),
+					DEFAULT_THUMBNAIL_MEM_BUDGET,
+					// The bytes are already on disk; nothing to protect.
+					true,
 				),
-				filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET,
-				// The bytes are already on disk; nothing to protect.
-				true,
-			),
-			None => {
-				let affordable = file.size() <= MAX_THUMBNAIL_SOURCE_BYTES;
-				if !affordable {
-					debug!(
-						"File too large to stream for a thumbnail ({} bytes); embedded previews only: {}",
-						file.size(),
-						file_path.display()
-					);
+				None => {
+					let affordable = file.size() <= MAX_THUMBNAIL_SOURCE_BYTES;
+					if !affordable {
+						debug!(
+							"File too large to stream for a thumbnail ({} bytes); embedded previews only: {}",
+							file.size(),
+							file_path.display()
+						);
+					}
+					(
+						Box::new(RemoteChunkSource::new(
+							self.client.clone(),
+							file.clone(),
+							tokio::runtime::Handle::current(),
+							Some(cancel),
+						)),
+						// The source's two resident chunk slots live outside the
+						// pipeline's own accounting; hand the decode what is
+						// actually left of the budget.
+						DEFAULT_THUMBNAIL_MEM_BUDGET.saturating_sub(REMOTE_SOURCE_RESIDENT_BYTES),
+						affordable,
+					)
 				}
-				(
-					Box::new(filen_sdk_rs::thumbnail::RemoteChunkSource::new(
-						self.client.clone(),
-						file.clone(),
-						tokio::runtime::Handle::current(),
-						Some(cancel),
-					)),
-					// The source's two resident chunk slots live outside the
-					// pipeline's own accounting; hand the decode what is
-					// actually left of the budget.
-					filen_sdk_rs::thumbnail::DEFAULT_THUMBNAIL_MEM_BUDGET
-						.saturating_sub(filen_sdk_rs::thumbnail::REMOTE_SOURCE_RESIDENT_BYTES),
-					affordable,
-				)
-			}
-		};
+			};
 
 		// Decode buffers, not downloads, are the memory hazard — serialize decodes
 		// process-wide. Acquired before the blocking task is spawned, so parked work
@@ -229,18 +224,21 @@ impl AuthCacheState {
 			.acquire()
 			.await
 			.expect("the decode gate is never closed");
+		let spec = ThumbSpec {
+			target_width,
+			target_height,
+			mem_budget,
+			allow_full_decode,
+		};
 		let decode_result = tokio::task::spawn_blocking(
-			move || -> Result<
-				Option<filen_sdk_rs::thumbnail::ThumbnailInfo>,
-				filen_sdk_rs::error::Error,
-			> {
+			move || -> Result<ThumbnailOutcome, filen_sdk_rs::error::Error> {
 				let _decode_permit = decode_permit;
-				filen_sdk_rs::thumbnail::make_thumbnail_from_source(
+				make_thumbnail_from_source(
 					source,
-					target_width,
-					target_height,
-					mem_budget,
-					allow_full_decode,
+					&spec,
+					// Files.app draws a fixed-size grid tile, so crop to the
+					// requested box rather than letter-boxing into it.
+					ThumbnailFit::Cover,
 					&mut tmp_file,
 				)
 			},
@@ -261,7 +259,7 @@ impl AuthCacheState {
 		};
 
 		match decode_result {
-			Ok(Some(info)) => {
+			Ok(ThumbnailOutcome::Thumbnail(info)) => {
 				// Which path served this is the difference between a couple of
 				// container reads and fetching the whole file, and it is
 				// invisible from the outside — log it so a silently broken
@@ -277,11 +275,19 @@ impl AuthCacheState {
 				tmp_guard.disarm();
 				Ok(Some(thumbnail_path))
 			}
-			// Over budget, refused, or undecodable bytes — the pipeline folds
-			// them all into the cacheable "no thumbnail" verdict; what reaches
-			// this arm as Err is transport/system trouble that must stay a
-			// retryable error.
-			Ok(None) => Ok(None),
+			// Over budget, unsupported, or undecodable bytes — all settled
+			// verdicts about this file, which the platform may cache. Logged
+			// apart because "we never decode this" and "this host could not
+			// afford it" call for different fixes. What reaches this arm as
+			// Err is transport/system trouble that must stay retryable.
+			Ok(
+				outcome @ (ThumbnailOutcome::Unsupported
+				| ThumbnailOutcome::OverBudget
+				| ThumbnailOutcome::Corrupt(_)),
+			) => {
+				debug!("no thumbnail for {}: {:?}", file.uuid(), outcome);
+				Ok(None)
+			}
 			Err(e) => Err(CacheError::from(e)),
 		}
 	}
