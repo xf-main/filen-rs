@@ -64,7 +64,9 @@ fi
 run "cargo clippy -- -D warnings" cargo clippy -- -D warnings
 run "cargo clippy --tests -- -D warnings" cargo clippy --tests -- -D warnings
 
-# WASM clippy (matches ci.yml ci-wasm job; run from filen-sdk-rs sub-workspace).
+# WASM clippy: the two configurations wasm-pack.sh actually ships (the
+# service-worker one with default features OFF and its RUSTFLAGS), run from
+# the filen-sdk-rs sub-workspace like the ci-wasm job does.
 if [ -f filen-sdk-rs/Cargo.toml ]; then
 	if rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
 		# The cache feature compiles bundled SQLite C for wasm32, which Apple

@@ -252,9 +252,15 @@ jobs:
         env:
           CC_wasm32_unknown_unknown: /opt/homebrew/opt/llvm/bin/clang
           AR_wasm32_unknown_unknown: /opt/homebrew/opt/llvm/bin/llvm-ar
+      # As wasm-pack.sh ships it: default features OFF (they pull in the
+      # threaded runtime the service worker does not have) and the same
+      # RUSTFLAGS. Linting the default-features build instead lints a
+      # configuration nothing ever ships.
       - name: Run clippy service-worker
-        run: cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker -- -D warnings
         working-directory: ./filen-sdk-rs
+        env:
+          RUSTFLAGS: -C target-feature=-nontrapping-fptoint,+bulk-memory --cfg getrandom_backend="wasm_js"
       - name: Run rustfmt in filen-wasm
         run: cargo fmt -- --check
         working-directory: ./filen-sdk-rs
