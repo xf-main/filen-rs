@@ -20,6 +20,14 @@ image = { version = "0.25.6", default-features = false, features = [
 	"webp",
 ] }
 gif = "0.13"
+# `default-features = false` drops the `rayon` feature, and WITHOUT it
+# jpeg-decoder's baseline path hands every MCU row to a spawned worker thread
+# over an unbounded mpsc channel: the entropy decoder outruns the IDCT worker,
+# the queue grows, and the live coefficient rows blow the budget (a 60 MP
+# source peaked at 27 MB against a 12 MB budget on a loaded machine). With the
+# feature on, `Worker::append_row` runs the IDCT inline on the calling thread —
+# exactly the one-MCU-row-band cost `formats::jpeg::full_decode_peak` charges.
+# Off on wasm, where jpeg-decoder compiles its rayon worker out anyway.
 jpeg-decoder = { version = "0.3.2", default-features = false }
 tiff = "0.10"
 png = "0.18"
@@ -28,6 +36,13 @@ resvg = { version = "0.48", default-features = false, optional = true }
 # Pinned to the exact version usvg 0.48 locks: the expansion pre-pass reads the
 # document with the same parser usvg will, and adds nothing to the lockfile.
 roxmltree = { version = "0.21.1", optional = true }
+
+# See the jpeg-decoder note above: the rayon worker is what keeps the baseline
+# JPEG decode to one MCU row at a time. filen-sdk-rs already drives rayon's
+# global pool (`multi-threaded-crypto`), so this shares that pool instead of
+# spawning a thread per component per decode.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+jpeg-decoder = { version = "0.3.2", features = ["rayon"] }
 
 [dev-dependencies]
 # Synthetic fixtures are generated at test runtime — encoders only. The RAW

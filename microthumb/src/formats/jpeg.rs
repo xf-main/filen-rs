@@ -139,7 +139,12 @@ fn full_decode_peak(src_dims: (u32, u32), out_dims: (u32, u32), progressive: boo
 		// escapes it, and the estimate must survive the unsubsampled case.
 		out + src_dims.0 as usize * src_dims.1 as usize * 6
 	} else {
-		// One MCU row band (≤16 px tall) of the FULL-width image.
+		// One MCU row band (≤16 px tall) of the FULL-width image. ONE — which
+		// holds only because jpeg-decoder's `rayon` feature makes
+		// `Worker::append_row` run the IDCT inline. Without it the baseline path
+		// posts every row to a spawned worker over an unbounded mpsc channel,
+		// the entropy decoder outruns the IDCT, and the queued rows make this
+		// term a fiction under load. See microthumb's Cargo.toml.
 		out + src_dims.0 as usize * 16 * 4
 	}
 }
