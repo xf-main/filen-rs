@@ -783,6 +783,44 @@ fn png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
 	out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
 }
 
+#[test]
+fn png_honours_the_exif_orientation_chunk() {
+	// PNGs carry EXIF in an `eXIf` chunk — a converted phone screenshot keeps
+	// its orientation there, and the row streamer used to ignore it and
+	// thumbnail the picture on its side.
+	let mut exif = Vec::new();
+	exif.extend_from_slice(b"II");
+	exif.extend_from_slice(&42u16.to_le_bytes());
+	exif.extend_from_slice(&8u32.to_le_bytes());
+	exif.extend_from_slice(&1u16.to_le_bytes()); // one entry
+	exif.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+	exif.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+	exif.extend_from_slice(&1u32.to_le_bytes());
+	exif.extend_from_slice(&6u16.to_le_bytes()); // rotate 90° clockwise
+	exif.extend_from_slice(&0u16.to_le_bytes()); // value padding
+	exif.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+
+	// Splice the chunk in behind IHDR (8-byte signature + a 25-byte IHDR).
+	let landscape = encode(&checkerboard(300, 200), ImageFormat::Png);
+	let mut bytes = landscape[..33].to_vec();
+	png_chunk(&mut bytes, b"eXIf", &exif);
+	bytes.extend_from_slice(&landscape[33..]);
+
+	let upright = thumb(Box::new(MemSource(landscape)), &spec(128))
+		.unwrap()
+		.expect("the plain png must thumbnail");
+	assert!(upright.width > upright.height, "fixture must be landscape");
+	let rotated = thumb(Box::new(MemSource(bytes)), &spec(128))
+		.unwrap()
+		.expect("the eXIf png must thumbnail");
+	assert!(
+		rotated.height > rotated.width,
+		"orientation 6 must rotate to portrait, got {}x{}",
+		rotated.width,
+		rotated.height
+	);
+}
+
 /// A 1×2³⁰ PNG: per-row memory passes any budget — the row COUNT is the
 /// attack. The source-side ceiling refuses it before a single row decodes.
 /// (Hand-built header; actually encoding one would itself be the DoS.)

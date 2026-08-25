@@ -307,7 +307,15 @@ impl Client {
 				image
 			};
 
-			Ok(image.resize(max_width, max_height, FilterType::CatmullRom))
+			// Never above what was decoded. microthumb's canvas is routinely
+			// SMALLER than the request — the budget clamps it, and an
+			// embedded preview can be smaller still — and `resize` would
+			// happily blow that back up: a blurry thumbnail in a BIGGER
+			// lossless-WebP payload. `make_thumbnail_from_source` clamps the
+			// same way.
+			let width = max_width.min(image.width());
+			let height = max_height.min(image.height());
+			Ok(image.resize(width, height, FilterType::CatmullRom))
 		})
 		.await
 	}

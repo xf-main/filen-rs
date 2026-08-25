@@ -162,29 +162,39 @@ async function generateImage(width: number, height: number, type: string): Promi
 // FIRST in the file on purpose: wasm linear memory is a monotone high-water
 // mark, so any earlier test's peak would mask the growth this one measures.
 test("thumbnail decode stays inside a bounded memory budget", async () => {
-	// 24 MP. Decoded whole-frame that is ~72 MB of RGB8 plus ~96 MB of RGBA
-	// before the resize even starts; through microthumb the JPEG is IDCT-scaled
-	// straight into a small canvas.
-	const bytes = await generateImage(6000, 4000, "image/jpeg")
-	const file = await state.uploadFile(bytes, { parent: testDir, name: "memory-24mp.jpg" })
+	// A 12 MP PNG, not a JPEG: a JPEG is IDCT-scaled by its own decoder, so
+	// even the whole-frame path it replaced would never have materialised the
+	// full frame — the old fixture could not fail this test. A PNG has no such
+	// escape: decoded whole-frame it is 48 MB of RGBA (the browser's canvas
+	// always writes an alpha channel), plus a second copy for the resize.
+	// Through microthumb its rows stream into a canvas sized by the REQUEST.
+	const bytes = await generateImage(4000, 3000, "image/png")
+	// Sampled before the upload, so the upload's own buffers cannot pre-grow
+	// the mark and hide what the decode then spends inside it.
+	const before = heapBytes()
+	const file = await state.uploadFile(bytes, { parent: testDir, name: "memory-12mp.png" })
 	expect(file.canMakeThumbnail).toBe(true)
 
-	// Read after the upload, so the upload's own buffers are already in the mark.
-	const before = heapBytes()
-	const thumb = await state.makeThumbnailInMemory({ file, maxHeight: 512, maxWidth: 512 })
+	const thumb = await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 })
 	const after = heapBytes()
-	console.log(`24 MP thumbnail: heap ${before} -> ${after} (+${after - before} bytes)`)
+	console.log(
+		`12 MP png thumbnail: source ${bytes.length} B, heap ${before} -> ${after} (+${after - before} bytes)`
+	)
 
 	expect(thumb).toBeDefined()
 	const bitmap = await createImageBitmap(new Blob([thumb!.webpData], { type: "image/webp" }))
-	expect(bitmap.width).toBeLessThanOrEqual(512)
-	expect(bitmap.height).toBeLessThanOrEqual(512)
+	expect(bitmap.width).toBeLessThanOrEqual(256)
+	expect(bitmap.height).toBeLessThanOrEqual(256)
 	bitmap.close()
 
-	// The whole-frame path this replaced needed well past 120 MiB for a source
-	// this size; the bounded pipeline needs single-digit MiB plus the resident
-	// source bytes.
-	expect(after - before).toBeLessThan(120 * 1024 * 1024)
+	// Upload buffers, the resident source bytes and a ~7 MiB accumulator: the
+	// bounded pipeline lands around 20 MiB. The 48 MB frame alone would clear
+	// this bound, which is the regression the test exists to catch. The
+	// remaining headroom is the upload's, not the decode's — the mark is taken
+	// before `uploadFile` so that growth is inside the delta. A change that
+	// buffers uploads differently moves this number without the thumbnail
+	// path regressing; re-measure before treating it as a decode leak.
+	expect(after - before).toBeLessThan(40 * 1024 * 1024)
 	// And memory is never returned, so a later reading can only be >=.
 	expect(heapBytes()).toBeGreaterThanOrEqual(after)
 }, 180000)

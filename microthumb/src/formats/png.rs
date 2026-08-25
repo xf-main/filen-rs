@@ -34,10 +34,18 @@ impl FormatDecoder for Png {
 		let info = reader.info();
 		let dims = (info.width, info.height);
 		let interlaced = info.interlaced;
+		// PNGs carry EXIF in an `eXIf` chunk, orientation included — a phone
+		// screenshot converted to PNG keeps it, and ignoring it thumbnails the
+		// picture on its side.
+		let orientation = info
+			.exif_metadata
+			.as_deref()
+			.map_or(1, crate::exif::orientation);
 		Ok(Box::new(PreparedPng {
 			reader,
 			dims,
 			interlaced,
+			orientation,
 		}))
 	}
 }
@@ -46,6 +54,7 @@ struct PreparedPng {
 	reader: png::Reader<BufReader<SeqReader>>,
 	dims: (u32, u32),
 	interlaced: bool,
+	orientation: u8,
 }
 
 impl PreparedPng {
@@ -57,6 +66,10 @@ impl PreparedPng {
 impl PreparedDecode for PreparedPng {
 	fn dims(&self) -> (u32, u32) {
 		self.dims
+	}
+
+	fn orientation(&self) -> u8 {
+		self.orientation
 	}
 
 	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
