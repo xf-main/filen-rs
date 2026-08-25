@@ -74,6 +74,19 @@ async fn create_list_trash() {
 
 	let found_dir = client.get_dir(dir.uuid()).await.unwrap();
 	assert_eq!(dir, found_dir);
+
+	// The asymmetry the cache's reconcile pass has to know about: a trashed directory still
+	// RESOLVES through `v3/dir` (just above) but its contents cannot be LISTED. Anything that
+	// classifies a failed listing by probing `get_dir` therefore learns nothing about a trashed
+	// container — see `refresh_container` in filen-mobile-native-cache.
+	let listing = client
+		.list_dir(&(&found_dir).into(), None::<&fn(u64, Option<u64>)>)
+		.await;
+	assert_eq!(
+		listing.err().map(|e| e.kind()),
+		Some(ErrorKind::FolderNotFound),
+		"a trashed directory must not be listable"
+	);
 }
 
 #[derive(Default)]

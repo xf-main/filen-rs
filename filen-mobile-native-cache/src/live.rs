@@ -34,7 +34,7 @@ use std::{
 
 use filen_sdk_rs::{
 	fs::{
-		HasUUID,
+		HasParent, HasUUID,
 		categories::NonRootItemType,
 		dir::RemoteDirectory,
 		file::{RemoteFile, meta::FileMeta},
@@ -905,15 +905,39 @@ impl AuthCacheState {
 			Ok(()) => true,
 			Err(e) => {
 				// `CacheError` folds the SDK error kind away, so classify with one probe.
-				if matches!(
-					self.client.get_dir(uuid).await,
-					Err(probe) if probe.kind() == filen_sdk_rs::ErrorKind::FolderNotFound
-				) {
-					tracing::debug!("container {uuid} is gone; forgetting it");
-					self.forget_dir(uuid).await.is_ok()
-				} else {
-					tracing::warn!("re-listing container {uuid} failed: {e}");
-					false
+				match self.client.get_dir(uuid).await {
+					// Definitively gone: nothing below it can be stale once it is forgotten.
+					Err(probe) if probe.kind() == filen_sdk_rs::ErrorKind::FolderNotFound => {
+						tracing::debug!("container {uuid} is gone; forgetting it");
+						self.forget_dir(uuid).await.is_ok()
+					}
+					// Trashed, and the probe is the only way to learn it: `v3/dir/content`
+					// refuses to list a trashed directory while `v3/dir` still resolves it
+					// (pinned by `create_list_trash` in filen-sdk-rs). Read as a transient
+					// failure it held the pass — and with it the watermark — back forever, so
+					// every reconnect re-listed every materialized container. It is not this
+					// path's to refresh either: every other caller routes a trashed item into
+					// the `trash/` namespace (`canonicalize_id`), whose listing owns it and
+					// carries its own restore reconciliation. Converged.
+					//
+					// Asking the SERVER rather than the cached row is what makes this safe: a
+					// container restored while the socket was down still has a trashed row
+					// here, and skipping that one on the row's say-so would advance the
+					// watermark past a container whose children were never re-listed.
+					Ok(remote) if remote.parent().is_trash() => {
+						tracing::debug!("container {uuid} is trashed; the trash listing owns it");
+						true
+					}
+					_ => {
+						tracing::warn!(
+							"re-listing container {uuid} (parent {parent}) failed: {e}",
+							parent = match &dir {
+								crate::sql::DBDirObject::Dir(dir) => dir.parent.to_string(),
+								crate::sql::DBDirObject::Root(_) => "root".to_owned(),
+							}
+						);
+						false
+					}
 				}
 			}
 		}
