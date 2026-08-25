@@ -6,9 +6,7 @@ use crate::{ErrorKind, error::Error};
 const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
 	// AVIF goes through `heif-decoder` — libheif on its dav1d backend, the
 	// same container path HEIC takes, available on every target this builds
-	// for. The `avif-decoder` feature is NOT enough: it only teaches the
-	// `image` crate a whole-frame AVIF decode, and no thumbnail path calls
-	// into that any more.
+	// for.
 	#[cfg(feature = "heif-decoder")]
 	"image/avif",
 	"image/gif",

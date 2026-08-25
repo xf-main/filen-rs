@@ -58,18 +58,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
-      - name: Install dependencies for avif-decoder (linux)
+      # heif-decoder vendors dav1d and builds it from source with meson +
+      # ninja (nasm assembles its x86 SIMD). `Run tests` below runs at the
+      # workspace root, which builds heif-decoder whatever the features say,
+      # and its build script asserts on all three.
+      - name: Install build tools for heif-decoder's vendored dav1d (linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get install -y libdav1d-dev pkg-config
-      - name: Install dependencies for avif-decoder (windows)
+        run: sudo apt-get install -y meson ninja-build nasm
+      - name: Install build tools for heif-decoder's vendored dav1d (windows)
         if: runner.os == 'Windows'
         run: |
-          git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
-          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-          choco install pkgconfiglite
-          vcpkg install dav1d:x64-windows
-          echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
+          choco install meson ninja nasm --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - name: Remove the broken fusermount3 shadow (actions/runner-images#14516)
         if: runner.os == 'Linux'
         run: |
@@ -83,17 +83,10 @@ jobs:
       - name: Install WinFsp (rclone mount backend for network-drive tests)
         if: runner.os == 'Windows'
         run: choco install winfsp -y
-      - name: Install dependencies for avif-decoder (macos)
+      # No nasm: macos-latest is arm64, and dav1d only assembles SIMD on x86.
+      - name: Install build tools for heif-decoder's vendored dav1d (macos)
         if: runner.os == 'macOS'
-        run: |
-          brew install dav1d pkg-config
-          # Homebrew's dav1d.pc resolves to the versioned Cellar path, which rust-cache bakes
-          # into dav1d-sys's cached build-script output — it dangles on every bottle bump
-          # ("ld: library 'dav1d' not found"). Bypass pkg-config and link via the
-          # version-stable opt symlink instead.
-          echo "SYSTEM_DEPS_DAV1D_NO_PKG_CONFIG=1" >> "$GITHUB_ENV"
-          echo "SYSTEM_DEPS_DAV1D_LIB=dav1d" >> "$GITHUB_ENV"
-          echo "SYSTEM_DEPS_DAV1D_SEARCH_NATIVE=$(brew --prefix dav1d)/lib" >> "$GITHUB_ENV"
+        run: brew install meson ninja
       - name: Install Wild linker
         if: runner.os == 'Linux'
         uses: taiki-e/cache-cargo-install-action@v2
@@ -105,7 +98,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run tests
-        run: cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder --no-fail-fast
+        run: cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder --no-fail-fast
         env:
           TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
           TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
@@ -123,7 +116,7 @@ jobs:
     # account, which makes EVERY concurrent login to that account fail (the other matrix jobs, and
     # other workers). Run it ISOLATED here: only AFTER the whole matrix finishes (needs: test, so
     # nothing else is touching the account) and only on Linux, via the ignored test. Default
-    # features only — the test needs none of malformed/heif/avif, so there are no system deps to
+    # features only — the test needs neither malformed nor heif, so there are no system deps to
     # install. `version` mirrors the matrix so 2FA coverage is preserved for each auth version
     # (V1/V2 use different accounts, so the two are safe to run concurrently with each other).
     needs: test
@@ -199,6 +192,20 @@ jobs:
           sudo apt-get install -y clang llvm
           echo "CC_wasm32_unknown_unknown=$(command -v clang)" >> "$GITHUB_ENV"
           echo "AR_wasm32_unknown_unknown=$(command -v llvm-ar)" >> "$GITHUB_ENV"
+      # heif-decoder builds its vendored dav1d with meson + ninja on every
+      # target; wasm has no SIMD path in dav1d, so no nasm here.
+      - name: Install build tools for heif-decoder's vendored dav1d
+        run: sudo apt-get install -y meson ninja-build
+      # wasm-pack.sh refuses to run without this: heif-decoder cross-compiles
+      # libheif/libde265/dav1d for wasm32 against wasi-sdk's sysroot, there
+      # being no host C++ runtime for wasm32-unknown-unknown.
+      - name: Install wasi-sdk (heif-decoder's wasm C++ toolchain)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz
+          mkdir -p "$HOME/wasi-sdk"
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$HOME/wasi-sdk" --strip-components=1
+          echo "WASI_SDK_PATH=$HOME/wasi-sdk" >> "$GITHUB_ENV"
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
           # waiting on a new release that includes

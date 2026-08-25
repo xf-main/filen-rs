@@ -333,9 +333,11 @@ fn build_libde265() -> PathBuf {
 /// AV1 decoders in one tree would be pure maintenance cost.
 ///
 /// The price is dav1d's build system: meson + ninja, plus nasm for the x86
-/// SIMD. Those are demanded HERE, so the tooling only bites a build that
-/// actually compiles the thumbnail codecs — anyone not enabling
-/// `heif-decoder` never meets them.
+/// SIMD. Those are demanded HERE, and note who meets them: this crate is a
+/// workspace member with no `default-members`, so any cargo command run at the
+/// workspace root builds it whatever features were asked for. Skipping the
+/// tooling means `--workspace --exclude heif-decoder`, or a package-scoped
+/// `-p` command — not leaving the feature off.
 fn build_dav1d() -> PathBuf {
 	let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 	let build_dir = out_dir.join("dav1d-build");
@@ -383,6 +385,14 @@ fn build_dav1d() -> PathBuf {
 		// write is a stubbed WASI call that fails anyway — so drop the
 		// strings instead of shipping them.
 		.arg("-Dlogging=false");
+	// meson probes the compiler from PATH, and a plain Windows shell — a CI
+	// runner's, or a developer's — has no MSVC environment loaded: it would
+	// find whichever gcc the image ships and hand the MSVC link an archive it
+	// cannot use. `--vsenv` makes meson locate and activate Visual Studio
+	// itself. It is accepted (and inert) elsewhere, but only Windows needs it.
+	if cfg!(windows) {
+		setup.arg("--vsenv");
+	}
 	if let Some(cross_file) = write_meson_cross_file(&out_dir) {
 		setup.arg(format!("--cross-file={}", cross_file.display()));
 	}
@@ -576,8 +586,9 @@ fn require_build_tool(tool: &str, version_flag: &str) {
 		"`{tool}` is required to build heif-decoder's AV1 decoder: dav1d builds with \
 		 meson + ninja, and nasm assembles its x86 SIMD. Install it (macOS: \
 		 `brew install {tool}`; Debian/Ubuntu: `apt-get install {tool}`; Windows: \
-		 `choco install {tool}`), or build without the `heif-decoder` feature, which \
-		 is what keeps this off everyone else's path."
+		 `choco install {tool}`), or keep this crate out of the build entirely with \
+		 `--workspace --exclude heif-decoder` — it is a workspace member, so a \
+		 workspace-root cargo command builds it whatever features you asked for."
 	);
 }
 

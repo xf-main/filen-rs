@@ -37,6 +37,21 @@ jobs:
           ndk-version: 27.0.12077973
       - name: Install LLVM clang (wasm32 C objects for the cache's bundled SQLite)
         run: brew install llvm
+      # heif-decoder builds its vendored dav1d with meson + ninja on every
+      # target, and `npm run ubrn:release` below builds the x86_64 Android
+      # slice, whose SIMD nasm assembles.
+      - name: Install build tools for heif-decoder's vendored dav1d
+        run: brew install meson ninja nasm
+      # wasm-pack.sh refuses to run without this: heif-decoder cross-compiles
+      # libheif/libde265/dav1d for wasm32 against wasi-sdk's sysroot, there
+      # being no host C++ runtime for wasm32-unknown-unknown.
+      - name: Install wasi-sdk (heif-decoder's wasm C++ toolchain)
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-arm64-macos.tar.gz
+          mkdir -p "$HOME/wasi-sdk"
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$HOME/wasi-sdk" --strip-components=1
+          echo "WASI_SDK_PATH=$HOME/wasi-sdk" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           shared-key: cargo-build-ci-wasm
