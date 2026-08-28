@@ -695,26 +695,61 @@ impl microthumb::ByteSource for CountingSource {
 	}
 }
 
-/// A real device HEIC (`iphone_img.heic` at the workspace root, or
-/// `MICROTHUMB_HEIF_FIXTURE`) exercises both HEIF paths against the C side of
-/// the pipeline — which only the macOS malloc_logger meter can see; the
-/// global-allocator meter under-counts these two cases and their ceilings are
-/// asserted for the C-aware meter's benefit. HEVC cannot be encoded at test
-/// time (the vendored libheif is decode-only), so this is the one fixture-file
-/// dependency; the case skips loudly when the file is absent.
+/// The C side of the pipeline — which only the macOS malloc_logger meter can
+/// see; the global-allocator meter under-counts every case here, and their
+/// ceilings are asserted for the C-aware meter's benefit. Neither codec can be
+/// encoded at test time (the vendored libheif is decode-only and nothing in
+/// the tree encodes AV1), so every case here is a fixture file: the committed
+/// browser parrots cover both codecs' whole-frame decode, and the grid and
+/// embedded-preview paths need a real device HEIC on top.
 #[cfg(feature = "heif")]
 fn heif_cases() {
-	let path = std::env::var("MICROTHUMB_HEIF_FIXTURE").unwrap_or_else(|_| {
-		format!(
-			"{}/../iphone_img.heic",
-			env!("CARGO_MANIFEST_DIR").replace('\\', "/")
-		)
-	});
-	let Ok(bytes) = std::fs::read(&path) else {
+	committed_codec_cases();
+
+	// `MICROTHUMB_HEIF_FIXTURE` is the fixture's whole availability story: no
+	// device HEIC is committed (a megabyte of HEVC, against this suite's
+	// generate-your-own-fixtures rule) and none can be generated. Absence used
+	// to skip with a printed warning that libtest swallows, so a run that
+	// proved neither of these two ceilings looked identical to one that did —
+	// the same hole `raw_cases` closed. It fails now, and `=offline` is the one
+	// spelling that says the omission was deliberate, matching the sentinel
+	// `MICROTHUMB_RAW_FIXTURES=offline` already uses.
+	let var = std::env::var("MICROTHUMB_HEIF_FIXTURE");
+	if var.as_deref() == Ok("offline") {
 		eprintln!(
-			"SKIP heif cases: no fixture at {path} — the HEIF embedded-preview and \
-			 tile-decode memory ceilings are NOT being proven by this run (CI has no \
-			 fixture; supply one via MICROTHUMB_HEIF_FIXTURE to exercise them)"
+			"SKIP heif cases: MICROTHUMB_HEIF_FIXTURE=offline — the HEIF \
+			 embedded-preview and tile-decode memory ceilings are NOT proven by \
+			 this run"
+		);
+		return;
+	}
+	// Set-but-wrong is a caller error and fails; simply absent is not. No device
+	// HEIC is committed and CI never sets the variable, so panicking on absence
+	// would red every matrix leg that enables `microthumb/heif` — and it would
+	// buy nothing, because `committed_codec_cases` above has already metered
+	// both codecs on this run. What is unproven without it is narrower than the
+	// old message claimed: the grid and embedded-preview paths, not the ceiling.
+	let bytes = match &var {
+		Ok(path) => Some(std::fs::read(path).unwrap_or_else(|e| {
+			panic!(
+				"MICROTHUMB_HEIF_FIXTURE points at {path}, which cannot be read \
+				 ({e}). Fix the path, or set it to `offline` to run without the \
+				 grid and embedded-preview ceilings on purpose."
+			)
+		})),
+		Err(_) => {
+			let path = format!(
+				"{}/../iphone_img.heic",
+				env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+			);
+			std::fs::read(&path).ok()
+		}
+	};
+	let Some(bytes) = bytes else {
+		eprintln!(
+			"SKIP heif grid/preview cases: no device HEIC found — those two \
+			 ceilings are NOT proven by this run (the committed parrots above \
+			 were still metered)"
 		);
 		return;
 	};
@@ -763,6 +798,73 @@ fn heif_cases() {
 		peak <= TILE_BUDGET,
 		"heif tile decode peaked at {peak} bytes (budget {TILE_BUDGET})"
 	);
+}
+
+/// The two committed HEIF fixtures, metered where nothing else meters them:
+/// the AV1 and HEVC decodes happen inside dav1d and libde265, whose buffers
+/// are C allocations no `#[global_allocator]` can see, so only the macOS
+/// meter above prices them. Nothing in this tree encodes either codec, so a
+/// real file has to come from disk, and these two 1000×667 parrots are the
+/// ones there are — `pipeline.rs` reads the AVIF for the same reason. Neither
+/// is tiled and neither carries a `thmb`, so what they pin is the whole-frame
+/// decode; the grid and embedded-preview paths still need the device HEIC
+/// `heif_cases` asks for.
+#[cfg(feature = "heif")]
+fn committed_codec_cases() {
+	for name in ["parrot.avif", "parrot.heif"] {
+		let path = format!(
+			"{}/../filen-sdk-rs/web/test-assets/imgs/{name}",
+			env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+		);
+		let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("committed {name}: {e}"));
+		let px = 1000usize * 667;
+
+		// The consequence, not the accounting: at the extension budget the
+		// charge is what decides how much canvas is left, and the whole run
+		// has to land inside the budget it was admitted under. (This used to
+		// assert against APP_PROCESS_MEM_BUDGET, 3.2× the peak it saw, and so
+		// could not fail — while the same decode was 1.27× OVER the default
+		// budget that admits it in the extension.)
+		let copy = bytes.clone();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(copy)), &spec(512)));
+		let image = result
+			.unwrap()
+			.unwrap_or_else(|| panic!("committed {name} must thumbnail"));
+		assert_not_flat(&image, name);
+		eprintln!(
+			"{name} peak at 512: {peak} bytes ({}x{} canvas)",
+			image.width, image.height
+		);
+		assert!(
+			peak <= DEFAULT_MEM_BUDGET,
+			"{name} peaked at {peak} bytes (budget {DEFAULT_MEM_BUDGET})"
+		);
+
+		// And at a small request, where the canvas is a rounding error, what
+		// is left IS the decode — which must stay under what it was charged.
+		let charged = heif_charge(px, bytes.len());
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bytes)), &spec(64)));
+		result
+			.unwrap()
+			.unwrap_or_else(|| panic!("{name} must thumbnail at 64 px too"));
+		eprintln!(
+			"{name} decode peak: {peak} bytes ({} B/px, charged {charged})",
+			peak / px
+		);
+		assert!(
+			peak <= charged,
+			"{name} decode peaked at {peak} bytes, past the {charged} its estimate charges"
+		);
+	}
+}
+
+/// What `formats::heif::peak_estimate` charges for a whole-frame decode.
+/// Mirrored rather than called: the estimate is crate-private, and a test
+/// that read the real number would pass however wrong the number was. Keep in
+/// step with `DECODE_SETUP_BYTES` / `DECODE_BYTES_PER_PIXEL`.
+#[cfg(feature = "heif")]
+fn heif_charge(pixels: usize, source_len: usize) -> usize {
+	1024 * 1024 + pixels * 12 + source_len
 }
 
 /// Real camera RAW files, metered. Most of them now yield a thumbnail — the

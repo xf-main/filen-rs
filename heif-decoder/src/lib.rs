@@ -213,53 +213,99 @@ impl Drop for ImageHandle<'_> {
 	}
 }
 
-/// Decoding options handed to every libheif decode call.
+/// Decoding options handed to every libheif decode call. Never NULL: the one
+/// field that matters here is `num_codec_threads`, and libheif's default for
+/// it (0) is wrong on both targets, in opposite ways.
 ///
-/// Native targets pass NULL and take libheif's defaults (worker threads help
-/// there). On wasm no thread can ever start, and the two codec plugins want
-/// OPPOSITE things from the one field libheif has for this:
+/// libheif copies the field into `heif_decoder_plugin_options::num_threads`
+/// (`codecs/decoder.cc`), and the two plugins read it differently:
 ///
 /// - libde265's plugin turns 0 into 1 and hands the result to
-///   `de265_start_worker_threads`. Pool startup ignores the failed
-///   `pthread_create`, while `decoder_context::start_thread_pool` records the
-///   context as threaded regardless — a WPP- or tile-coded bitstream would
-///   then queue work on a pool with no workers and deadlock. Only a NEGATIVE
-///   count makes it skip pool startup entirely.
-/// - dav1d's plugin assigns the same value straight into
-///   `Dav1dSettings::n_threads`, and `dav1d_open` REJECTS anything negative
-///   (`validate_input_or_ret(s->n_threads >= 0 …)`), failing every AVIF decode
-///   with a plugin error. 0 means "auto", i.e. ask the host for a processor
-///   count no browser module can honour; 1 is the single-threaded answer.
+///   `de265_start_worker_threads`, which starts a pool for any count > 0 and
+///   skips pool startup entirely at <= 0.
+/// - dav1d's plugin assigns a NON-ZERO value straight into
+///   `Dav1dSettings::n_threads` and leaves 0 as dav1d's own default, which is
+///   "ask the host for its logical CPU count". `dav1d_open` then rejects
+///   anything negative or above `DAV1D_MAX_THREADS`
+///   (`validate_input_or_ret(s->n_threads >= 0 && s->n_threads <=
+///   DAV1D_MAX_THREADS …)`).
 ///
-/// So the count is picked per file: -1 whenever the file carries an HEVC item,
-/// 1 otherwise. A file carrying both (legal, and not something any encoder
-/// produces) loses its AVIF decode rather than risking the deadlock, which is
-/// the safe direction to be wrong in.
+/// So on NATIVE both plugins are happy with one small POSITIVE count, and
+/// pinning it is what makes the decode's memory cost a property of the file
+/// rather than of the host: at libheif's default of 0, dav1d sizes its pool
+/// from `hw.logicalcpu` and its setup allocation grows ~259 KB per logical
+/// CPU, linearly across every count measured (libde265's is flat).
+/// `microthumb`'s budget has to
+/// charge for that setup up front, and it cannot charge for a term the host
+/// picks. See [`NATIVE_CODEC_THREADS`].
+///
+/// On WASM no thread can ever start, and then the two plugins want OPPOSITE
+/// things from that same field: libde265 must be told a NEGATIVE count,
+/// because pool startup ignores the failed `pthread_create` while
+/// `decoder_context::start_thread_pool` records the context as threaded
+/// regardless — a WPP- or tile-coded bitstream would then queue work on a
+/// pool with no workers and deadlock — whereas dav1d rejects negatives
+/// outright and wants 1. So there the count is picked per file: -1 whenever
+/// the file carries an HEVC item, 1 otherwise. A file carrying both (legal,
+/// and not something any encoder produces) loses its AVIF decode rather than
+/// risking the deadlock, which is the safe direction to be wrong in.
 struct DecodeOptions(*mut heif_decoding_options);
+
+/// Worker threads each codec plugin gets on native. One — which is already
+/// all libde265 ever got here (its plugin turns libheif's default 0 into 1)
+/// and is what takes dav1d off the host's CPU count.
+///
+/// The reason is memory, not parallelism: `microthumb` admits a decode by
+/// charging its peak BEFORE running it, so every term of that charge has to
+/// be a property of the file rather than of the machine, and at 0 dav1d's is
+/// not. Peak heap of the whole thumbnail call, macOS `malloc_logger`, the
+/// committed 1000×667 `parrot.avif`: 5.78 MB at 1 thread, 8.62 MB at 2,
+/// 9.13 MB at 4, 10.17 MB at 8, 10.70 MB at libheif's default on a 10-CPU
+/// host — and a verifier faking `hw.logicalcpu` measured that default rising
+/// ~259 KB per logical CPU, linear from 4 to 32. The step past 1 thread is not a
+/// fixed setup cost either: it tracks the unit decoded (+4 to 5 B per unit
+/// pixel for the second thread), so it inflates the per-pixel charge too.
+/// libde265 is flat across all of it — identical peaks at 1, 2, 4 and 8.
+///
+/// It costs next to nothing, because these are THUMBNAIL decodes: small
+/// targets, one tile or one modest frame at a time, and the mobile cache
+/// serialises them anyway. Best-of-5 wall clock, 1 thread vs libheif's
+/// default on this 10-CPU host: `parrot.avif` 6.5 vs 6.3 ms, `parrot.heif`
+/// 15.5 vs 15.6 ms, a 12 MP device HEIC through the tile path 233 vs 234 ms.
+///
+/// What it does forgo is HEVC speed libde265 could have had and never did:
+/// at 2 threads `parrot.heif` decodes in 9.8 ms and that tile path in 161 ms.
+/// Taking it would mean carrying dav1d's per-pixel inflation on the AVIF
+/// side — a ~3 MiB setup charge again, and ~175k fewer pixels admitted per
+/// decode. If that wall clock ever outweighs the admission limit, the upgrade
+/// is per-codec counts off the same `hvc1` item probe [`wasm_codec_threads`]
+/// already does: 2 for HEVC, 1 for AV1.
+// ponytail: one count for both codecs; per-codec wants that probe on native too.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const NATIVE_CODEC_THREADS: c_int = 1;
 
 impl DecodeOptions {
 	fn for_handle(handle: &ImageHandle) -> Result<Self, HeifError> {
+		// SAFETY: alloc fills in defaults and the current options version;
+		// num_codec_threads is a plain int field in that struct.
+		let options = unsafe { heif_decoding_options_alloc() };
+		if options.is_null() {
+			// Falling back to NULL here would hand libheif its defaults —
+			// the unbounded pool this exists to avoid — so a failed
+			// allocation fails the decode instead.
+			return Err(HeifError::invalid_input(
+				"could not allocate decoding options",
+			));
+		}
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		{
-			// SAFETY: alloc fills in defaults and the current options version;
-			// num_codec_threads is a plain int field in that struct.
-			let options = unsafe { heif_decoding_options_alloc() };
-			if options.is_null() {
-				// Falling back to NULL here would hand libheif its defaults —
-				// the very pool-startup path this exists to avoid — so a
-				// failed allocation fails the decode instead.
-				return Err(HeifError::invalid_input(
-					"could not allocate decoding options",
-				));
-			}
-			unsafe { (*options).num_codec_threads = wasm_codec_threads(handle) };
-			Ok(DecodeOptions(options))
-		}
+		let threads = wasm_codec_threads(handle);
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		{
+		let threads = {
 			let _ = handle;
-			Ok(DecodeOptions(std::ptr::null_mut()))
-		}
+			NATIVE_CODEC_THREADS
+		};
+		unsafe { (*options).num_codec_threads = threads };
+		Ok(DecodeOptions(options))
 	}
 
 	fn as_ptr(&self) -> *const heif_decoding_options {
