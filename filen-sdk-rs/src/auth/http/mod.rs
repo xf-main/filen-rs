@@ -333,10 +333,19 @@ impl SharedClientState {
 			}
 		};
 
+		// Same two hazards as the thumbnail gate, and the same reason to handle them here:
+		// `GlobalConcurrencyLimitLayer::new` builds a `tokio::sync::Semaphore`, which parks every
+		// request forever at 0 permits and panics above `MAX_PERMITS` — a ceiling a 32-bit `usize`
+		// (wasm32) puts inside `u32`, so `JsClientConfig { concurrency }` can reach it. This is
+		// where every construction path converges.
+		let concurrency = config
+			.concurrency
+			.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+
 		Ok(Self {
-			concurrency: GlobalConcurrencyLimitLayer::new(config.concurrency),
+			concurrency: GlobalConcurrencyLimitLayer::new(concurrency),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			max_concurrency: config.concurrency,
+			max_concurrency: concurrency,
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
 			rate_limiter: limit::GlobalRateLimitLayer::new(config.rate_limit_per_sec),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1216,6 +1225,34 @@ mod client_timeout_tests {
 				 but was NoRetry: {e}"
 			),
 		}
+	}
+}
+
+// The layer keeps no readable permit count, so this pins the clamp through `max_concurrency`,
+// which the constructor feeds from the same clamped local.
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod concurrency_limit_tests {
+	use super::{ClientConfig, SharedClientState};
+
+	/// `GlobalConcurrencyLimitLayer::new` is a `tokio::sync::Semaphore`, so 0 permits parks every
+	/// request forever and anything above `MAX_PERMITS` panics inside the constructor — reachable
+	/// from `JsClientConfig`'s `u32` on wasm32, where the ceiling is `u32::MAX >> 3`.
+	#[tokio::test]
+	async fn concurrency_is_clamped_at_both_ends() {
+		assert_eq!(
+			SharedClientState::new(ClientConfig::default().with_concurrency(0))
+				.expect("a zero concurrency is clamped, not rejected")
+				.max_concurrency(),
+			1,
+			"concurrency 0 must be floored to 1, not left as a park-forever limiter"
+		);
+		assert_eq!(
+			SharedClientState::new(ClientConfig::default().with_concurrency(usize::MAX))
+				.expect("an oversized concurrency is clamped, not rejected")
+				.max_concurrency(),
+			tokio::sync::Semaphore::MAX_PERMITS,
+			"an oversized concurrency must be clamped to Semaphore::MAX_PERMITS, not panic"
+		);
 	}
 }
 
