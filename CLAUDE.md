@@ -28,7 +28,8 @@ cargo test -p filen-sdk-rs --test cache_tests -F cache
 # Lint
 cargo clippy
 
-# Build with HEIF decoder support
+# Build with HEIF decoder support (needs meson + ninja, and nasm on x86 —
+# see Toolchain > Native build prerequisites)
 cargo build --features heif-decoder
 ```
 
@@ -67,7 +68,7 @@ Test notes:
 | `service-worker` | WASM service-worker build |
 | `multi-threaded-crypto` | `rayon` / `wasm-bindgen-rayon` parallel crypto |
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata) — never enable in production |
-| `heif-decoder` / `avif-decoder` | Thumbnail decoding for HEIF/HEIC and AVIF |
+| `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark only |
 
 The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
@@ -78,15 +79,33 @@ The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
 Hooks live in `scripts/git-hooks/` and are opt-in per clone/worktree:
 `./scripts/git-hooks/install.sh` (sets `core.hooksPath`).
 
+The split between them is `heif-decoder`: **nothing pre-commit runs enables it**, so
+committing never triggers a vendored C++ build and needs no `meson` / `ninja` / `nasm` /
+wasi-sdk. Every `heif-decoder` pass lives in pre-push.
+
 - **pre-commit** — `cargo fmt --all --check`, `cargo fmt` inside `filen-sdk-rs`, `taplo
   lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then four clippy passes: workspace
   (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`, and
-  wasm32 `-F wasm-full` + `-F service-worker` (both run from the `filen-sdk-rs` directory).
-  **On a cold cargo cache this takes several minutes** — warm the cache by running those
-  clippy invocations first, or the commit may be killed by a tool/CI timeout mid-hook.
-  Missing `taplo` / `sqlfluff` / the wasm32 target are skipped with a warning.
-- **pre-push** — heavier: feature-combination clippy, `clippy --tests`, full `sqlfluff
-  lint .`, and `cargo test --lib --no-fail-fast` (`SKIP_TESTS=1` to skip).
+  wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
+  `filen-sdk-rs` directory). **On a cold cargo cache this takes several minutes** — warm the
+  cache by running those clippy invocations first, or the commit may be killed by a tool/CI
+  timeout mid-hook. Missing `taplo` / `sqlfluff` / the wasm32 target are skipped with a
+  warning; missing brew LLVM on macOS is a hard failure, since the `cache` wasm pass cannot
+  run without it and quietly dropping the feature would report ok on a configuration nobody
+  ships.
+- **pre-push** — heavier: the `heif-decoder` feature-combination clippy, `clippy --tests`,
+  both wasm32 passes on the feature sets `ci-wasm` uses (`-F wasm-full,cache,heif-decoder`
+  and `--no-default-features -F service-worker,heif-decoder`, i.e. what `wasm-pack.sh`
+  ships), full `sqlfluff lint .`, and `cargo test --lib --no-fail-fast`. This is the hook
+  that needs `meson` / `ninja` (/ `nasm` on x86) and `WASI_SDK_PATH`; it stops with an
+  install message rather than degrading the feature set. `SKIP_HEAVY_CLIPPY=1` builds no
+  vendored C++ at all — it skips the `heif-decoder` passes, native and wasm, *and* adds
+  `--workspace --exclude heif-decoder` to the remaining passes, which would otherwise build
+  the crate anyway (see below); it is the escape hatch if you have no wasi-sdk; `SKIP_TESTS=1` and `SKIP_SQLFLUFF=1` skip theirs.
+
+Neither hook is CI parity, by design: both run a subset. `ci.yml` additionally lints with
+`filen-sdk-rs/cache` in the all-features pass, runs `clippy --tests -F cache`, and
+cross-compiles for Android, iOS and Windows — none of which the hooks attempt.
 
 The auto-formatter some editors/agents run on save does **not** match this repo's nightly
 `cargo fmt` output and will fail the pre-commit gate. Run `cargo fmt -p <crate>` before
@@ -95,6 +114,40 @@ staging.
 ## Toolchain
 
 Uses **nightly** Rust (`nightly-2026-02-20`) via `rust-toolchain.toml`. The nightly channel is required for the `higher-ranked-assumptions` feature. The `rust-src` component is required.
+
+### Native build prerequisites
+
+Everything below exists because `heif-decoder` compiles vendored C++ (libheif, libde265) and
+vendored dav1d from source on *every* target. **You need the first four rows even if you never
+touch thumbnails**: `heif-decoder` is a workspace member and the workspace declares no
+`default-members`, so *any* cargo command run at the repo root builds it, whatever features
+you asked for (`cargo build --unit-graph` at the root plans its `run-custom-build`). Leaving
+the feature off does not help; `--workspace --exclude heif-decoder`, or a package-scoped
+`-p <crate>` command, is the only way to skip them. Build scripts also run under
+`cargo clippy`, not just `cargo build`.
+
+| Tool | Needed for | Install |
+|------|-----------|---------|
+| submodules | any workspace-root cargo command — `heif-decoder/deps/` are git submodules | `git submodule update --init --recursive` |
+| `cmake`, C++ toolchain | any workspace-root cargo command (libheif/libde265) | macOS: Xcode CLT · Ubuntu: `apt install cmake clang libc++-dev libc++abi-dev` |
+| `meson`, `ninja` | any workspace-root cargo command — vendored dav1d, all targets | `brew install meson ninja` · `apt install meson ninja-build` · `choco install meson ninja` |
+| `nasm` | any workspace-root cargo command on **x86/x86_64 only** (dav1d's SIMD); not used on arm64 or wasm | `brew install nasm` · `apt install nasm` · `choco install nasm` (add `C:\Program Files\NASM` to PATH) |
+| brew LLVM | **macOS + wasm32 with `cache`** — Apple clang cannot target wasm32 for the bundled SQLite | `brew install llvm`; `wasm-pack.sh` and the hooks point `CC_wasm32_unknown_unknown` / `AR_wasm32_unknown_unknown` at it |
+| `WASI_SDK_PATH` | **wasm32 with `heif-decoder` only** — there is no host C++ runtime for `wasm32-unknown-unknown` | see below |
+| wasm32 target | any wasm build | `rustup target add wasm32-unknown-unknown` |
+
+wasi-sdk, as `.github/workflows/ci.yml`'s `ci-wasm` job installs it (release **33**; >= 25 is
+the floor, it must carry the `wasm32-wasi-threads` sysroot). Swap the asset for your host:
+
+```bash
+curl -sSfL -o /tmp/wasi-sdk.tar.gz \
+  https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-arm64-macos.tar.gz
+mkdir -p ~/wasi-sdk && tar -xzf /tmp/wasi-sdk.tar.gz -C ~/wasi-sdk --strip-components=1
+export WASI_SDK_PATH=~/wasi-sdk   # must contain share/wasi-sysroot
+```
+
+`filen-sdk-rs/wasm-pack.sh` and the pre-push hook both refuse to run without it, rather than
+building a configuration that never ships.
 
 ## Workspace Structure
 
@@ -186,4 +239,4 @@ See the `mobile-build` skill in `.claude/skills/` for the build commands and got
 
 ### Incremental Build Note
 
-Incremental builds for `heif-decoder` are broken due to a cmake-rs bug. If only working on SDK/types, exclude it with `--exclude heif-decoder` or avoid enabling the `heif-decoder` feature.
+Incremental builds for `heif-decoder` are broken due to a cmake-rs bug. If only working on SDK/types, exclude it with `--workspace --exclude heif-decoder`. Not enabling the `heif-decoder` feature is **not** enough — it is a workspace member, so a workspace-root cargo command builds it regardless.
