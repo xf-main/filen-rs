@@ -8,9 +8,13 @@
 //! * **The hash is checked on every run**, not only after a download. A cached
 //!   file that no longer matches its pin is a hard error, so the tests can
 //!   never quietly run against bytes we do not recognise.
-//! * **Missing bytes are a skip, not a failure.** A machine with no network and
-//!   a cold cache must still pass; it prints which fixture and which URL it
-//!   could not get.
+//! * **Missing bytes are a skip, not a failure.** A fixture that cannot be
+//!   fetched is skipped with a line naming it and its URL; a machine with no
+//!   network passes once it says so with `MICROTHUMB_RAW_FIXTURES=offline`.
+//!
+//! `MICROTHUMB_RAW_FIXTURES` selects how much is fetched: unset pulls the
+//! default subset ([`wanted`]), `all` pulls all of [`RAW_FIXTURES`] (~1 GiB),
+//! `offline` pulls nothing and uses only what is already cached.
 //!
 //! Fetching shells out to `curl` rather than linking an HTTP client. microthumb
 //! is deliberately dependency-light and has no network stack; the alternative
@@ -44,8 +48,34 @@ pub fn cache_dir() -> PathBuf {
 }
 
 /// Set `MICROTHUMB_RAW_FIXTURES=offline` to use only what is already cached.
-fn offline() -> bool {
-	std::env::var("MICROTHUMB_RAW_FIXTURES").is_ok_and(|v| v == "offline")
+pub fn offline() -> bool {
+	mode().is_some_and(|v| v == "offline")
+}
+
+fn mode() -> Option<String> {
+	std::env::var("MICROTHUMB_RAW_FIXTURES").ok()
+}
+
+/// Whether `fixture` is worth downloading on an ordinary run.
+///
+/// The whole table is ~1 GiB, too much to pull from a plain `cargo test`, so
+/// the default is one sample per container format — the largest of each, since
+/// the tests that fetch automatically are memory-ceiling tests and the biggest
+/// file is the worst case for the decode path that container selects. About
+/// 115 MiB, fetched once and kept outside `target/`.
+/// `MICROTHUMB_RAW_FIXTURES=all` widens this to everything.
+pub fn wanted(fixture: &RawFixture) -> bool {
+	if offline() {
+		return false;
+	}
+	if mode().is_some_and(|v| v == "all") {
+		return true;
+	}
+	// ponytail: O(n^2) over a 100-row const table, run once per test.
+	RAW_FIXTURES
+		.iter()
+		.filter(|other| other.container == fixture.container)
+		.all(|other| other.len <= fixture.len)
 }
 
 pub enum Fixture {

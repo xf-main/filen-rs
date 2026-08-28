@@ -476,17 +476,37 @@ fn heif_cases() {
 /// preview can be a 6480x4320 JPEG, its IFD0 can declare an enormous strip
 /// table, and every one of those paths has to stay inside the ceiling.
 ///
-/// Uses only samples already in the fixture cache — it never downloads, so a
-/// plain `cargo test` is unaffected. Populate the cache by running
-/// `cargo test -p microthumb --test raw_characterisation -- --ignored`.
+/// Downloads what it needs: `raw_fixtures::wanted` picks one sample per
+/// container format (~115 MiB, once, kept outside `target/`), every pin is
+/// hash-verified on every run, and anything already cached is metered too even
+/// when it is outside that set. `MICROTHUMB_RAW_FIXTURES=all` meters the whole
+/// ~1 GiB table; `=offline` meters only what is already on disk.
+///
+/// Measuring nothing is a failure, not a quiet pass — that is the entire
+/// reason this function exists. `=offline` is the way to say so deliberately.
 fn raw_cases() {
 	let mut worst = 0;
 	let mut worst_name = "";
 	let mut measured = 0;
+	let mut unavailable = 0;
 
 	for fixture in raw_fixtures::RAW_FIXTURES {
-		let Some(path) = raw_fixtures::cached(fixture) else {
-			continue;
+		let path = if raw_fixtures::wanted(fixture) {
+			match raw_fixtures::locate(fixture) {
+				raw_fixtures::Fixture::Ready(path) => path,
+				raw_fixtures::Fixture::Unavailable(why) => {
+					eprintln!("SKIP {}: {why}", fixture.cache_name);
+					unavailable += 1;
+					continue;
+				}
+			}
+		} else {
+			// Not in the default set, but if a previous `=all` run left it
+			// cached it is free to meter.
+			match raw_fixtures::cached(fixture) {
+				Some(path) => path,
+				None => continue,
+			}
 		};
 		let file = std::fs::File::open(&path).expect("cached fixture opens");
 		let source = FileSource::new(file).expect("file source");
@@ -509,12 +529,26 @@ fn raw_cases() {
 	}
 
 	if measured == 0 {
+		// A pass here would prove nothing about RAW memory while looking green,
+		// and a printed warning would be swallowed by libtest's capture. So it
+		// fails; the message says exactly how to make an offline run legitimate.
+		assert!(
+			raw_fixtures::offline(),
+			"raw cases measured NOTHING: {unavailable} pinned samples could not be \
+			 fetched into {} (see the SKIP lines above), so the RAW memory ceilings \
+			 are unproven. Set MICROTHUMB_RAW_FIXTURES=offline to run without them \
+			 on purpose.",
+			raw_fixtures::cache_dir().display()
+		);
 		eprintln!(
-			"SKIP raw cases: no pinned RAW samples in {} — run \
-			 `cargo test -p microthumb --test raw_characterisation -- --ignored` to fetch them",
+			"SKIP raw cases: MICROTHUMB_RAW_FIXTURES=offline and nothing cached in {} \
+			 — the RAW memory ceilings are NOT proven by this run",
 			raw_fixtures::cache_dir().display()
 		);
 		return;
 	}
-	eprintln!("raw peak over {measured} samples: {worst} bytes ({worst_name})");
+	eprintln!(
+		"raw peak over {measured} samples ({unavailable} unavailable): \
+		 {worst} bytes ({worst_name})"
+	);
 }
