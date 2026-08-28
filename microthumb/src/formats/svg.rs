@@ -124,8 +124,9 @@ const MAX_REFERENCE_HOPS: u32 = 32;
 const FILTER_NODE_WEIGHT: u64 = 2;
 
 /// Worst-case concurrent isolated-layer bytes `decode_into` will accept, in
-/// units of the output pixmap — priced into `peak_estimate` for EVERY document
-/// and enforced against the real tree before rendering.
+/// units of one PADDED output pixmap ([`layer_unit_bytes`]) — priced into
+/// `peak_estimate` for EVERY document and enforced against the real tree
+/// before rendering.
 ///
 /// Sized for what real files carry: a full-canvas `clipPath` — which is in
 /// essentially every Figma/Illustrator/Inkscape export — costs three pixmaps
@@ -135,6 +136,17 @@ const FILTER_NODE_WEIGHT: u64 = 2;
 /// scan of the text or the attributes can tell in advance whether a document
 /// has layers.
 const LAYERED_ALLOWANCE_PIXMAPS: usize = 6;
+
+/// Whole pixels resvg adds to an isolated layer before allocating its
+/// sub-pixmap: it rounds the bounding box out and leaves slop on each side.
+///
+/// This is an ABSOLUTE cost — it does not shrink with the target — so both
+/// sides of the allowance have to quote it. Charging it in `layer_peak` while
+/// pricing the allowance in unpadded pixmaps made the same document pass or
+/// fail on target size alone: it is ~13% of a 64 px canvas but ~1.6% of a
+/// 512 px one, so an export sitting near the line was refused small and
+/// rendered large.
+const LAYER_PAD: u32 = 4;
 
 impl FormatDecoder for Svg {
 	fn detect(&self, prefix: &[u8]) -> bool {
@@ -1342,6 +1354,12 @@ fn raster_dims(aspect: f64, spec: &ThumbSpec) -> (u32, u32) {
 	// are priced against the same budget. Cap the area at what the raster plus
 	// that allowance may take of it — a wide document renders smaller rather
 	// than not at all.
+	//
+	// The reserve is counted in UNPADDED pixels while the allowance charges
+	// `LAYER_PAD` on each side; that gap is what the ×2 here is spent on. It
+	// only ever binds above ~470 px a side (below that nothing shrinks), where
+	// the padding is under 2% — so the reserve still covers the estimate with
+	// most of the doubling to spare.
 	let max_px = (spec.mem_budget / (4 * 2 * (1 + LAYERED_ALLOWANCE_PIXMAPS))).max(1) as f64;
 	if w * h > max_px {
 		let shrink = (max_px / (w * h)).sqrt();
@@ -1363,7 +1381,7 @@ struct PreparedSvg {
 
 impl PreparedSvg {
 	fn layer_allowance(&self) -> usize {
-		pixmap_bytes(self.out_dims).saturating_mul(LAYERED_ALLOWANCE_PIXMAPS)
+		layer_unit_bytes(self.out_dims).saturating_mul(LAYERED_ALLOWANCE_PIXMAPS)
 	}
 
 	/// What one isolated layer can cost at most, matching the clamp resvg
@@ -1376,6 +1394,17 @@ impl PreparedSvg {
 
 fn pixmap_bytes(dims: (u32, u32)) -> usize {
 	dims.0 as usize * dims.1 as usize * 4
+}
+
+/// Bytes ONE isolated layer covering the whole canvas costs, in the units
+/// `layer_peak` charges in — the output pixmap plus the padding resvg rounds
+/// every layer out by. The allowance is quoted in these so a verdict depends
+/// on the document, not on how big the thumbnail happens to be.
+fn layer_unit_bytes(dims: (u32, u32)) -> usize {
+	pixmap_bytes((
+		dims.0.saturating_add(LAYER_PAD),
+		dims.1.saturating_add(LAYER_PAD),
+	))
 }
 
 impl PreparedDecode for PreparedSvg {
@@ -1570,8 +1599,8 @@ fn layer_peak(group: &usvg::Group, scale: f64, cap: u64) -> u64 {
 	let mut own = 0u64;
 	if group.should_isolate() {
 		let bbox = group.abs_layer_bounding_box();
-		let w = (f64::from(bbox.width()) * scale).ceil() + 4.0;
-		let h = (f64::from(bbox.height()) * scale).ceil() + 4.0;
+		let w = (f64::from(bbox.width()) * scale).ceil() + f64::from(LAYER_PAD);
+		let h = (f64::from(bbox.height()) * scale).ceil() + f64::from(LAYER_PAD);
 		let bytes = if w.is_finite() && h.is_finite() {
 			(w * h * 4.0).min(u64::MAX as f64) as u64
 		} else {

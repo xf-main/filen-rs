@@ -6,7 +6,10 @@
 use std::io::Cursor;
 
 use image::{ImageFormat, Rgb, RgbImage};
-use microthumb::{DEFAULT_MEM_BUDGET, MemSource, ThumbError, ThumbOutcome, ThumbSpec, generate};
+use microthumb::{
+	APP_PROCESS_MEM_BUDGET, DEFAULT_MEM_BUDGET, MemSource, ThumbError, ThumbOutcome, ThumbSpec,
+	generate,
+};
 
 /// Most tests care only about the pixels. The ones that care about WHICH path
 /// produced them call `generate` directly and inspect `Thumbnail::source`.
@@ -2137,5 +2140,64 @@ fn svg_text_renders_as_nothing() {
 	assert!(
 		mean_channel(&result.rgba, 0) < 10,
 		"text was rendered from somewhere"
+	);
+}
+
+/// Every design tool exports the same shape: a group clipped to the frame,
+/// holding a masked group. Both cover the canvas, so both are charged at
+/// canvas size — and the verdict has to be the same at every target, because
+/// nothing about the DOCUMENT changed between them. It was not: the allowance
+/// was priced in unpadded output pixmaps while `layer_peak` charges the
+/// padding resvg rounds each layer out by, an absolute cost that is ~13% of
+/// this document at a 64 px target and ~2% at 512 — so this export was
+/// refused small and rendered large.
+#[cfg(feature = "svg")]
+#[test]
+fn svg_design_tool_exports_thumbnail_at_every_target() {
+	let export = svg_doc(
+		r#"width="200" height="200" viewBox="0 0 200 200" fill="none""#,
+		r##"<g clip-path="url(#clip0)">
+		<rect width="200" height="200" fill="#fff"/>
+		<g mask="url(#mask0)"><path d="M10 10L190 190" stroke="#000" stroke-width="4"/></g>
+		</g>
+		<defs><clipPath id="clip0"><rect width="200" height="200"/></clipPath>
+		<mask id="mask0" maskUnits="userSpaceOnUse" x="0" y="0" width="200" height="200">
+		<rect width="200" height="200" fill="#fff"/></mask></defs>"##,
+	);
+	// Both budgets at every shipped target: an `OverBudget` here is the
+	// estimate — allowance included — not fitting `mem_budget`. 512 on the
+	// 12 MB budget is the tightest of the six at half the budget spent, so it
+	// catches an allowance that grew past roughly double.
+	for budget in [DEFAULT_MEM_BUDGET, APP_PROCESS_MEM_BUDGET] {
+		for target in [64, 128, 512] {
+			let spec = ThumbSpec::new(target, target, budget);
+			let outcome = generate(Box::new(MemSource(export.clone())), &spec)
+				.unwrap_or_else(|e| panic!("an ordinary export must decode at {target}: {e}"));
+			assert!(
+				matches!(outcome, ThumbOutcome::Thumbnail(_)),
+				"an ordinary export must thumbnail at {target} on a {budget}-byte budget, \
+				 got {outcome:?}"
+			);
+		}
+	}
+
+	// And the allowance still binds: nested full-canvas opacity groups are
+	// concurrent sub-pixmaps, and twenty-four of them are refused at the
+	// largest target on the roomiest budget, not merely at the smallest.
+	let mut body = String::new();
+	for _ in 0..24 {
+		body.push_str(r#"<g opacity="0.5">"#);
+	}
+	body.push_str(r#"<rect width="200" height="200" fill="red"/>"#);
+	for _ in 0..24 {
+		body.push_str("</g>");
+	}
+	let stack = svg_doc(r#"width="200" height="200""#, &body);
+	let spec = ThumbSpec::new(512, 512, APP_PROCESS_MEM_BUDGET);
+	let err = thumb(Box::new(MemSource(stack)), &spec)
+		.expect_err("a twenty-four-deep layer stack must still be refused");
+	assert!(
+		err.to_string().contains("isolated layer stack"),
+		"expected the layer allowance, got {err}"
 	);
 }
