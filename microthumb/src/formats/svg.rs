@@ -1415,7 +1415,7 @@ impl PreparedDecode for PreparedSvg {
 		self.out_dims
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
+	fn embedded_preview(&mut self, _mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
 		// No such thing for SVG.
 		Ok(None)
 	}

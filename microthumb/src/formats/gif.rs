@@ -56,7 +56,7 @@ impl PreparedDecode for PreparedGif {
 		self.dims
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
+	fn embedded_preview(&mut self, _mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
 		Ok(None)
 	}
 

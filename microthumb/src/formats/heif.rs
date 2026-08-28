@@ -96,12 +96,27 @@ impl PreparedDecode for PreparedHeif {
 		}
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
-		match self.session.embedded_thumbnail_rgba(MAX_PREVIEW_PIXELS) {
-			Ok(rgba) => Ok(rgba.map(small_image)),
-			// A corrupt thumbnail item must not fail the tile path.
-			Err(_) => Ok(None),
-		}
+	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
+		// libheif's own RGBA plus the copy `small_image` takes ownership of,
+		// 8 bytes per PREVIEW pixel, and the cap has to bind before libheif
+		// decodes, not after. What it does NOT price is the codec's transient
+		// cost of decoding that preview — `DECODE_SETUP_BYTES` plus
+		// `DECODE_BYTES_PER_PIXEL` per preview pixel, which `peak_estimate`
+		// charges the real decode. Real `thmb` items are ~320 px, so the
+		// transient is ~2.3 MB and this holds today; a container declaring
+		// the full `MAX_PREVIEW_PIXELS` would put ~13.6 MB behind it,
+		// unpriced.
+		let max_pixels = MAX_PREVIEW_PIXELS.min(mem_budget as u64 / 8);
+		let rgba = self
+			.session
+			.embedded_thumbnail_rgba(max_pixels)
+			.map_err(decode_err)?;
+		// A corrupt thumbnail item must still not fail the tile path — but
+		// that call belongs to the orchestrator, which knows whether there is
+		// a tile path left to fall back on. Swallowing it here also swallowed
+		// it on the preview-only spec, where the answer then reached the
+		// caller as a settled "no thumbnail".
+		Ok(rgba.map(small_image))
 	}
 
 	fn peak_estimate(&self) -> usize {
@@ -180,5 +195,11 @@ fn small_image(rgba: RgbaImage) -> SmallImage {
 }
 
 fn decode_err(e: heif_decoder::HeifError) -> ThumbError {
+	// Always `Decode`, never `Io`: libheif reports a failed reader callback as
+	// an error code of its own, and `HeifError` does not carry the io error
+	// that callback saw. So a transport blip inside libheif is not
+	// distinguishable here from corrupt bytes, and settles as a verdict about
+	// the file rather than staying retryable. Fixing that means teaching
+	// `heif-decoder` to carry the reader's error out.
 	ThumbError::Decode(format!("{e}"))
 }

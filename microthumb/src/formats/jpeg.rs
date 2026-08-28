@@ -151,15 +151,25 @@ fn full_decode_peak(src_dims: (u32, u32), out_dims: (u32, u32), progressive: boo
 
 /// Decodes an EXIF IFD1 embedded thumbnail (shared by the full-decode and
 /// DC-scan prepared states).
-pub(super) fn exif_preview(exif: Option<&[u8]>) -> Option<SmallImage> {
+///
+/// The EXIF block is already in memory by the time this runs, so nothing here
+/// touches the source and an error can only mean corrupt bytes — hence
+/// `Option`, not `Result`.
+pub(super) fn exif_preview(exif: Option<&[u8]>, mem_budget: usize) -> Option<SmallImage> {
 	let bytes = exif.and_then(exif::embedded_thumbnail)?;
 	let mut decoder = Decoder::new(bytes);
 	if decoder.read_info().is_err() {
 		return None;
 	}
-	let sane = decoder
-		.info()
-		.is_some_and(|info| u64::from(info.width) * u64::from(info.height) <= MAX_PREVIEW_PIXELS);
+	let sane = decoder.info().is_some_and(|info| {
+		let px = u64::from(info.width) * u64::from(info.height);
+		// Two ceilings, and the budget one has to be checked HERE: the
+		// decoder's output frame (3 B/px, 4 for CMYK) and the RGBA copy
+		// `rgba_image` builds are live together — 8 B/px, the rate the
+		// whole-frame formats charge, and 7.17 MiB measured for a 1 Mpx
+		// preview. The orchestrator can only filter one already paid for.
+		px <= MAX_PREVIEW_PIXELS && px.saturating_mul(8) <= mem_budget as u64
+	});
 	if !sane {
 		return None;
 	}
@@ -201,8 +211,8 @@ impl PreparedDecode for PreviewOnly {
 		self.orientation
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
-		Ok(exif_preview(self.exif.as_deref()))
+	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
+		Ok(exif_preview(self.exif.as_deref(), mem_budget))
 	}
 
 	fn peak_estimate(&self) -> usize {
@@ -229,8 +239,8 @@ impl PreparedDecode for PreparedJpeg {
 		self.orientation
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
-		Ok(exif_preview(self.exif.as_deref()))
+	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
+		Ok(exif_preview(self.exif.as_deref(), mem_budget))
 	}
 
 	fn peak_estimate(&self) -> usize {

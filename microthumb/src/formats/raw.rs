@@ -684,13 +684,18 @@ impl PreparedDecode for PreparedRawJpeg {
 		self.orientation
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
+	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
 		let Some(inner) = self.inner.take() else {
 			return Ok(None);
 		};
 		// Priced by the same rules as any other decode; over budget answers
 		// None rather than failing, and the orchestrator reports no thumbnail.
-		crate::decode_bounded(inner, &self.spec)
+		// The allowance this call was handed wins over the one `open` saw.
+		let spec = ThumbSpec {
+			mem_budget,
+			..self.spec
+		};
+		crate::decode_bounded(inner, &spec)
 	}
 
 	fn peak_estimate(&self) -> usize {
@@ -720,11 +725,21 @@ impl PreparedDecode for PreparedRawRgb {
 		self.orientation
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
+	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
 		let (Some(mut src), (w, h)) = (self.src.take(), self.dims) else {
 			return Ok(None);
 		};
 		let row_bytes = w as usize * 3;
+		// The whole RGBA strip plus the band buffer below, refused before
+		// either is allocated: nothing downstream can un-spend them.
+		let cost = (w as usize)
+			.saturating_mul(h as usize)
+			.saturating_mul(4)
+			.saturating_add(row_bytes)
+			.saturating_add(65536);
+		if cost > mem_budget {
+			return Ok(None);
+		}
 		let mut rgba = vec![0u8; w as usize * h as usize * 4];
 		// Read in bands rather than row by row: a remote source charges per
 		// request, and 64 KB at a time keeps both the request count and the

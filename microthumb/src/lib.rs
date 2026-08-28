@@ -251,7 +251,15 @@ pub trait PreparedDecode {
 
 	/// A cheap embedded preview (EXIF IFD1 thumb, HEIF `thmb` item), read
 	/// from the header region only.
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError>;
+	///
+	/// `mem_budget` is the caller's whole allowance — on this path the preview
+	/// IS the output, so there is no accumulator canvas to leave room for.
+	/// Anything that would not fit must be refused BEFORE it is materialised:
+	/// the orchestrator can only filter a preview that has already been paid
+	/// for, and these are not free (a 1 Mpx EXIF thumbnail measured 7.17 MiB,
+	/// most of a remote decode's budget, on the path that is supposed to be
+	/// the cheap one).
+	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError>;
 
 	/// Contract: [`decode_into`](Self::decode_into) never allocates more than
 	/// this, including the decoder's internal state. The orchestrator refuses
@@ -408,14 +416,20 @@ pub fn generate(
 	let orientation = prepared.orientation();
 
 	// A broken preview must not fail a decodable image — previews are an
-	// optimisation, the real decode is the contract. Budget-gated like every
-	// other path: the preview plus the one rotated copy `apply_orientation`
-	// may hold concurrently must fit (2× its RGBA — 8 bytes per pixel); an
-	// oversized "preview" falls through to the bounded decode instead.
-	let mut preview = prepared
-		.embedded_preview()
-		.unwrap_or_default()
-		.filter(|p| p.rgba.len().saturating_mul(2) <= spec.mem_budget);
+	// optimisation, the real decode is the contract. On a preview-only spec
+	// there IS no real decode behind it, and swallowing there would answer a
+	// settled `OverBudget` — "this file has no thumbnail", which callers cache
+	// as final — for what may be a transient read failure.
+	let preview = match prepared.embedded_preview(spec.mem_budget) {
+		Ok(preview) => preview,
+		Err(_) if spec.allow_full_decode => None,
+		Err(e) => return Err(e),
+	};
+	// Backstop to the budget the format was handed: the preview plus the one
+	// rotated copy `apply_orientation` may hold concurrently must fit (2× its
+	// RGBA — 8 bytes per pixel); an oversized "preview" falls through to the
+	// bounded decode instead.
+	let mut preview = preview.filter(|p| p.rgba.len().saturating_mul(2) <= spec.mem_budget);
 	let as_preview = |preview: SmallImage| {
 		ThumbOutcome::Thumbnail(Thumbnail {
 			image: apply_orientation(preview, orientation),

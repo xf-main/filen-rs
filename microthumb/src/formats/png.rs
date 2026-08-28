@@ -74,7 +74,7 @@ impl PreparedDecode for PreparedPng {
 		self.orientation
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
+	fn embedded_preview(&mut self, _mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
 		// The eXIf chunk can theoretically carry a thumbnail; in practice PNGs
 		// with one are vanishingly rare and rows already stream cheaply.
 		Ok(None)

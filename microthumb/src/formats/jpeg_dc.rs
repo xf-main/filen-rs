@@ -298,8 +298,8 @@ impl PreparedDecode for PreparedDcScan {
 		self.orientation
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
-		Ok(exif_preview(self.exif.as_deref()))
+	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
+		Ok(exif_preview(self.exif.as_deref(), mem_budget))
 	}
 
 	fn peak_estimate(&self) -> usize {

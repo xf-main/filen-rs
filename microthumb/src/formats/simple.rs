@@ -84,7 +84,7 @@ impl PreparedDecode for PreparedSimple {
 		self.orientation
 	}
 
-	fn embedded_preview(&mut self) -> Result<Option<SmallImage>, ThumbError> {
+	fn embedded_preview(&mut self, _mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
 		Ok(None)
 	}
 
