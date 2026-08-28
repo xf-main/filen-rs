@@ -202,7 +202,8 @@ pub use microthumb::{
 	ThumbSpec,
 };
 
-/// Sources bigger than this are not worth streaming end to end to make one
+/// Default for [`ClientConfig::with_thumbnail_max_source_bytes`](crate::auth::http::ClientConfig::with_thumbnail_max_source_bytes):
+/// sources bigger than this are not worth streaming end to end to make one
 /// small thumbnail. Past it the pipeline is restricted to embedded previews
 /// ([`ThumbSpec::allow_full_decode`] off), which cost a chunk or two whatever
 /// the file size — so a 200 MB HEIC still gets its `thmb` item, and a source
@@ -620,6 +621,12 @@ mod remote_chunks {
 			}
 			let cancel = Arc::new(AtomicBool::new(false));
 			let mut guard = CancelOnDrop(Some(cancel.clone()));
+			// Decode buffers, not downloads, are the memory hazard, and this path was bounded
+			// only by tokio's 512 blocking threads. Acquired BEFORE the source and the spawn, so
+			// parked work costs a future rather than a blocked pool thread; MOVED INTO the
+			// closure so the permit outlives a cancelled caller's future the way the detached
+			// decode does.
+			let decode_permit = client.thumbnails().decode_permit().await;
 			let source = RemoteChunkSource::new(
 				client,
 				file,
@@ -627,6 +634,7 @@ mod remote_chunks {
 				Some(cancel),
 			);
 			let joined = tokio::task::spawn_blocking(move || {
+				let _decode_permit = decode_permit;
 				let mut webp = Vec::new();
 				let outcome = make_thumbnail_from_source(
 					Box::new(source),
@@ -652,7 +660,12 @@ mod remote_chunks {
 			// No cancel flag: dropping this future drops `incoming`, and the
 			// source's next request fails the same way.
 			let source = RemoteChunkSource::over_requests(file.size(), None, requests);
+			// Same gate as the native arm, for the same reason. A configured concurrency above 1
+			// is capped at 1 anyway: every decode runs on the ONE long-lived `decode_worker`
+			// thread, which takes jobs strictly in turn.
+			let decode_permit = client.thumbnails().decode_permit().await;
 			let mut done = decode_worker::submit(move || {
+				let _decode_permit = decode_permit;
 				let mut webp = Vec::new();
 				make_thumbnail_from_source(
 					Box::new(source),
@@ -700,8 +713,7 @@ mod js_impls {
 	use filen_macros::js_type;
 
 	use super::{
-		APP_PROCESS_THUMBNAIL_MEM_BUDGET, MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES,
-		ThumbSource, ThumbSpec, ThumbnailOutcome, is_supported_thumbnail_mime,
+		ThumbSource, ThumbnailOutcome, is_supported_thumbnail_mime,
 		remote_chunks::thumbnail_remote_file,
 	};
 	use crate::{
@@ -797,18 +809,9 @@ mod js_impls {
 				if !is_supported_thumbnail_mime(mime) {
 					return Ok(MakeThumbnailInMemoryResult::Unsupported);
 				}
-				let spec = ThumbSpec {
-					target_width: params.max_width,
-					target_height: params.max_height,
-					// The chunk source's two resident slots live outside the
-					// pipeline's own accounting; hand the decode what is
-					// actually left.
-					mem_budget: APP_PROCESS_THUMBNAIL_MEM_BUDGET
-						.saturating_sub(REMOTE_SOURCE_RESIDENT_BYTES),
-					// Past the cap, the embedded preview is still worth a
-					// chunk or two — streaming the whole thing is not.
-					allow_full_decode: file.size() <= MAX_THUMBNAIL_SOURCE_BYTES,
-				};
+				let spec =
+					this.thumbnails()
+						.spec_remote(params.max_width, params.max_height, file.size());
 				let (outcome, webp_data) = thumbnail_remote_file(this, file, spec).await?;
 				Ok(match outcome {
 					ThumbnailOutcome::Thumbnail(info) => MakeThumbnailInMemoryResult::Thumbnail {
@@ -839,9 +842,10 @@ mod tests {
 	use microthumb::MemSource;
 
 	use super::{
-		DEFAULT_THUMBNAIL_MEM_BUDGET, ThumbSpec, ThumbnailFit, ThumbnailOutcome,
-		make_thumbnail_from_source,
+		DEFAULT_THUMBNAIL_MEM_BUDGET, REMOTE_SOURCE_RESIDENT_BYTES, ThumbSpec, ThumbnailFit,
+		ThumbnailOutcome, make_thumbnail_from_source,
 	};
+	use crate::auth::http::{ClientConfig, SharedClientState};
 
 	fn png_bytes(width: u32, height: u32) -> Vec<u8> {
 		use image::{ImageFormat, RgbImage};
@@ -1078,6 +1082,98 @@ mod tests {
 			"got {outcome:?}"
 		);
 		assert!(out.is_empty());
+	}
+
+	/// The point of the whole config: what a host configures is what the decode runs under.
+	///
+	/// A real `Client` needs auth material a unit test has no business minting, so this stops one
+	/// layer short at `SharedClientState` — which is where the config actually lands and what
+	/// `Client::thumbnails()` hands straight back.
+	#[test]
+	fn a_configured_budget_reaches_the_decode() {
+		let bytes = png_bytes(300, 200);
+		let decode_under = |config: ClientConfig| {
+			let state = SharedClientState::new(config).expect("valid config");
+			let mut out = Vec::new();
+			let outcome = make_thumbnail_from_source(
+				Box::new(MemSource(bytes.clone())),
+				&state.thumbnails().spec_local(32, 32),
+				ThumbnailFit::Cover,
+				&mut out,
+			)
+			.unwrap();
+			(outcome, out)
+		};
+
+		// Same image, same call path — only the configured budget differs.
+		let (outcome, out) = decode_under(ClientConfig::default());
+		let ThumbnailOutcome::Thumbnail(info) = outcome else {
+			panic!("expected a thumbnail under the default budget, got {outcome:?}");
+		};
+		assert_eq!((info.width, info.height), (32, 32));
+		assert!(!out.is_empty());
+
+		let (outcome, out) = decode_under(ClientConfig::default().with_thumbnail_mem_budget(1024));
+		assert_eq!(outcome, ThumbnailOutcome::OverBudget);
+		assert!(out.is_empty());
+	}
+
+	/// The two corrections `spec_remote` absorbed from its (formerly duplicated) callers.
+	#[test]
+	fn spec_remote_pays_for_the_sources_resident_chunks_and_caps_the_stream() {
+		let state = SharedClientState::new(ClientConfig::default()).expect("valid config");
+		let thumbs = state.thumbnails();
+
+		assert_eq!(
+			thumbs.spec_remote(32, 32, 1).mem_budget,
+			thumbs.mem_budget - REMOTE_SOURCE_RESIDENT_BYTES
+		);
+		assert!(
+			thumbs
+				.spec_remote(32, 32, thumbs.max_source_bytes)
+				.allow_full_decode
+		);
+		assert!(
+			!thumbs
+				.spec_remote(32, 32, thumbs.max_source_bytes + 1)
+				.allow_full_decode,
+			"past the cap only the embedded-preview probe is worth the bytes"
+		);
+
+		// A budget under the subtraction saturates to 0 rather than wrapping to a huge one.
+		let starved =
+			SharedClientState::new(ClientConfig::default().with_thumbnail_mem_budget(1024))
+				.expect("valid config");
+		assert_eq!(starved.thumbnails().spec_remote(32, 32, 1).mem_budget, 0);
+	}
+
+	/// The permit is `acquire_owned`ed so it can be MOVED INTO the detached blocking closure and
+	/// released when the decode really ends. This pins the other half of that contract: an
+	/// ordinary drop does give the slot back, so a cancelled caller cannot leak the gate shut.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn a_dropped_decode_permit_gives_its_slot_back() {
+		use std::time::Duration;
+
+		let state =
+			SharedClientState::new(ClientConfig::default().with_thumbnail_decode_concurrency(1))
+				.expect("valid config");
+		let thumbs = state.thumbnails();
+
+		let held = thumbs.decode_permit().await;
+		// Paused time auto-advances once every task is idle, so a gate that never opens elapses
+		// this deterministically instead of sleeping.
+		assert!(
+			tokio::time::timeout(Duration::from_secs(30), thumbs.decode_permit())
+				.await
+				.is_err(),
+			"the only slot is held; a second decode must wait"
+		);
+
+		drop(held);
+		let _reacquired = tokio::time::timeout(Duration::from_secs(30), thumbs.decode_permit())
+			.await
+			.expect("dropping a decode permit must return it to the gate");
 	}
 
 	#[test]

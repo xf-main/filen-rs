@@ -9,6 +9,7 @@ use std::{
 use bytes::Bytes;
 use filen_macros::js_type;
 use filen_types::auth::APIKey;
+use microthumb::{APP_PROCESS_MEM_BUDGET, ThumbSpec};
 use reqwest::{
 	IntoUrl, RequestBuilder,
 	header::{HeaderName, HeaderValue},
@@ -21,6 +22,7 @@ use crate::{
 	Error,
 	auth::{Client, http::auth::AuthLayer, unauth::UnauthClient},
 	consts::gateway_url,
+	thumbnail::{MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES},
 	util::{MaybeSend, MaybeSendSync},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -84,6 +86,19 @@ pub struct ClientConfig {
 	connect_timeout: Option<Duration>,
 	/// Idle/time-to-first-byte read timeout (see [`DEFAULT_READ_TIMEOUT`]). `None` disables it.
 	read_timeout: Option<Duration>,
+	/// Hard ceiling on ONE thumbnail decode's peak allocation, bytes — which microthumb preset
+	/// this host decodes under. A host with a jetsam ceiling of its own (the iOS file-provider
+	/// extension) sets [`microthumb::DEFAULT_MEM_BUDGET`]; a whole app process or browser tab
+	/// affords [`APP_PROCESS_MEM_BUDGET`].
+	thumbnail_mem_budget: usize,
+	/// How many bytes we will stream for ONE thumbnail. Past it the decode is restricted to
+	/// embedded previews (see [`ThumbSpec::allow_full_decode`]), which cost a chunk or two
+	/// whatever the file size — so a 200 MB HEIC still gets its `thmb` item. `0` is meaningful:
+	/// embedded previews only, never a full decode off the network.
+	thumbnail_max_source_bytes: u64,
+	/// How many thumbnail decodes may run at once for this client. Decode buffers, not
+	/// downloads, are the memory hazard: each one costs up to `thumbnail_mem_budget`.
+	thumbnail_decode_concurrency: usize,
 }
 
 impl ClientConfig {
@@ -122,6 +137,24 @@ impl ClientConfig {
 
 	pub fn with_memory_budget(mut self, file_io_memory_budget: usize) -> Self {
 		self.file_io_memory_budget = file_io_memory_budget;
+		self
+	}
+
+	pub fn with_thumbnail_mem_budget(mut self, thumbnail_mem_budget: usize) -> Self {
+		self.thumbnail_mem_budget = thumbnail_mem_budget;
+		self
+	}
+
+	pub fn with_thumbnail_max_source_bytes(mut self, thumbnail_max_source_bytes: u64) -> Self {
+		self.thumbnail_max_source_bytes = thumbnail_max_source_bytes;
+		self
+	}
+
+	pub fn with_thumbnail_decode_concurrency(
+		mut self,
+		thumbnail_decode_concurrency: usize,
+	) -> Self {
+		self.thumbnail_decode_concurrency = thumbnail_decode_concurrency;
 		self
 	}
 
@@ -170,6 +203,15 @@ impl Default for ClientConfig {
 			log_level: None,
 			connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
 			read_timeout: Some(DEFAULT_READ_TIMEOUT),
+			// NOT the safe 12 MiB preset, and deliberately NOT cfg'd on iOS the way
+			// `file_io_memory_budget` below is: on iOS the same binary serves both the file-provider
+			// extension and the app, so an iOS cfg would starve the app to protect the extension.
+			// The only memory-capped host is the extension, and it sets its own budget explicitly.
+			// Every existing caller of the FFI path decodes under 64 MiB today, so this default
+			// preserves that byte for byte.
+			thumbnail_mem_budget: APP_PROCESS_MEM_BUDGET,
+			thumbnail_max_source_bytes: MAX_THUMBNAIL_SOURCE_BYTES,
+			thumbnail_decode_concurrency: 2,
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
 				{
@@ -213,6 +255,18 @@ pub struct JsClientConfig {
 	pub log_level: Option<LogLevel>,
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	pub file_io_memory_budget: Option<u64>,
+	// These three carry `uniffi(default = None)` where the fields above do not: a bare new field
+	// on a `uniffi::Record` changes the generated Kotlin/Swift constructor arity, so every
+	// existing caller would stop compiling.
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub thumbnail_mem_budget: Option<u64>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub thumbnail_max_source_bytes: Option<u64>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub thumbnail_decode_concurrency: Option<u32>,
 }
 
 #[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
@@ -250,7 +304,101 @@ impl From<JsClientConfig> for ClientConfig {
 				.min(tokio::sync::Semaphore::MAX_PERMITS);
 			config = config.with_memory_budget(budget);
 		}
+		if let Some(thumbnail_mem_budget) = value.thumbnail_mem_budget {
+			// The remote path subtracts the chunk source's two resident slots from the budget, so
+			// anything at or below that leaves the decode nothing (saturating to 0) and refuses
+			// every image. Floor at twice the subtraction so a decode always has room left.
+			let budget = usize::try_from(thumbnail_mem_budget)
+				.unwrap_or(usize::MAX)
+				.max(2 * REMOTE_SOURCE_RESIDENT_BYTES);
+			config = config.with_thumbnail_mem_budget(budget);
+		}
+		if let Some(thumbnail_max_source_bytes) = value.thumbnail_max_source_bytes {
+			// No floor: 0 is a meaningful setting, not a mistake — it means "embedded previews
+			// only, never stream a file for a thumbnail".
+			config = config.with_thumbnail_max_source_bytes(thumbnail_max_source_bytes);
+		}
+		if let Some(thumbnail_decode_concurrency) = value.thumbnail_decode_concurrency {
+			// A zero-permit gate parks every decode forever; treat 0 (a natural "unlimited"
+			// assumption from FFI callers) as a floor of 1.
+			config = config
+				.with_thumbnail_decode_concurrency((thumbnail_decode_concurrency as usize).max(1));
+		}
 		config
+	}
+}
+
+/// The thumbnail policy this client decodes under, plus the gate that bounds how many decodes
+/// run at once.
+///
+/// Lives here rather than in `thumbnail.rs` because it is built from [`ClientConfig`] and owned by
+/// [`SharedClientState`], exactly like the file-IO memory budget next to it.
+///
+/// **The gate is per-client-lineage, not process-wide.** `SharedClientState` is cloned by `Arc`
+/// through `UnauthClient::from_stringified`, so every client descended from one `UnauthClient`
+/// shares one gate. In the mobile cache that is one client at a time and equivalent to the old
+/// file-level `static`, except transiently during an auth swap where two states could briefly
+/// overlap and admit `2 * concurrency` decodes. At 12 MiB each that is survivable.
+#[derive(Clone)]
+pub struct ThumbnailConfig {
+	/// See [`ClientConfig::with_thumbnail_mem_budget`].
+	pub mem_budget: usize,
+	/// See [`ClientConfig::with_thumbnail_max_source_bytes`].
+	pub max_source_bytes: u64,
+	/// `Arc` rather than a plain `Semaphore` (as [`crate::auth::Client::open_file_semaphore`] is)
+	/// so a permit can be `acquire_owned`ed and MOVED INTO the blocking decode closure — see
+	/// [`decode_permit`](Self::decode_permit).
+	gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl ThumbnailConfig {
+	fn new(config: &ClientConfig) -> Self {
+		Self {
+			mem_budget: config.thumbnail_mem_budget,
+			max_source_bytes: config.thumbnail_max_source_bytes,
+			// A zero-permit gate parks every decode forever; floor it here so no FFI or builder
+			// path can produce one. tokio's Semaphore panics above MAX_PERMITS, which a 32-bit
+			// `usize` (wasm32) puts within reach of a plausible config typo, so clamp there too.
+			// Both ends belong here rather than at the call sites: every construction path
+			// (default, builder, `From<JsClientConfig>`) converges on this one constructor.
+			gate: Arc::new(tokio::sync::Semaphore::new(
+				config
+					.thumbnail_decode_concurrency
+					.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+			)),
+		}
+	}
+
+	/// Spec for bytes that are already local: the whole budget, and a full decode is free.
+	pub fn spec_local(&self, target_width: u32, target_height: u32) -> ThumbSpec {
+		ThumbSpec::new(target_width, target_height, self.mem_budget)
+	}
+
+	/// Spec for a file streamed over the network through a `RemoteChunkSource`.
+	///
+	/// Two corrections the callers used to copy-paste: the source's two resident chunk slots live
+	/// outside the pipeline's own accounting, so they come off the budget; and past
+	/// [`max_source_bytes`](Self::max_source_bytes) only the embedded-preview probe is worth the
+	/// bytes.
+	pub fn spec_remote(&self, target_width: u32, target_height: u32, file_size: u64) -> ThumbSpec {
+		ThumbSpec {
+			target_width,
+			target_height,
+			mem_budget: self.mem_budget.saturating_sub(REMOTE_SOURCE_RESIDENT_BYTES),
+			allow_full_decode: file_size <= self.max_source_bytes,
+		}
+	}
+
+	/// Waits for a decode slot. Acquire this BEFORE spawning the blocking decode, so parked work
+	/// costs a future rather than a blocked pool thread, and MOVE the permit into the closure: a
+	/// cancelled caller drops its future while the detached closure keeps decoding, and a permit
+	/// released by the dropped future would let fresh decodes stack on the orphans.
+	pub async fn decode_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+		self.gate
+			.clone()
+			.acquire_owned()
+			.await
+			.expect("the thumbnail decode gate is never closed")
 	}
 }
 
@@ -270,6 +418,7 @@ pub(crate) struct SharedClientState {
 	/// stream's read-ahead at half the total budget, which `available_permits()` cannot give.
 	#[cfg(feature = "http-provider")]
 	file_io_memory_budget: usize,
+	thumbnails: ThumbnailConfig,
 }
 
 impl SharedClientState {
@@ -307,6 +456,9 @@ impl SharedClientState {
 				),
 			));
 		}
+
+		// Built before `config.log_level` is moved out below.
+		let thumbnails = ThumbnailConfig::new(&config);
 
 		// Apply this client's level to the (host- or SDK-installed) global tracing filter only if
 		// one was explicitly set. A default-config client leaves this `None` so routine client
@@ -355,11 +507,16 @@ impl SharedClientState {
 			memory_semaphore: Arc::new(tokio::sync::Semaphore::new(config.file_io_memory_budget)),
 			#[cfg(feature = "http-provider")]
 			file_io_memory_budget: config.file_io_memory_budget,
+			thumbnails,
 		})
 	}
 
 	pub(crate) fn memory_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
 		&self.memory_semaphore
+	}
+
+	pub(crate) fn thumbnails(&self) -> &ThumbnailConfig {
+		&self.thumbnails
 	}
 
 	/// Total file-IO memory budget in bytes (the semaphore's initial permit count). Used by the
@@ -1257,6 +1414,34 @@ mod concurrency_limit_tests {
 }
 
 #[cfg(test)]
+mod thumbnail_gate_tests {
+	use super::{ClientConfig, ThumbnailConfig};
+
+	/// Both ends of the gate's permit count are hazards: 0 parks every decode forever, and
+	/// anything above `Semaphore::MAX_PERMITS` panics inside `Semaphore::new` — reachable from a
+	/// `u32` config field on wasm32, where `usize` is 32-bit and the ceiling is `u32::MAX >> 3`.
+	#[test]
+	fn decode_concurrency_is_clamped_at_both_ends() {
+		assert_eq!(
+			ThumbnailConfig::new(&ClientConfig::default().with_thumbnail_decode_concurrency(0))
+				.gate
+				.available_permits(),
+			1,
+			"concurrency 0 must be floored to 1, not left as a park-forever gate"
+		);
+		assert_eq!(
+			ThumbnailConfig::new(
+				&ClientConfig::default().with_thumbnail_decode_concurrency(usize::MAX)
+			)
+			.gate
+			.available_permits(),
+			tokio::sync::Semaphore::MAX_PERMITS,
+			"an oversized concurrency must be clamped to Semaphore::MAX_PERMITS, not panic"
+		);
+	}
+}
+
+#[cfg(test)]
 mod min_memory_budget_tests {
 	use super::{CHUNK_SIZE, ClientConfig, FILE_CHUNK_SIZE_EXTRA_USIZE, SharedClientState};
 
@@ -1326,6 +1511,9 @@ mod js_client_config_tests {
 			download_bandwidth_kilobytes_per_sec: None,
 			log_level: None,
 			file_io_memory_budget: None,
+			thumbnail_mem_budget: None,
+			thumbnail_max_source_bytes: None,
+			thumbnail_decode_concurrency: None,
 		}
 	}
 

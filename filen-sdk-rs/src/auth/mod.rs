@@ -355,6 +355,12 @@ impl Client {
 		&self.http_client
 	}
 
+	/// The thumbnail policy and decode gate shared by every client descended from the same
+	/// `UnauthClient`.
+	pub fn thumbnails(&self) -> &crate::auth::http::ThumbnailConfig {
+		self.http_client.state().thumbnails()
+	}
+
 	pub(crate) fn arc_client(&self) -> Arc<AuthClient> {
 		self.http_client.clone()
 	}
