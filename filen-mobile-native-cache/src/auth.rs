@@ -12,6 +12,7 @@ use filen_sdk_rs::{
 	auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::HasUUID,
+	thumbnail::{DEFAULT_THUMBNAIL_MEM_BUDGET, REMOTE_SOURCE_RESIDENT_BYTES},
 };
 use filen_types::{
 	auth::FilenSDKConfig,
@@ -61,6 +62,8 @@ pub struct AuthCacheState {
 	pub(crate) last_trash_update: RwLock<Option<Instant>>,
 	pub(crate) thumbnail_file_budget: u64,
 	pub(crate) cache_file_budget: u64,
+	/// See [`crate::thumbnail::DEFAULT_THUMBNAIL_ITEM_CONCURRENCY`].
+	pub(crate) thumbnail_item_concurrency: usize,
 	pub(crate) last_cleanup: tokio::sync::RwLock<Option<DateTime<Utc>>>,
 	pub(crate) last_cleanup_sem: tokio::sync::Semaphore,
 	/// Path of the SDK cache DB backing live search (see [`crate::search`]). Separate from the
@@ -460,6 +463,46 @@ pub struct AuthFile {
 	pub max_thumbnail_files_budget: Option<u64>,
 	#[serde(default)]
 	pub max_cache_files_budget: Option<u64>,
+	/// Thumbnail policy. Absent means the file-provider extension's tuned values (see
+	/// [`thumbnail_client_config`]); the SDK's own defaults are sized for a whole app process
+	/// and would not survive this extension's jetsam ceiling.
+	#[serde(default)]
+	pub thumbnail_mem_budget: Option<u64>,
+	#[serde(default)]
+	pub thumbnail_max_source_bytes: Option<u64>,
+	#[serde(default)]
+	pub thumbnail_decode_concurrency: Option<u32>,
+	/// Items in flight in the bulk batch loop, NOT decodes — the SDK has no notion of a
+	/// thumbnail batch, so this one is applied here rather than through `ClientConfig`.
+	#[serde(default)]
+	pub thumbnail_item_concurrency: Option<u32>,
+}
+
+/// The extension decodes under the SAFE preset, not the SDK's app-process default: it has ~20 MB
+/// before jetsam, so ONE 12 MiB decode at a time is all that fits — and this gate also covers the
+/// single-item `get_thumbnail` path (Android's only route). auth.json may raise either.
+fn thumbnail_client_config(settings: &AuthFile) -> ClientConfig {
+	let mut config = ClientConfig::default()
+		.with_thumbnail_mem_budget(settings.thumbnail_mem_budget.map_or(
+			DEFAULT_THUMBNAIL_MEM_BUDGET,
+			|budget| {
+				// Same floor `JsClientConfig` applies to the same knob, for the same reason:
+				// the remote path subtracts the chunk source's two resident slots, so a budget
+				// at or below that saturates to 0 and refuses every REMOTE thumbnail while
+				// local ones keep working — a silent, half-broken state a host cannot see.
+				usize::try_from(budget)
+					.unwrap_or(usize::MAX)
+					.max(2 * REMOTE_SOURCE_RESIDENT_BYTES)
+			},
+		))
+		// 0 is floored to 1 by the SDK, so no clamp here.
+		.with_thumbnail_decode_concurrency(
+			settings.thumbnail_decode_concurrency.unwrap_or(1) as usize
+		);
+	if let Some(max_source_bytes) = settings.thumbnail_max_source_bytes {
+		config = config.with_thumbnail_max_source_bytes(max_source_bytes);
+	}
+	config
 }
 
 /// `None` means the file's contents are UNKNOWN (unreadable, undecryptable, or unparseable) —
@@ -555,7 +598,7 @@ pub(crate) async fn confirm_disabled(auth_file: &Path, dek: Option<&EncryptionKe
 }
 
 fn update_state(state: &mut CacheState, auth_file: Option<AuthFile>) {
-	let Some(auth_file) = auth_file else {
+	let Some(mut auth_file) = auth_file else {
 		debug!("Auth file unavailable; failing closed without treating it as a disable");
 		state.status = AuthStatus::Unauthenticated(UnauthCacheState {
 			reason: UnauthReason::Unavailable,
@@ -565,18 +608,13 @@ fn update_state(state: &mut CacheState, auth_file: Option<AuthFile>) {
 		return;
 	};
 	if auth_file.provider_enabled {
-		match auth_file.sdk_config {
+		match auth_file.sdk_config.take() {
 			Some(config) => {
 				match AuthCacheState::from_sdk_config(
 					config,
+					&auth_file,
 					&state.files_dir,
 					&state.db_dir,
-					auth_file
-						.max_thumbnail_files_budget
-						.unwrap_or(DEFAULT_MAX_THUMBNAIL_FILES_BUDGET),
-					auth_file
-						.max_cache_files_budget
-						.unwrap_or(DEFAULT_MAX_CACHE_FILES_BUDGET),
 				) {
 					Ok(auth_state) => {
 						info!("Authenticated with Filen SDK");
@@ -820,12 +858,11 @@ impl AuthCacheState {
 
 	fn from_sdk_config(
 		config: FilenSDKConfig,
+		settings: &AuthFile,
 		files_dir: &Path,
 		db_dir: &Path,
-		max_thumbnail_files_budget: u64,
-		max_cache_files_budget: u64,
 	) -> Result<Self, CacheError> {
-		let unauth_client = UnauthClient::from_config(ClientConfig::default())?;
+		let unauth_client = UnauthClient::from_config(thumbnail_client_config(settings))?;
 		let client = unauth_client.from_stringified(config.into())?;
 
 		let cache_state_file = db_dir.join("db_state.json");
@@ -850,8 +887,17 @@ impl AuthCacheState {
 			client: Arc::new(client),
 			last_recents_update: RwLock::new(None),
 			last_trash_update: RwLock::new(None),
-			thumbnail_file_budget: max_thumbnail_files_budget,
-			cache_file_budget: max_cache_files_budget,
+			thumbnail_file_budget: settings
+				.max_thumbnail_files_budget
+				.unwrap_or(DEFAULT_MAX_THUMBNAIL_FILES_BUDGET),
+			cache_file_budget: settings
+				.max_cache_files_budget
+				.unwrap_or(DEFAULT_MAX_CACHE_FILES_BUDGET),
+			thumbnail_item_concurrency: settings.thumbnail_item_concurrency.map_or(
+				crate::thumbnail::DEFAULT_THUMBNAIL_ITEM_CONCURRENCY,
+				// `for_each_concurrent` panics on a limit of zero.
+				|items| (items as usize).max(1),
+			),
 			last_cleanup: tokio::sync::RwLock::new(
 				state.as_ref().and_then(|s| s.last_cache_cleanup),
 			),
@@ -890,7 +936,8 @@ impl AuthCacheState {
 			client.email
 		);
 
-		let unauth_client = UnauthClient::from_config(ClientConfig::default())?;
+		let unauth_client =
+			UnauthClient::from_config(thumbnail_client_config(&AuthFile::default()))?;
 		let client = unauth_client.from_stringified(client)?;
 
 		let cache_state_file = std::convert::AsRef::<Path>::as_ref(files_dir).join("db_state.json");
@@ -916,6 +963,7 @@ impl AuthCacheState {
 			last_trash_update: RwLock::new(None),
 			thumbnail_file_budget: DEFAULT_MAX_THUMBNAIL_FILES_BUDGET,
 			cache_file_budget: DEFAULT_MAX_CACHE_FILES_BUDGET,
+			thumbnail_item_concurrency: crate::thumbnail::DEFAULT_THUMBNAIL_ITEM_CONCURRENCY,
 			last_cleanup: tokio::sync::RwLock::new(None),
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,

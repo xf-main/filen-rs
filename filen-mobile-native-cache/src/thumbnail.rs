@@ -7,8 +7,7 @@ use filen_sdk_rs::{
 	},
 	io::FilenMetaExt,
 	thumbnail::{
-		ByteSource, DEFAULT_THUMBNAIL_MEM_BUDGET, FileSource, MAX_THUMBNAIL_SOURCE_BYTES,
-		REMOTE_SOURCE_RESIDENT_BYTES, RemoteChunkSource, ThumbSpec, ThumbnailFit, ThumbnailOutcome,
+		ByteSource, FileSource, RemoteChunkSource, ThumbSpec, ThumbnailFit, ThumbnailOutcome,
 		make_thumbnail_from_source,
 	},
 };
@@ -26,22 +25,13 @@ use crate::{
 
 /// Files.app hands over entire grid batches at once; bound how many ITEMS are
 /// in flight so a 1000-photo directory cannot queue hundreds of concurrent
-/// downloads. Wider than the decode bound: downloads are disk-streamed and
-/// cheap to overlap, and a slot waiting on a download (or a per-item lock) must
-/// not starve cache hits behind it.
-const THUMBNAIL_CONCURRENCY: usize = 4;
-
-/// How many DECODES may run at once, process-wide. ONE: the decode pipeline
-/// bounds itself to [`DEFAULT_THUMBNAIL_MEM_BUDGET`]
-/// (~12 MB) per decode, and the iOS file-provider extension has ~20 MB total
-/// before jetsam — two concurrent decodes could not both fit. Global on
-/// purpose: it also covers the single-item `get_thumbnail` path (Android's
-/// only route) and concurrent batches.
-const MAX_CONCURRENT_DECODES: usize = 1;
-
-/// See [`MAX_CONCURRENT_DECODES`].
-static DECODE_GATE: tokio::sync::Semaphore =
-	tokio::sync::Semaphore::const_new(MAX_CONCURRENT_DECODES);
+/// downloads. Wider than the client's decode bound: downloads are disk-streamed
+/// and cheap to overlap, and a slot waiting on a download (or a per-item lock)
+/// must not starve cache hits behind it.
+///
+/// Not a `ClientConfig` knob — the SDK has no notion of a thumbnail batch. A host
+/// overrides it through `AuthFile::thumbnail_item_concurrency`.
+pub(crate) const DEFAULT_THUMBNAIL_ITEM_CONCURRENCY: usize = 4;
 
 /// Removes the temp file a thumbnail encode writes into unless [`disarm`](Self::disarm)ed
 /// after the rename into place — the one cleanup covering every exit, including the future
@@ -177,59 +167,45 @@ impl AuthCacheState {
 		// 200 MB HEIC's `thmb` item and a JPEG's EXIF thumbnail both live in
 		// the header region and cost a chunk or two. Probe those, and settle on
 		// `OverBudget` having read almost nothing when there is nothing to find.
-		let (source, mem_budget, allow_full_decode): (Box<dyn ByteSource>, usize, bool) =
-			match local_file {
-				Some(local) => (
-					Box::new(
-						FileSource::with_cancel(local.into_std().await, Some(cancel))
-							.map_err(CacheError::from)?,
-					),
-					DEFAULT_THUMBNAIL_MEM_BUDGET,
-					// The bytes are already on disk; nothing to protect.
-					true,
+		// Both budgets are the client's, configured in `AuthCacheState::from_sdk_config`.
+		let thumbnails = self.client.thumbnails();
+		let (source, spec): (Box<dyn ByteSource>, ThumbSpec) = match local_file {
+			Some(local) => (
+				Box::new(
+					FileSource::with_cancel(local.into_std().await, Some(cancel))
+						.map_err(CacheError::from)?,
 				),
-				None => {
-					let affordable = file.size() <= MAX_THUMBNAIL_SOURCE_BYTES;
-					if !affordable {
-						debug!(
-							"File too large to stream for a thumbnail ({} bytes); embedded previews only: {}",
-							file.size(),
-							file_path.display()
-						);
-					}
-					(
-						Box::new(RemoteChunkSource::new(
-							self.client.clone(),
-							file.clone(),
-							tokio::runtime::Handle::current(),
-							Some(cancel),
-						)),
-						// The source's two resident chunk slots live outside the
-						// pipeline's own accounting; hand the decode what is
-						// actually left of the budget.
-						DEFAULT_THUMBNAIL_MEM_BUDGET.saturating_sub(REMOTE_SOURCE_RESIDENT_BYTES),
-						affordable,
-					)
+				// The bytes are already on disk; nothing to protect.
+				thumbnails.spec_local(target_width, target_height),
+			),
+			None => {
+				let spec = thumbnails.spec_remote(target_width, target_height, file.size());
+				if !spec.allow_full_decode {
+					debug!(
+						"File too large to stream for a thumbnail ({} bytes); embedded previews only: {}",
+						file.size(),
+						file_path.display()
+					);
 				}
-			};
-
-		// Decode buffers, not downloads, are the memory hazard — serialize decodes
-		// process-wide. Acquired before the blocking task is spawned, so parked work
-		// costs a future, not a blocked pool thread; MOVED INTO the closure so the
-		// permit is released when the decode actually ends — a cancelled batch drops
-		// this future while the blocking closure keeps running detached, and a permit
-		// held by the dropped future would let fresh decodes stack on the orphans.
-		// Never closed, so the expect is unreachable.
-		let decode_permit = DECODE_GATE
-			.acquire()
-			.await
-			.expect("the decode gate is never closed");
-		let spec = ThumbSpec {
-			target_width,
-			target_height,
-			mem_budget,
-			allow_full_decode,
+				(
+					Box::new(RemoteChunkSource::new(
+						self.client.clone(),
+						file.clone(),
+						tokio::runtime::Handle::current(),
+						Some(cancel),
+					)),
+					spec,
+				)
+			}
 		};
+
+		// Decode buffers, not downloads, are the memory hazard — the client's gate
+		// bounds how many run at once. Acquired before the blocking task is spawned, so
+		// parked work costs a future, not a blocked pool thread; MOVED INTO the closure
+		// so the permit is released when the decode actually ends — a cancelled batch
+		// drops this future while the blocking closure keeps running detached, and a
+		// permit held by the dropped future would let fresh decodes stack on the orphans.
+		let decode_permit = thumbnails.decode_permit().await;
 		let decode_result = tokio::task::spawn_blocking(
 			move || -> Result<ThumbnailOutcome, filen_sdk_rs::error::Error> {
 				let _decode_permit = decode_permit;
@@ -407,10 +383,11 @@ impl AuthCacheState {
 		requested_height: u32,
 		callback: Arc<dyn ThumbnailCallback>,
 	) -> BulkThumbnailResponse {
+		let item_concurrency = this.thumbnail_item_concurrency;
 		let arc = Arc::new(this);
 		let handle = crate::env::get_runtime().spawn(async move {
 			futures::stream::iter(items)
-				.for_each_concurrent(THUMBNAIL_CONCURRENCY, |item| {
+				.for_each_concurrent(item_concurrency, |item| {
 					let self_ref = arc.clone();
 					let callback_ref = callback.clone();
 					async move {

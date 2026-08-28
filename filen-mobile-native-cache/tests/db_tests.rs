@@ -4382,6 +4382,7 @@ pub async fn test_init_from_file() {
 		provider_enabled: true,
 		max_thumbnail_files_budget: Some(1024 * 1024 * 6),
 		max_cache_files_budget: Some(1024 * 1024 * 10),
+		..Default::default()
 	})
 	.unwrap();
 
@@ -4786,6 +4787,7 @@ pub async fn test_cache_version_bump_reinitializes_db() {
 		provider_enabled: true,
 		max_thumbnail_files_budget: None,
 		max_cache_files_budget: None,
+		..Default::default()
 	})
 	.unwrap();
 
