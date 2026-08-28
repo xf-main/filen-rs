@@ -358,6 +358,10 @@ mod remote_chunks {
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	};
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use std::time::Duration;
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use wasmtimer::{std::Instant as TimerInstant, tokio::sleep_until};
 
 	/// Reads one plaintext byte range of a remote file.
 	///
@@ -388,15 +392,22 @@ mod remote_chunks {
 	/// fetch is the one genuinely per-target piece: on native a
 	/// `Handle::block_on` inside `spawn_blocking`, on wasm a channel round-trip
 	/// to the async runtime from a dedicated worker (see
-	/// [`over_requests`](Self::over_requests)). Everything else — the two-slot
-	/// cache, the cancel contract, the short reads at chunk boundaries — is
-	/// shared.
+	/// [`over_requests`](Self::over_requests)). The two-slot cache and the short
+	/// reads at chunk boundaries are shared; cancellation is NOT — only the
+	/// native bridge is ever handed a flag, see [`cancel`](Self::cancel).
 	pub struct RemoteChunkSource {
 		fetch: Box<dyn FnMut(u64, u64) -> std::io::Result<Vec<u8>> + Send>,
 		/// Checked before every read: cancellation surfaces as
 		/// `ErrorKind::Interrupted`, which unwinds the decode through its normal
 		/// error path at chunk granularity — the same points an async decoder
 		/// would get to cancel at.
+		///
+		/// `Some` only on the native bridge. `over_requests` passes `None`, so
+		/// on wasm this check is a permanent no-op: nothing there has a cancel
+		/// to raise (a `wasm_bindgen` export is wrapped in `future_to_promise`,
+		/// so JS holds a Promise and the task queue owns the future), and the
+		/// only thing that stops a running decode is its next chunk REQUEST
+		/// failing.
 		cancel: Option<Arc<AtomicBool>>,
 		len: u64,
 		slots: [Option<(u64, Vec<u8>)>; 2],
@@ -460,8 +471,15 @@ mod remote_chunks {
 				cancel,
 				Box::new(move |start, end| {
 					// A dropped driver (the caller's future went away) closes
-					// one of these; either way the decode unwinds at the same
-					// chunk granularity a cancel flag would give it.
+					// `requests`, and the decode unwinds at the same chunk
+					// granularity a cancel flag would give it.
+					//
+					// `replies.recv()` cannot report the same thing: this
+					// closure holds its own `reply` sender, so the channel is
+					// never fully closed, and a driver dropped BETWEEN taking a
+					// request and answering it parks this worker here forever.
+					// Nothing recovers that worker in place — the next caller's
+					// stall deadline retires it (see `decode_worker::retire`).
 					let cancelled = || {
 						std::io::Error::new(std::io::ErrorKind::Interrupted, "thumbnail cancelled")
 					};
@@ -481,9 +499,9 @@ mod remote_chunks {
 			// Checked on EVERY read, cache hit included. Gating this on the
 			// fetch instead would mean a decode whose remaining reads all land
 			// in the two resident slots — anything under ~2 MiB once warm —
-			// never notices the cancel and runs to completion, while the caller
-			// documents both source kinds as answering their next read with
-			// Interrupted.
+			// never notices the cancel and runs to completion. Native only:
+			// the wasm bridge passes no flag, so there this is a no-op and a
+			// warm decode cannot be interrupted at all (see `cancel`).
 			if self
 				.cancel
 				.as_ref()
@@ -551,47 +569,206 @@ mod remote_chunks {
 	/// - **Not a rayon worker.** `runtime::do_cpu_intensive` IS the rayon pool,
 	///   and chunk DECRYPTION runs there too — a decode parked on a rayon worker
 	///   would be waiting on the pool that has to run to unblock it.
-	/// - **One worker, not one per call.** Each `runtime::spawn` instantiates a
-	///   fresh wasm module and its thread state in the shared linear memory that
-	///   is never returned to the host, and retains the worker's JS wrapper for
-	///   the life of the spawning thread. A worker per thumbnail would grow
-	///   exactly the memory this pipeline exists to bound. Serialising decodes
-	///   is what the budget assumes anyway.
+	/// - **One worker at a time, not one per call.** Each `runtime::spawn`
+	///   instantiates a fresh wasm module and its thread state in the shared
+	///   linear memory that is never returned to the host, and retains the
+	///   worker's JS wrapper for the life of the spawning thread. A worker per
+	///   thumbnail would grow exactly the memory this pipeline exists to bound.
+	///   Serialising decodes is what the budget assumes anyway. A replacement is
+	///   spawned only when the previous worker is retired for going silent (see
+	///   `retire`).
 	///
 	/// Parking here is legal: `wasm-full` builds with `+atomics`, where `std`
 	/// selects the futex parker, and this is a dedicated worker rather than the
 	/// JS main thread.
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	mod decode_worker {
-		use std::sync::{OnceLock, mpsc};
+		use std::sync::{
+			Mutex, PoisonError,
+			atomic::{AtomicU64, Ordering},
+			mpsc,
+		};
 
 		type Job = Box<dyn FnOnce() + Send>;
 
-		static JOBS: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
+		/// The live worker's job sender, tagged with the generation it belongs
+		/// to.
+		///
+		/// Re-settable rather than a `OnceLock` because the worker CAN stop
+		/// draining this channel without ever exiting. Two ways:
+		///
+		/// - a trap. The wasm build is `panic=abort` and `heif-decoder` stubs
+		///   `__cxa_throw` as `unreachable`, so a malformed HEIC turns libheif's
+		///   `length_error`/`bad_alloc` into a trap on this worker. A trap
+		///   abandons the thread's stack without running a single destructor, so
+		///   the `Receiver` is leaked rather than closed;
+		/// - a park. `RemoteChunkSource::over_requests` can block forever on a
+		///   reply that is never coming (see there).
+		///
+		/// Either way `send` below keeps SUCCEEDING into a channel nothing
+		/// drains, and every later thumbnail on the page queues behind a worker
+		/// that is gone. [`retire`] is how the driver's stall deadline gets out
+		/// of that.
+		static JOBS: Mutex<Option<(u64, mpsc::Sender<Job>)>> = Mutex::new(None);
+		static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+		/// Bumped every time the worker is observed doing something: asking a
+		/// driver for a chunk, taking that chunk back, or finishing a job.
+		///
+		/// Process-global because a driver's own `select!` is NOT a liveness
+		/// signal for the worker. `thumbnail_decode_concurrency` is 2 by default
+		/// and each call is its own task, so several drivers can be waiting on the
+		/// one worker at once while it runs their jobs strictly in turn — and a
+		/// driver queued behind someone else's decode never sees a reply of its
+		/// own, however healthy that decode is. Without this it would time out on
+		/// the other caller's wall clock and retire a live worker, which costs a
+		/// wasm instantiation that is never given back.
+		///
+		/// `Relaxed` at both ends, deliberately: nothing is published through this
+		/// counter — it guards no data, and the driver reads it only to choose
+		/// between re-arming a timer and returning an error. All it needs is that
+		/// a bump eventually becomes visible, which every ordering gives. That
+		/// window is nanoseconds against a 60 s deadline; a check-read that did
+		/// miss one would retire a live worker, costing an instantiation — never
+		/// a wrong result, and never a missed hang.
+		static ACTIVITY: AtomicU64 = AtomicU64::new(0);
+
+		/// Records progress, returning the stamp to compare against when the
+		/// caller's deadline expires.
+		pub(super) fn note_activity() -> u64 {
+			ACTIVITY.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+		}
+
+		/// The current stamp. Equal to what a driver last recorded means nothing
+		/// anywhere has heard from the worker since.
+		pub(super) fn activity() -> u64 {
+			ACTIVITY.load(Ordering::Relaxed)
+		}
+
+		/// Queues `job`, spawning a worker if there is none.
+		///
+		/// The returned generation names the worker that took the job; hand it
+		/// to [`retire`] if it stops answering.
 		pub(super) fn submit<T: Send + 'static>(
 			job: impl FnOnce() -> T + Send + 'static,
-		) -> tokio::sync::oneshot::Receiver<T> {
+		) -> (u64, tokio::sync::oneshot::Receiver<T>) {
 			let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-			let jobs = JOBS.get_or_init(|| {
+			// Poisoning cannot happen under `panic=abort`; taking the guard
+			// anyway keeps a hypothetical one from wedging the very pipeline
+			// this module exists to un-wedge.
+			let mut slot = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+			let (generation, jobs) = slot.get_or_insert_with(|| {
 				let (tx, rx) = mpsc::channel::<Job>();
 				crate::runtime::spawn(move || {
-					// `recv` parks this worker between jobs. The sender lives in
-					// a static, so it never errors and the worker never exits —
-					// which is the point: the wasm module is instantiated once.
+					// `recv` parks this worker between jobs; it fails only once
+					// `retire` has dropped this generation's sender, which is
+					// the worker's cue to let its thread go.
 					while let Ok(job) = rx.recv() {
 						job();
 					}
 				});
-				tx
+				(NEXT_GENERATION.fetch_add(1, Ordering::Relaxed), tx)
 			});
-			// The receiving worker never exits, so this cannot fail.
+			// Succeeds whether or not anything is still draining the channel —
+			// see `JOBS`. A dead worker is detected by the driver's deadline,
+			// never by this send.
 			let _ = jobs.send(Box::new(move || {
 				let _ = result_tx.send(job());
+				// Not about speed — the chunk traffic already covers a decode that
+				// is merely slow. This is the only event a job that asks for NO
+				// chunk at all produces (a zero-length source never reads), so
+				// bumping here is what makes the invariant total: every job the
+				// worker takes and returns from moves the stamp at least once.
+				note_activity();
 			}));
-			result_rx
+			(*generation, result_rx)
+		}
+
+		/// Drops `generation`'s sender, so the next [`submit`] spawns a fresh
+		/// worker and the old thread exits if it ever comes back.
+		///
+		/// Generation-checked because several callers can be queued behind the
+		/// same dead worker and each times out on its own schedule: unchecked,
+		/// the late ones would retire the healthy replacement, and every respawn
+		/// costs a wasm module instantiation that is never returned to the host.
+		pub(super) fn retire(generation: u64) {
+			let mut slot = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+			if slot.as_ref().is_some_and(|(live, _)| *live == generation) {
+				*slot = None;
+			}
+		}
+
+		/// Whether `generation` is still the worker [`submit`] queues to.
+		///
+		/// A driver whose generation has been retired will never be served — its
+		/// job is stranded in the dead worker's leaked channel — so activity from
+		/// the REPLACEMENT worker must not keep re-arming its deadline. Without
+		/// this the stamp, which is process-global, would read as movement
+		/// forever and that driver would hang holding its permit.
+		pub(super) fn is_live(generation: u64) -> bool {
+			JOBS.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.as_ref()
+				.is_some_and(|(live, _)| *live == generation)
 		}
 	}
+
+	/// How long the wasm decode worker may go silent — no chunk request to any
+	/// driver, no job finished — before the driver whose deadline expires
+	/// declares it dead and retires it.
+	///
+	/// It measures worker-side silence ACROSS ALL DRIVERS, not the expiring
+	/// caller's own progress. That distinction is the whole reason for
+	/// [`decode_worker::note_activity`]: several drivers can wait on the one
+	/// worker at once, and the ones queued behind another caller's decode never
+	/// see a chunk reply of their own to reset on. Each driver still ARMS its
+	/// deadline at submit time — deferring it to when the job starts would put a
+	/// queued caller back behind a trapped worker with no deadline at all, the
+	/// exact hang this exists to break — and on expiry re-reads the shared
+	/// stamp: moved means the worker is demonstrably alive and busy with someone
+	/// else, so the deadline is simply re-armed.
+	///
+	/// What is left that can spend it while the worker is perfectly healthy is
+	/// one unobserved step: a single chunk fetch, or a single stretch of decode
+	/// between two chunks — or after the last one, since nothing resets the
+	/// deadline once the source is done — longer than the whole timeout. The decode never
+	/// spends that long between reads under this budget, but the HTTP stack's
+	/// read timeout is far above this one, so a single pathological chunk fetch
+	/// CAN outlast a queued caller's deadline. The knob below is the answer,
+	/// not another observation point — there is nothing left to observe.
+	///
+	/// ponytail: a calibration knob, not a proof — nothing here can tell a
+	/// trapped worker from a slow one, so the ceiling is set far above any
+	/// plausible single decode step on a slow phone. All it has to buy is
+	/// turning an infinite silent hang into a surfaced error and a pipeline that
+	/// recovers on the next call. If a real device ever reports a spurious
+	/// "decode worker died", raise it; the honest upgrade is a liveness ping
+	/// from inside the decode, which needs a decode loop that can be
+	/// instrumented from Rust — libheif's cannot.
+	/// **Status: defence-in-depth, not a load-bearing path — do not delete it as
+	/// dead code, and do not trust it as battle-tested.** An audit of libheif's
+	/// allocation sites found no input that reaches the trapping `__cxa_throw` in
+	/// THIS build — which is not a proof that none exists. Plenty of those sites
+	/// are NOT bounded by the file's byte length: `Box_stts` / `Box_ctts` /
+	/// `Box_stsc::parse` (`sequences/seq_boxes.cc`) each resize to a
+	/// file-declared `entry_count` BEFORE reading a single entry, capped only by
+	/// `max_sequence_frames` (18'000'000), and `moov`/`trak`/`stbl` are
+	/// registered unconditionally (`box.cc`). Measured through
+	/// `microthumb::generate`, a 76-byte file peaks at 216 MB on the `stsc`
+	/// table — the largest single pre-read allocation found, and still well under
+	/// the wasm module's 1 GiB linker cap. The sites that WOULD clear that cap
+	/// are the uncompressed-codec ones, which are not compiled in (see the
+	/// `WITH_UNCOMPRESSED_CODEC` note in `heif-decoder/build.rs`). So the trap
+	/// arm guards a libheif bump, a newly enabled codec, or the `over_requests`
+	/// park mode — none of which is live today.
+	///
+	/// What IS pinned by tests is the queued-caller half: the browser suite's
+	/// "a queued thumbnail is not expired by another caller's decode". Worker
+	/// death and respawn are NOT exercised anywhere — no test has ever trapped
+	/// this worker, so [`decode_worker::retire`] and the respawn after it are
+	/// unproven code on an untaken path.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	const DECODE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 	/// Thumbnails a remote file straight from its chunks, off the async
 	/// runtime's threads: the webp bytes and the verdict, without the file ever
@@ -657,15 +834,20 @@ mod remote_chunks {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
 			let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-			// No cancel flag: dropping this future drops `incoming`, and the
-			// source's next request fails the same way.
+			// `None`, not a flag: nothing on this target can raise one (see
+			// `RemoteChunkSource::cancel`). What a dropped driver does give the
+			// decode is `incoming` closing, which fails its next chunk REQUEST.
 			let source = RemoteChunkSource::over_requests(file.size(), None, requests);
-			// Same gate as the native arm, for the same reason. A configured concurrency above 1
-			// is capped at 1 anyway: every decode runs on the ONE long-lived `decode_worker`
-			// thread, which takes jobs strictly in turn.
-			let decode_permit = client.thumbnails().decode_permit().await;
-			let mut done = decode_worker::submit(move || {
-				let _decode_permit = decode_permit;
+			// Same gate as the native arm, but the permit is held HERE rather than moved into
+			// the job. A trapped worker runs no destructor, so a permit living inside the job
+			// would be lost for the life of the page and the gate would close for good — the
+			// same wedge this deadline exists to remove, one step earlier. The accounting the
+			// native arm buys by moving it (a cancelled caller must not free a slot while its
+			// orphaned decode still runs) is worth nothing here: every decode goes through the
+			// one worker in turn, so a spare permit buys no extra concurrency, only an earlier
+			// place in that queue.
+			let _decode_permit = client.thumbnails().decode_permit().await;
+			let (generation, mut done) = decode_worker::submit(move || {
 				let mut webp = Vec::new();
 				make_thumbnail_from_source(
 					Box::new(source),
@@ -681,20 +863,67 @@ mod remote_chunks {
 					"thumbnail decode worker died".to_string(),
 				)
 			};
+			// A worker that trapped drops nothing: `done` never resolves, `incoming` never
+			// closes, and the next `submit` would queue behind it forever. This deadline is the
+			// only thing that notices, so every wait below is under it.
+			let deadline = sleep_until(TimerInstant::now() + DECODE_STALL_TIMEOUT);
+			tokio::pin!(deadline);
+			// The stamp as of arming. Our job may not have STARTED — the worker takes jobs in
+			// turn and other drivers hold the other decode permits — so what we watch for is
+			// the worker serving anyone, not ourselves being served.
+			let mut last_activity = decode_worker::activity();
+			// Set once the source is dropped inside the worker: no further chunk can be asked
+			// for, only a result. The arm is disabled rather than left to spin on a channel
+			// that now returns `None` immediately.
+			let mut source_gone = false;
 			loop {
 				tokio::select! {
 					biased;
 					result = &mut done => return result.map_err(|_| died())?,
-					request = incoming.recv() => {
+					request = incoming.recv(), if !source_gone => {
 						let Some(request) = request else {
-							// The source was dropped inside the worker: no
-							// further chunk can be asked for, only a result.
-							return done.await.map_err(|_| died())?;
+							// A trap can still land between the last chunk and the
+							// result, so keep waiting under the deadline.
+							source_gone = true;
+							continue;
 						};
+						// The request itself is proof the worker is running, and it is proof
+						// NOW rather than after a fetch that may take minutes on a bad
+						// connection — which is time another driver must not count against
+						// the worker.
+						decode_worker::note_activity();
 						let data = fetch_range(&client, &file, request.start, request.end)
 							.await
 							.map_err(std::io::Error::other);
 						let _ = request.reply.send(data);
+						// Handing the chunk back is the second observation of the pair: it
+						// dates the worker's next silence from when the worker resumed, not
+						// from when it asked. Recording both means a slow fetch and a slow
+						// stretch of decode each get the full timeout instead of sharing one.
+						last_activity = decode_worker::note_activity();
+						deadline.as_mut().reset(TimerInstant::now() + DECODE_STALL_TIMEOUT);
+					}
+					() = &mut deadline => {
+						let seen = decode_worker::activity();
+						if seen != last_activity && decode_worker::is_live(generation) {
+							// Someone else's decode moved the stamp, so the worker is alive
+							// and merely busy ahead of us. Retiring it here would kill a
+							// healthy generation mid-decode and cost a second wasm module.
+							// Gated on our OWN generation still being live: once it is
+							// retired our job is stranded in the dead worker's channel, and
+							// a replacement worker's bumps would otherwise re-arm us forever.
+							last_activity = seen;
+							deadline.as_mut().reset(TimerInstant::now() + DECODE_STALL_TIMEOUT);
+							continue;
+						}
+						// Nothing has heard from the worker for the whole timeout. Retire it
+						// so the NEXT thumbnail spawns a fresh one instead of queueing behind
+						// this one forever; a later driver's `retire` for the same generation
+						// then no-ops. The permit is ours and drops with this future; the
+						// job's own state (source, spec, buffers) is abandoned with the dead
+						// thread's stack and cannot be reclaimed.
+						decode_worker::retire(generation);
+						return Err(died());
 					}
 				}
 			}

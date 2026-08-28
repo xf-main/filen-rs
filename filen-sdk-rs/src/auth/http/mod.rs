@@ -390,9 +390,19 @@ impl ThumbnailConfig {
 	}
 
 	/// Waits for a decode slot. Acquire this BEFORE spawning the blocking decode, so parked work
-	/// costs a future rather than a blocked pool thread, and MOVE the permit into the closure: a
-	/// cancelled caller drops its future while the detached closure keeps decoding, and a permit
-	/// released by the dropped future would let fresh decodes stack on the orphans.
+	/// costs a future rather than a blocked pool thread.
+	///
+	/// Where the permit then lives is per-target, and the two targets want opposite things:
+	///
+	/// - **native**: MOVE it into the closure. A cancelled caller drops its future while the
+	///   detached closure keeps decoding, and a permit released by the dropped future would let
+	///   fresh decodes stack on the orphans.
+	/// - **wasm**: KEEP it in the driver future. The decode runs on one long-lived worker that
+	///   can trap — the build is `panic=abort`, so a trap runs no destructor — and a permit
+	///   moved into the job would be leaked for the life of the page; two traps would close a
+	///   2-permit gate for good. Holding it costs nothing there: every decode goes through that
+	///   one worker in turn, so an early-released permit buys a place in its queue rather than
+	///   any extra concurrency.
 	pub async fn decode_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
 		self.gate
 			.clone()

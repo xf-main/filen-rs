@@ -826,6 +826,49 @@ test("thumbnail verdicts are distinguishable", async () => {
 	expect(brokenVerdict.type).toBe("corrupt")
 })
 
+test("a queued thumbnail is not expired by another caller's decode", async () => {
+	// On wasm every decode runs on ONE worker thread that takes jobs strictly in turn, and each
+	// caller arms its stall deadline the moment it QUEUES — deferring it to when its own job
+	// starts would put a caller behind a trapped worker with no deadline at all, the exact hang
+	// the deadline exists to break. So a caller routinely sits armed for far longer than its own
+	// decode takes, and the only thing stopping it from declaring a perfectly healthy worker dead
+	// is the process-global activity stamp the worker bumps for whoever it is currently serving.
+	//
+	// Reaching that state means keeping the queue busy past DECODE_STALL_TIMEOUT (60 s). Two
+	// config knobs do it with no production change: `thumbnailDecodeConcurrency` admits every
+	// caller at once so they all ARM (at the default of 2 the rest would be parked on the decode
+	// permit, which is before the deadline exists and proves nothing), and `rateLimitPerSec: 1`
+	// paces the single chunk request each decode makes, so the queue drains at ~1 job/s however
+	// fast the machine is. The bandwidth knobs cannot do this — those tower layers are cfg'd out
+	// on wasm.
+	const QUEUED = 75
+	const slow = UnauthClient.from_config({ rateLimitPerSec: 1, thumbnailDecodeConcurrency: QUEUED }).fromStringified(
+		await state.toStringified()
+	)
+
+	// Under a chunk, so one rate-limited request per decode and the queue costs ~QUEUED seconds
+	// and nothing else. Uploaded through `state`, which is not rate limited.
+	const bytes = await generateImage(64, 64, "image/png")
+	const file = await state.uploadFile(bytes, { parent: testDir, name: "queued-decode.png" })
+	expect(file.canMakeThumbnail).toBe(true)
+
+	const started = Date.now()
+	const pending = Array.from({ length: QUEUED }, () => slow.makeThumbnailInMemory({ file, maxHeight: 64, maxWidth: 64 }))
+	const results = await Promise.all(pending)
+	const elapsed = Date.now() - started
+
+	// Load-bearing precondition, asserted first: the last caller really did sit armed through at
+	// least one 60 s expiry. If the queue ever drains faster than that this test has stopped
+	// testing anything, and it must say so rather than pass.
+	expect(elapsed).toBeGreaterThan(65000)
+	// And every one of them still got a picture. A deadline that measured the EXPIRING caller's
+	// own progress instead of the worker's would hand the late ones "thumbnail decode worker
+	// died" here — and retire a live worker mid-decode on the way out.
+	for (const result of results) {
+		expectThumbnail(result)
+	}
+}, 240000)
+
 test("exif upload applies DateTimeOriginal", async () => {
 	// Each fixture in test-assets/imgs has EXIF DateTimeOriginal=2020:06:15 10:30:00
 	// injected via exiftool. nom-exif (the WASM-compatible fork) parses jpg, tiff,
