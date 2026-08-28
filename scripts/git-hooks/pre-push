@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 # Heavier checks that run before every push.
 # Mirrors .github/workflows/ci.yml: the Linux job's clippy configurations + unit
-# tests, plus the ci-wasm job's clippy passes.
+# tests, plus both of the ci-wasm job's clippy passes on the feature sets that
+# job uses. This is where the heif-decoder passes live — pre-commit runs the
+# same wasm configurations without heif-decoder so committing stays fast.
+#
+# Tools this hook needs beyond cargo, all of them for heif-decoder's vendored
+# C++ (see the Git Hooks section of CLAUDE.md):
+#   meson, ninja          vendored dav1d, every target
+#   nasm                  dav1d's x86/x86_64 SIMD only
+#   brew llvm (macOS)     wasm32 C objects for the cache's bundled SQLite
+#   WASI_SDK_PATH         wasm32 C++ sysroot; only the wasm heif-decoder pass
 #
 # To bypass in an emergency: git push --no-verify
 #
 # Env vars:
-#   SKIP_HEAVY_CLIPPY=1   skip the heif-/avif-decoder clippy variants
-#                         (heif-decoder breaks incremental builds — cmake-rs bug)
+#   SKIP_HEAVY_CLIPPY=1   build no vendored C++ at all: skips the heif-decoder
+#                         clippy variants, native and wasm, AND excludes the
+#                         crate from the workspace passes, which build it
+#                         otherwise whatever the features say (heif-decoder
+#                         breaks incremental builds — cmake-rs bug — and the
+#                         wasm pass needs a wasi-sdk)
 #   SKIP_TESTS=1          skip cargo test
 #   SKIP_SQLFLUFF=1       skip the full-repo sqlfluff scan
 
@@ -44,7 +57,30 @@ if ! have cargo; then
 	exit 1
 fi
 
-# All-features clippy variants (matches CI). The heif-/avif-decoder builds can
+# Same guard wasm-pack.sh applies, for the same reason: heif-decoder's build
+# script aborts without it. Checked HERE rather than beside the wasm passes it
+# gates, so a contributor without the sysroot is told before sitting through the
+# multi-minute native clippy battery below. The conditions repeat the ones the
+# wasm section applies, so this only ever fires when those passes would run.
+if [ -f filen-sdk-rs/Cargo.toml ] && [ "${SKIP_HEAVY_CLIPPY:-0}" != "1" ] &&
+	rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$' &&
+	[ ! -d "${WASI_SDK_PATH:-}/share/wasi-sysroot" ]; then
+	printf '%sWASI_SDK_PATH does not point at an extracted wasi-sdk release — cannot build -F heif-decoder for wasm32.%s\n' \
+		"$red$bold" "$reset"
+	printf 'Install the release ci-wasm uses (wasi-sdk 33, >= 25 works — it needs the wasm32-wasi-threads sysroot):\n'
+	printf '  %scurl -sSfL -o /tmp/wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-arm64-macos.tar.gz%s\n' \
+		"$bold" "$reset"
+	printf '  %smkdir -p ~/wasi-sdk && tar -xzf /tmp/wasi-sdk.tar.gz -C ~/wasi-sdk --strip-components=1%s\n' \
+		"$bold" "$reset"
+	printf '  %sexport WASI_SDK_PATH=~/wasi-sdk%s   (put it in your shell profile)\n' "$bold" "$reset"
+	printf 'Pick the asset matching your host from %shttps://github.com/WebAssembly/wasi-sdk/releases%s.\n' \
+		"$bold" "$reset"
+	printf 'Or skip these passes with %s, or bypass with %s.\n' \
+		"SKIP_HEAVY_CLIPPY=1" "git push --no-verify"
+	exit 1
+fi
+
+# All-features clippy variants (matches CI). The heif-decoder builds can
 # be slow on cold caches; gate them behind SKIP_HEAVY_CLIPPY for tight loops.
 #
 # The features are package-qualified because these names belong to filen-sdk-rs.
@@ -52,42 +88,93 @@ fi
 # heif-decoder as an optional dependency via `dep:` — which suppresses the
 # implicit same-named feature, so cargo rejects the bare form.
 if [ "${SKIP_HEAVY_CLIPPY:-0}" != "1" ]; then
-	run "cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto -- -D warnings" \
-		cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto -- -D warnings
-	run "cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings" \
-		cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/avif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
+	# dav1d's build system, demanded here rather than three layers down as a
+	# cmake-rs panic. nasm only assembles the x86 SIMD, so arm64 hosts skip it.
+	missing=""
+	have meson || missing="$missing meson"
+	have ninja || missing="$missing ninja"
+	case "$(uname -m)" in
+	x86_64 | amd64) have nasm || missing="$missing nasm" ;;
+	esac
+	if [ -n "$missing" ]; then
+		printf '%smissing build tools for the vendored dav1d build:%s%s\n' \
+			"$red$bold" "$missing" "$reset"
+		printf 'Install them (macOS: %sbrew install%s%s; Debian/Ubuntu: apt-get, Windows: choco), skip these passes with %s, or bypass with %s.\n' \
+			"$bold" "$reset" "$missing" "SKIP_HEAVY_CLIPPY=1" "git push --no-verify"
+		exit 1
+	fi
+	run "cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto -- -D warnings" \
+		cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto -- -D warnings
+	run "cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings" \
+		cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
 else
-	printf '%sSKIP_HEAVY_CLIPPY=1, skipping heif-/avif-decoder clippy variants%s\n' \
+	printf '%sSKIP_HEAVY_CLIPPY=1, skipping the native heif-decoder clippy variants%s\n' \
 		"$yellow" "$reset"
 fi
 
-run "cargo clippy -- -D warnings" cargo clippy -- -D warnings
-run "cargo clippy --tests -- -D warnings" cargo clippy --tests -- -D warnings
+# heif-decoder is a workspace member and there is no `default-members`, so the
+# passes below build its vendored C++ whatever the features say. Excluding it is
+# the only thing that honours SKIP_HEAVY_CLIPPY; unset, they build it as CI does.
+heif_scope=""
+if [ "${SKIP_HEAVY_CLIPPY:-0}" = "1" ]; then
+	heif_scope="--workspace --exclude heif-decoder"
+fi
+
+run "cargo clippy${heif_scope:+ $heif_scope} -- -D warnings" \
+	cargo clippy $heif_scope -- -D warnings
+run "cargo clippy${heif_scope:+ $heif_scope} --tests -- -D warnings" \
+	cargo clippy $heif_scope --tests -- -D warnings
 
 # WASM clippy: the two configurations wasm-pack.sh actually ships (the
-# service-worker one with default features OFF and its RUSTFLAGS), run from
-# the filen-sdk-rs sub-workspace like the ci-wasm job does.
+# service-worker one with default features OFF and its RUSTFLAGS), on the same
+# feature sets ci-wasm lints, run from the filen-sdk-rs sub-workspace like that
+# job does. pre-commit runs these two without `heif-decoder`; the heif-enabled
+# combinations — the ones that actually ship — are only checked here.
+#
+# Both passes are heif-decoder variants, so SKIP_HEAVY_CLIPPY covers them along
+# with the native ones above: same cost (a full libheif/libde265/dav1d
+# cross-build, cmake-rs defeating incremental) and the same escape hatch, rather
+# than a second flag for the same tradeoff. Skipping leaves the heif-free wasm
+# configurations, which pre-commit already lints on every commit.
 if [ -f filen-sdk-rs/Cargo.toml ]; then
-	if rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
-		# The cache feature compiles bundled SQLite C for wasm32, which Apple
-		# clang cannot target — use brew llvm like CI does.
-		wasm_full_feats="wasm-full,cache"
-		if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then
-			export CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang
-			export AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar
-		elif [ "$(uname -s)" = "Darwin" ]; then
-			printf '%sbrew llvm not found, dropping the cache feature from WASM clippy (install: brew install llvm)%s\n' \
-				"$yellow" "$reset"
-			wasm_full_feats="wasm-full"
-		fi
-		run "cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats (filen-sdk-rs)" \
-			bash -c "cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats -- -D warnings"
-		run "cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker (filen-sdk-rs)" \
-			bash -c 'cd filen-sdk-rs && RUSTFLAGS="-C target-feature=-nontrapping-fptoint,+bulk-memory --cfg getrandom_backend=\"wasm_js\"" cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker -- -D warnings'
-	else
+	if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
 		printf '%swasm32-unknown-unknown target not installed, skipping WASM clippy%s\n' \
 			"$yellow" "$reset"
 		printf '%s    install: rustup target add wasm32-unknown-unknown%s\n' "$yellow" "$reset"
+	elif [ "${SKIP_HEAVY_CLIPPY:-0}" = "1" ]; then
+		printf '%sSKIP_HEAVY_CLIPPY=1, skipping the WASM heif-decoder clippy passes%s\n' \
+			"$yellow" "$reset"
+	else
+		# What each feature needs: `cache` compiles bundled SQLite C for wasm32,
+		# which Apple clang cannot target (brew llvm, like CI), and
+		# `heif-decoder` cross-compiles its vendored C++ against wasi-sdk's
+		# sysroot.
+		#
+		# Dropping a feature when a toolchain is missing would be worse than not
+		# running this at all: the reduced set still reports ok, while the
+		# combination CI actually builds goes unchecked — the exact blind spot
+		# this check exists to close. So: parity or a clear stop, never a quiet
+		# downgrade. SKIP_HEAVY_CLIPPY=1 is the deliberate, visible opt-out.
+		if [ "$(uname -s)" = "Darwin" ] && [ ! -x /opt/homebrew/opt/llvm/bin/clang ]; then
+			printf '%sbrew llvm not found — cannot run the WASM clippy CI runs (-F wasm-full,cache,heif-decoder).%s\n' \
+				"$red$bold" "$reset"
+			printf 'Install it with %sbrew install llvm%s, skip these passes with %s, or bypass with %s.\n' \
+				"$bold" "$reset" "SKIP_HEAVY_CLIPPY=1" "git push --no-verify"
+			exit 1
+		fi
+		# Scoped to this one command: CI runs the service-worker pass without
+		# them, and they would otherwise persist into every later step.
+		# Seeded with a bare `env` so the expansion is never empty: an empty
+		# array under `set -u` is an unbound-variable error on bash < 4.4.
+		wasm_cc=(env)
+		if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then
+			wasm_cc=(env CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \
+				AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar)
+		fi
+		run "cargo clippy --target wasm32-unknown-unknown -F wasm-full,cache,heif-decoder (filen-sdk-rs)" \
+			"${wasm_cc[@]}" bash -c "cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F wasm-full,cache,heif-decoder -- -D warnings"
+		run "cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker,heif-decoder (filen-sdk-rs)" \
+			bash -c 'cd filen-sdk-rs && RUSTFLAGS="-C target-feature=-nontrapping-fptoint,+bulk-memory --cfg getrandom_backend=\"wasm_js\"" cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker,heif-decoder -- -D warnings'
 	fi
 fi
 
@@ -97,8 +184,8 @@ if [ "${SKIP_SQLFLUFF:-0}" != "1" ] && have sqlfluff; then
 fi
 
 if [ "${SKIP_TESTS:-0}" != "1" ]; then
-	run "cargo test --lib --no-fail-fast" \
-		cargo test --lib --no-fail-fast
+	run "cargo test${heif_scope:+ $heif_scope} --lib --no-fail-fast" \
+		cargo test $heif_scope --lib --no-fail-fast
 else
 	printf '%sSKIP_TESTS=1, skipping cargo test --lib%s\n' "$yellow" "$reset"
 fi

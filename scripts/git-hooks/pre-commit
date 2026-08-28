@@ -82,24 +82,40 @@ if have cargo; then
 		cargo clippy -p filen-sdk-rs -F uniffi,http-provider --all-targets -- -D warnings
 fi
 
-# WASM clippy: the two configurations wasm-pack.sh actually ships (the
-# service-worker one with default features OFF and its RUSTFLAGS), run from
-# the filen-sdk-rs sub-workspace like the ci-wasm job does.
+# WASM clippy: the two configurations wasm-pack.sh ships (the service-worker one
+# with default features OFF and its RUSTFLAGS), run from the filen-sdk-rs
+# sub-workspace like the ci-wasm job does — minus `heif-decoder`.
+#
+# That omission is the one deliberate gap between this hook and ci-wasm. With
+# `heif-decoder` every commit cross-compiles libheif + libde265 + dav1d for
+# wasm32 and needs a wasi-sdk installed; pre-push runs that pass, on the exact
+# feature sets CI uses. What stays here is the cheap half, and it is a strict
+# subset of what CI lints.
 if have cargo && [ -f filen-sdk-rs/Cargo.toml ]; then
 	if rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
-		# The cache feature compiles bundled SQLite C for wasm32, which Apple
-		# clang cannot target — use brew llvm like CI does.
-		wasm_full_feats="wasm-full,cache"
-		if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then
-			export CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang
-			export AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar
-		elif [ "$(uname -s)" = "Darwin" ]; then
-			printf '%sbrew llvm not found, dropping the cache feature from WASM clippy (install: brew install llvm)%s\n' \
-				"$yellow" "$reset"
-			wasm_full_feats="wasm-full"
+		# `cache` compiles bundled SQLite C for wasm32, which Apple clang cannot
+		# target — brew llvm, like CI. Dropping the feature instead would be worse
+		# than not running this at all: the reduced set still reports ok while the
+		# combination CI builds goes unchecked, the exact blind spot this check
+		# exists to close. So: a clear stop, never a quiet downgrade.
+		if [ "$(uname -s)" = "Darwin" ] && [ ! -x /opt/homebrew/opt/llvm/bin/clang ]; then
+			printf '%sbrew llvm not found — cannot run the WASM clippy pass (-F wasm-full,cache).%s\n' \
+				"$red$bold" "$reset"
+			printf 'Install it with %sbrew install llvm%s, or bypass with %s.\n' \
+				"$bold" "$reset" "--no-verify"
+			exit 1
 		fi
-		run "cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats (filen-sdk-rs)" \
-			bash -c "cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats -- -D warnings"
+		# Scoped to this one command: the service-worker pass runs without them,
+		# and they would otherwise persist into every later step. Seeded with a
+		# bare `env` so the expansion is never empty: an empty array under
+		# `set -u` is an unbound-variable error on bash < 4.4.
+		wasm_cc=(env)
+		if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then
+			wasm_cc=(env CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \
+				AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar)
+		fi
+		run "cargo clippy --target wasm32-unknown-unknown -F wasm-full,cache (filen-sdk-rs)" \
+			"${wasm_cc[@]}" bash -c "cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F wasm-full,cache -- -D warnings"
 		run "cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker (filen-sdk-rs)" \
 			bash -c 'cd filen-sdk-rs && RUSTFLAGS="-C target-feature=-nontrapping-fptoint,+bulk-memory --cfg getrandom_backend=\"wasm_js\"" cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker -- -D warnings'
 	else
