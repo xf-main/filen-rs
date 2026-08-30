@@ -272,7 +272,16 @@ pub(crate) async fn update_saved_db_state(
 pub(crate) fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 	use rusqlite::functions::FunctionFlags;
 	conn.execute_batch(
-		"PRAGMA recursive_triggers = TRUE;
+		// busy_timeout goes first so it also covers the statements under it — journal_mode
+		// especially, since converting or checkpointing a WAL takes locks and is the likeliest
+		// here to meet a busy one. The contention it answers is entirely intra-process: only the
+		// iOS file provider and the Android documents provider ever open this database, never the
+		// app. Two connections still overlap when a displaced cache state closes (a checkpoint on
+		// close) while a fresh one is already writing, and when the system runs two provider
+		// instances at once. Failing those outright with SQLITE_BUSY surfaces as a spurious
+		// operation error; waiting the moment out is what the caller wanted.
+		"PRAGMA busy_timeout = 5000;
+		PRAGMA recursive_triggers = TRUE;
 		PRAGMA journal_mode = WAL;
 		PRAGMA temp_store = MEMORY;
 		PRAGMA foreign_keys = ON;",
