@@ -106,7 +106,14 @@ jobs:
       # cargo step below needs all three, not only the -F heif-decoder ones.
       - name: Install build tools for heif-decoder's vendored dav1d
         run: |
-          choco install meson ninja nasm --no-progress
+          # meson and ninja come from pip, not choco. choco's meson is an MSI that
+          # updates the MACHINE PATH, which a job that is already running never sees:
+          # the install step succeeds and `require_build_tool` then finds no meson.
+          # pip's console scripts land in a Scripts directory already on the runner's
+          # PATH, so there is nothing to refresh and no install location to guess.
+          # nasm stays on choco, where the explicit GITHUB_PATH line already works.
+          python -m pip install meson ninja
+          choco install nasm --no-progress
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - name: Run clippy all features
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
