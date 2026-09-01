@@ -781,8 +781,10 @@ async fn events_all_decryptable() {
 			| DecryptedUserEventKind::FileMoved(info)
 			| DecryptedUserEventKind::FileTrash(info)
 			| DecryptedUserEventKind::FileRm(info)
-			| DecryptedUserEventKind::FileLinkEdited(info)
 			| DecryptedUserEventKind::DeleteFilePermanently(info) => {
+				check_file(uuid, event.event_type(), &info.metadata, &mut undecryptable);
+			}
+			DecryptedUserEventKind::FileLinkEdited(info) => {
 				check_file(uuid, event.event_type(), &info.metadata, &mut undecryptable);
 			}
 			DecryptedUserEventKind::FileRenamed(info)
@@ -803,8 +805,10 @@ async fn events_all_decryptable() {
 			| DecryptedUserEventKind::SubFolderCreated(info)
 			| DecryptedUserEventKind::BaseFolderCreated(info)
 			| DecryptedUserEventKind::FolderRestored(info)
-			| DecryptedUserEventKind::FolderColorChanged(info)
 			| DecryptedUserEventKind::DeleteFolderPermanently(info) => {
+				check_dir(uuid, event.event_type(), &info.name, &mut undecryptable);
+			}
+			DecryptedUserEventKind::FolderColorChanged(info) => {
 				check_dir(uuid, event.event_type(), &info.name, &mut undecryptable);
 			}
 			DecryptedUserEventKind::FolderRenamed(info)

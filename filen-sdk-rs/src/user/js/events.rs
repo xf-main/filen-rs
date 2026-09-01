@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::{api::v3::user::events::UserEventDeserializeError, fs::Uuid};
+use filen_types::{
+	api::v3::user::events::UserEventDeserializeError,
+	auth::FileEncryptionVersion,
+	fs::{ObjectType, Uuid},
+};
 
 use crate::{
-	js::{DirMeta, FileMeta},
+	js::{DirColor, DirMeta, FileMeta},
 	user::events::{
 		DecryptedUserEvent as DecryptedUserEventRs,
 		DecryptedUserEventKind as DecryptedUserEventKindRs,
@@ -69,7 +73,7 @@ pub enum UserEventKind {
 	FileTrash(UserEventFileInfo),
 	FileRm(UserEventFileInfo),
 	FileShared(UserEventFileSharedInfo),
-	FileLinkEdited(UserEventFileInfo),
+	FileLinkEdited(UserEventFileLinkEditedInfo),
 	DeleteFilePermanently(UserEventFileInfo),
 
 	FolderTrash(UserEventFolderInfo),
@@ -80,7 +84,7 @@ pub enum UserEventKind {
 	SubFolderCreated(UserEventFolderInfo),
 	BaseFolderCreated(UserEventFolderInfo),
 	FolderRestored(UserEventFolderInfo),
-	FolderColorChanged(UserEventFolderInfo),
+	FolderColorChanged(UserEventFolderColorChangedInfo),
 	DeleteFolderPermanently(UserEventFolderInfo),
 
 	Login(UserEventBaseInfo),
@@ -114,6 +118,22 @@ pub struct UserEventFileInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub metadata: FileMeta,
+	pub uuid: Option<Uuid>,
+	pub parent: Option<Uuid>,
+	pub bucket: Option<String>,
+	pub region: Option<String>,
+	pub rm: Option<String>,
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub chunks: Option<u64>,
+	pub version: Option<FileEncryptionVersion>,
+	pub favorited: Option<bool>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "filen_types::serde::time::optional"),
+		tsify(type = "bigint")
+	)]
+	pub timestamp: Option<DateTime<Utc>>,
+	pub current_uuid: Option<Uuid>,
 }
 
 #[js_type(export, no_deser)]
@@ -122,6 +142,7 @@ pub struct UserEventFilePairInfo {
 	pub user_agent: String,
 	pub metadata: FileMeta,
 	pub old_metadata: FileMeta,
+	pub uuid: Option<Uuid>,
 }
 
 #[js_type(export, no_deser)]
@@ -130,6 +151,17 @@ pub struct UserEventFileSharedInfo {
 	pub user_agent: String,
 	pub metadata: FileMeta,
 	pub receiver_email: String,
+	pub uuid: Option<Uuid>,
+	pub parent: Option<Uuid>,
+}
+
+#[js_type(export, no_deser)]
+pub struct UserEventFileLinkEditedInfo {
+	pub ip: String,
+	pub user_agent: String,
+	pub metadata: FileMeta,
+	pub uuid: Option<Uuid>,
+	pub link_uuid: Option<Uuid>,
 }
 
 #[js_type(export, no_deser)]
@@ -137,6 +169,14 @@ pub struct UserEventFolderInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub name: DirMeta,
+	pub uuid: Option<Uuid>,
+	pub parent: Option<Uuid>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "filen_types::serde::time::optional"),
+		tsify(type = "bigint")
+	)]
+	pub timestamp: Option<DateTime<Utc>>,
 }
 
 #[js_type(export, no_deser)]
@@ -145,6 +185,25 @@ pub struct UserEventFolderPairInfo {
 	pub user_agent: String,
 	pub name: DirMeta,
 	pub old_name: DirMeta,
+	pub uuid: Option<Uuid>,
+}
+
+#[js_type(export, no_deser)]
+pub struct UserEventFolderColorChangedInfo {
+	pub ip: String,
+	pub user_agent: String,
+	pub name: DirMeta,
+	pub uuid: Option<Uuid>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "DirColor")
+	)]
+	pub color: Option<DirColor>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "DirColor")
+	)]
+	pub old_color: Option<DirColor>,
 }
 
 #[js_type(export, no_deser)]
@@ -153,6 +212,8 @@ pub struct UserEventFolderSharedInfo {
 	pub user_agent: String,
 	pub name: DirMeta,
 	pub receiver_email: String,
+	pub uuid: Option<Uuid>,
+	pub parent: Option<Uuid>,
 }
 
 #[js_type(export, no_deser)]
@@ -201,6 +262,7 @@ pub struct UserEventFolderLinkEditedInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub link_uuid: Uuid,
+	pub uuid: Option<Uuid>,
 }
 
 #[js_type(export, no_deser)]
@@ -208,10 +270,13 @@ pub struct UserEventItemFavoriteInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub value: bool,
-	/// Encrypted blob can hold either a file or a folder name; in practice
-	/// `FileMeta::Decoded` for files and `FileMeta::DecryptedUTF8` for
-	/// folders (raw JSON, since the folder schema doesn't match the file one).
+	/// Encrypted blob can hold either a file or a folder name (discriminated
+	/// by `item_type`); in practice `FileMeta::Decoded` for files and
+	/// `FileMeta::DecryptedUTF8` for folders (raw JSON, since the folder
+	/// schema doesn't match the file one).
 	pub metadata: FileMeta,
+	pub uuid: Option<Uuid>,
+	pub item_type: Option<ObjectType>,
 }
 
 impl From<DecryptedUserEventRs> for UserEvent {
@@ -351,6 +416,7 @@ impl From<DecryptedUserEventKindRs> for UserEventKind {
 					ip: info.ip,
 					user_agent: info.user_agent,
 					link_uuid: info.link_uuid,
+					uuid: info.uuid,
 				})
 			}
 			DecryptedUserEventKindRs::ItemFavorite(info) => {
@@ -359,6 +425,8 @@ impl From<DecryptedUserEventKindRs> for UserEventKind {
 					user_agent: info.user_agent,
 					value: info.value,
 					metadata: info.metadata.into(),
+					uuid: info.uuid,
+					item_type: info.item_type,
 				})
 			}
 		}
@@ -380,6 +448,16 @@ impl From<crate::user::events::UserEventFileInfo> for UserEventFileInfo {
 			ip: info.ip,
 			user_agent: info.user_agent,
 			metadata: info.metadata.into(),
+			uuid: info.uuid,
+			parent: info.parent,
+			bucket: info.bucket,
+			region: info.region,
+			rm: info.rm,
+			chunks: info.chunks,
+			version: info.version,
+			favorited: info.favorited,
+			timestamp: info.timestamp,
+			current_uuid: info.current_uuid,
 		}
 	}
 }
@@ -391,6 +469,7 @@ impl From<crate::user::events::UserEventFilePairInfo> for UserEventFilePairInfo 
 			user_agent: info.user_agent,
 			metadata: info.metadata.into(),
 			old_metadata: info.old_metadata.into(),
+			uuid: info.uuid,
 		}
 	}
 }
@@ -402,6 +481,20 @@ impl From<crate::user::events::UserEventFileSharedInfo> for UserEventFileSharedI
 			user_agent: info.user_agent,
 			metadata: info.metadata.into(),
 			receiver_email: info.receiver_email,
+			uuid: info.uuid,
+			parent: info.parent,
+		}
+	}
+}
+
+impl From<crate::user::events::UserEventFileLinkEditedInfo> for UserEventFileLinkEditedInfo {
+	fn from(info: crate::user::events::UserEventFileLinkEditedInfo) -> Self {
+		Self {
+			ip: info.ip,
+			user_agent: info.user_agent,
+			metadata: info.metadata.into(),
+			uuid: info.uuid,
+			link_uuid: info.link_uuid,
 		}
 	}
 }
@@ -412,6 +505,9 @@ impl From<crate::user::events::UserEventFolderInfo> for UserEventFolderInfo {
 			ip: info.ip,
 			user_agent: info.user_agent,
 			name: info.name.into(),
+			uuid: info.uuid,
+			parent: info.parent,
+			timestamp: info.timestamp,
 		}
 	}
 }
@@ -423,6 +519,22 @@ impl From<crate::user::events::UserEventFolderPairInfo> for UserEventFolderPairI
 			user_agent: info.user_agent,
 			name: info.name.into(),
 			old_name: info.old_name.into(),
+			uuid: info.uuid,
+		}
+	}
+}
+
+impl From<crate::user::events::UserEventFolderColorChangedInfo>
+	for UserEventFolderColorChangedInfo
+{
+	fn from(info: crate::user::events::UserEventFolderColorChangedInfo) -> Self {
+		Self {
+			ip: info.ip,
+			user_agent: info.user_agent,
+			name: info.name.into(),
+			uuid: info.uuid,
+			color: info.color.map(Into::into),
+			old_color: info.old_color.map(Into::into),
 		}
 	}
 }
@@ -434,6 +546,8 @@ impl From<crate::user::events::UserEventFolderSharedInfo> for UserEventFolderSha
 			user_agent: info.user_agent,
 			name: info.name.into(),
 			receiver_email: info.receiver_email,
+			uuid: info.uuid,
+			parent: info.parent,
 		}
 	}
 }

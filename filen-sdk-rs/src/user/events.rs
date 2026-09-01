@@ -1,11 +1,15 @@
 use chrono::{DateTime, Utc};
 use filen_types::{
-	api::v3::user::events::{
-		BaseInfo, FileMetadataInfo, FileMetadataPairInfo, FileSharedInfo, FolderNameInfo,
-		FolderNamePairInfo, FolderSharedInfo, ItemFavoriteInfo, UserEvent, UserEventKind,
+	api::v3::{
+		dir::color::DirColor,
+		user::events::{
+			BaseInfo, FileLinkEditedInfo, FileMetadataInfo, FileMetadataPairInfo, FileSharedInfo,
+			FolderColorChangedInfo, FolderNameInfo, FolderNamePairInfo, FolderSharedInfo,
+			ItemFavoriteInfo, UserEvent, UserEventKind,
+		},
 	},
 	auth::FileEncryptionVersion,
-	fs::Uuid,
+	fs::{ObjectType, Uuid},
 	traits::CowHelpers,
 };
 
@@ -14,8 +18,9 @@ use crate::{
 	fs::{dir::meta::DirectoryMeta, file::meta::FileMeta},
 };
 
-// The user-events endpoint does not carry an encryption version, so we follow
-// the same convention as socket events (e.g. `FileRename`) and default to V2.
+// Some event kinds carry the file's encryption version in `info.version`;
+// where they don't, we follow the same convention as socket events (e.g.
+// `FileRename`) and default to V2.
 const DEFAULT_FILE_ENCRYPTION_VERSION: FileEncryptionVersion = FileEncryptionVersion::V2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +43,7 @@ pub enum DecryptedUserEventKind {
 	FileTrash(UserEventFileInfo),
 	FileRm(UserEventFileInfo),
 	FileShared(UserEventFileSharedInfo),
-	FileLinkEdited(UserEventFileInfo),
+	FileLinkEdited(UserEventFileLinkEditedInfo),
 	DeleteFilePermanently(UserEventFileInfo),
 
 	FolderTrash(UserEventFolderInfo),
@@ -49,7 +54,7 @@ pub enum DecryptedUserEventKind {
 	SubFolderCreated(UserEventFolderInfo),
 	BaseFolderCreated(UserEventFolderInfo),
 	FolderRestored(UserEventFolderInfo),
-	FolderColorChanged(UserEventFolderInfo),
+	FolderColorChanged(UserEventFolderColorChangedInfo),
 	DeleteFolderPermanently(UserEventFolderInfo),
 
 	Login(UserEventBaseInfo),
@@ -164,7 +169,7 @@ impl DecryptedUserEvent {
 				UserEventFileSharedInfo::blocking_from_encrypted(crypter, info),
 			),
 			UserEventKind::FileLinkEdited(info) => DecryptedUserEventKind::FileLinkEdited(
-				UserEventFileInfo::blocking_from_encrypted(crypter, info),
+				UserEventFileLinkEditedInfo::blocking_from_encrypted(crypter, info),
 			),
 			UserEventKind::DeleteFilePermanently(info) => {
 				DecryptedUserEventKind::DeleteFilePermanently(
@@ -199,7 +204,7 @@ impl DecryptedUserEvent {
 				UserEventFolderInfo::blocking_from_encrypted(crypter, info),
 			),
 			UserEventKind::FolderColorChanged(info) => DecryptedUserEventKind::FolderColorChanged(
-				UserEventFolderInfo::blocking_from_encrypted(crypter, info),
+				UserEventFolderColorChangedInfo::blocking_from_encrypted(crypter, info),
 			),
 			UserEventKind::DeleteFolderPermanently(info) => {
 				DecryptedUserEventKind::DeleteFolderPermanently(
@@ -282,6 +287,7 @@ impl DecryptedUserEvent {
 					ip: info.ip.into_owned(),
 					user_agent: info.user_agent.into_owned(),
 					link_uuid: info.link_uuid,
+					uuid: info.uuid,
 				})
 			}
 			UserEventKind::ItemFavorite(info) => DecryptedUserEventKind::ItemFavorite(
@@ -312,34 +318,62 @@ impl From<BaseInfo<'_>> for UserEventBaseInfo {
 	}
 }
 
+/// See [`FileMetadataInfo`] for which kinds populate which optional fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserEventFileInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub metadata: FileMeta<'static>,
+	pub uuid: Option<Uuid>,
+	pub parent: Option<Uuid>,
+	pub bucket: Option<String>,
+	pub region: Option<String>,
+	pub rm: Option<String>,
+	pub chunks: Option<u64>,
+	pub version: Option<FileEncryptionVersion>,
+	pub favorited: Option<bool>,
+	/// The file's own (creation/upload) timestamp, not the event time.
+	pub timestamp: Option<DateTime<Utc>>,
+	/// `versionedFileRestored` only: the uuid that was current before the
+	/// restore replaced it with [`Self::uuid`].
+	pub current_uuid: Option<Uuid>,
 }
 
 impl UserEventFileInfo {
 	fn blocking_from_encrypted(crypter: &impl MetaCrypter, info: FileMetadataInfo<'_>) -> Self {
 		Self {
-			ip: info.ip.into_owned(),
-			user_agent: info.user_agent.into_owned(),
 			metadata: FileMeta::blocking_from_encrypted(
 				info.metadata,
 				crypter,
-				DEFAULT_FILE_ENCRYPTION_VERSION,
+				info.version.unwrap_or(DEFAULT_FILE_ENCRYPTION_VERSION),
 			)
 			.into_owned_cow(),
+			ip: info.ip.into_owned(),
+			user_agent: info.user_agent.into_owned(),
+			uuid: info.uuid,
+			parent: info.parent,
+			bucket: info.bucket.map(|v| v.into_owned()),
+			region: info.region.map(|v| v.into_owned()),
+			rm: info.rm.map(|v| v.into_owned()),
+			chunks: info.chunks,
+			version: info.version,
+			favorited: info.favorited,
+			timestamp: info.timestamp,
+			current_uuid: info.current_uuid,
 		}
 	}
 }
 
+/// The wire payload also carries a standalone `name` blob, but it is encrypted
+/// with the file key rather than the master key, and the decrypted `metadata`
+/// already contains the same name — so it is not surfaced here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserEventFilePairInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub metadata: FileMeta<'static>,
 	pub old_metadata: FileMeta<'static>,
+	pub uuid: Option<Uuid>,
 }
 
 impl UserEventFilePairInfo {
@@ -359,6 +393,7 @@ impl UserEventFilePairInfo {
 				DEFAULT_FILE_ENCRYPTION_VERSION,
 			)
 			.into_owned_cow(),
+			uuid: info.uuid,
 		}
 	}
 }
@@ -369,6 +404,9 @@ pub struct UserEventFileSharedInfo {
 	pub user_agent: String,
 	pub metadata: FileMeta<'static>,
 	pub receiver_email: String,
+	pub uuid: Option<Uuid>,
+	/// `None` when the item was shared from the drive root.
+	pub parent: Option<Uuid>,
 }
 
 impl UserEventFileSharedInfo {
@@ -383,15 +421,50 @@ impl UserEventFileSharedInfo {
 			)
 			.into_owned_cow(),
 			receiver_email: info.receiver_email.into_owned(),
+			uuid: info.uuid,
+			parent: info.parent,
 		}
 	}
 }
 
+/// Emitted for both enabling and disabling a public file link — the payloads
+/// are identical, so the two cannot be told apart from the event alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEventFileLinkEditedInfo {
+	pub ip: String,
+	pub user_agent: String,
+	pub metadata: FileMeta<'static>,
+	pub uuid: Option<Uuid>,
+	pub link_uuid: Option<Uuid>,
+}
+
+impl UserEventFileLinkEditedInfo {
+	fn blocking_from_encrypted(crypter: &impl MetaCrypter, info: FileLinkEditedInfo<'_>) -> Self {
+		Self {
+			ip: info.ip.into_owned(),
+			user_agent: info.user_agent.into_owned(),
+			metadata: FileMeta::blocking_from_encrypted(
+				info.metadata,
+				crypter,
+				DEFAULT_FILE_ENCRYPTION_VERSION,
+			)
+			.into_owned_cow(),
+			uuid: info.uuid,
+			link_uuid: info.link_uuid,
+		}
+	}
+}
+
+/// See [`FolderNameInfo`] for which kinds populate which optional fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserEventFolderInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub name: DirectoryMeta<'static>,
+	pub uuid: Option<Uuid>,
+	pub parent: Option<Uuid>,
+	/// The folder's own creation timestamp, not the event time.
+	pub timestamp: Option<DateTime<Utc>>,
 }
 
 impl UserEventFolderInfo {
@@ -400,6 +473,9 @@ impl UserEventFolderInfo {
 			ip: info.ip.into_owned(),
 			user_agent: info.user_agent.into_owned(),
 			name: DirectoryMeta::blocking_from_encrypted(info.name, crypter).into_owned_cow(),
+			uuid: info.uuid,
+			parent: info.parent,
+			timestamp: info.timestamp,
 		}
 	}
 }
@@ -410,6 +486,7 @@ pub struct UserEventFolderPairInfo {
 	pub user_agent: String,
 	pub name: DirectoryMeta<'static>,
 	pub old_name: DirectoryMeta<'static>,
+	pub uuid: Option<Uuid>,
 }
 
 impl UserEventFolderPairInfo {
@@ -420,6 +497,34 @@ impl UserEventFolderPairInfo {
 			name: DirectoryMeta::blocking_from_encrypted(info.name, crypter).into_owned_cow(),
 			old_name: DirectoryMeta::blocking_from_encrypted(info.old_name, crypter)
 				.into_owned_cow(),
+			uuid: info.uuid,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEventFolderColorChangedInfo {
+	pub ip: String,
+	pub user_agent: String,
+	pub name: DirectoryMeta<'static>,
+	pub uuid: Option<Uuid>,
+	pub color: Option<DirColor<'static>>,
+	/// `None` when the folder still had the default colour.
+	pub old_color: Option<DirColor<'static>>,
+}
+
+impl UserEventFolderColorChangedInfo {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		info: FolderColorChangedInfo<'_>,
+	) -> Self {
+		Self {
+			ip: info.ip.into_owned(),
+			user_agent: info.user_agent.into_owned(),
+			name: DirectoryMeta::blocking_from_encrypted(info.name, crypter).into_owned_cow(),
+			uuid: info.uuid,
+			color: info.color.map(CowHelpers::into_owned_cow),
+			old_color: info.old_color.map(CowHelpers::into_owned_cow),
 		}
 	}
 }
@@ -430,6 +535,9 @@ pub struct UserEventFolderSharedInfo {
 	pub user_agent: String,
 	pub name: DirectoryMeta<'static>,
 	pub receiver_email: String,
+	pub uuid: Option<Uuid>,
+	/// `None` when the item was shared from the drive root.
+	pub parent: Option<Uuid>,
 }
 
 impl UserEventFolderSharedInfo {
@@ -439,6 +547,8 @@ impl UserEventFolderSharedInfo {
 			user_agent: info.user_agent.into_owned(),
 			name: DirectoryMeta::blocking_from_encrypted(info.name, crypter).into_owned_cow(),
 			receiver_email: info.receiver_email.into_owned(),
+			uuid: info.uuid,
+			parent: info.parent,
 		}
 	}
 }
@@ -482,11 +592,15 @@ pub struct UserEventRemovedSharedOutItemsInfo {
 	pub receiver_email: String,
 }
 
+/// Emitted for both enabling and disabling a public folder link (identical
+/// payloads). Unlike `fileLinkEdited` it carries no metadata/name blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserEventFolderLinkEditedInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub link_uuid: Uuid,
+	/// The linked folder's uuid.
+	pub uuid: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -494,10 +608,13 @@ pub struct UserEventItemFavoriteInfo {
 	pub ip: String,
 	pub user_agent: String,
 	pub value: bool,
-	/// The encrypted blob can hold either a file or a folder name. We try
-	/// decoding as a file (richer schema) first; for plain folder favourites
-	/// the result will be `FileMeta::DecryptedUTF8` with the raw JSON.
+	/// The encrypted blob can hold either a file or a folder name
+	/// (discriminated by [`Self::item_type`]). We try decoding as a file
+	/// (richer schema) first; for plain folder favourites the result will be
+	/// `FileMeta::DecryptedUTF8` with the raw JSON.
 	pub metadata: FileMeta<'static>,
+	pub uuid: Option<Uuid>,
+	pub item_type: Option<ObjectType>,
 }
 
 impl UserEventItemFavoriteInfo {
@@ -512,6 +629,8 @@ impl UserEventItemFavoriteInfo {
 				DEFAULT_FILE_ENCRYPTION_VERSION,
 			)
 			.into_owned_cow(),
+			uuid: info.uuid,
+			item_type: info.item_type,
 		}
 	}
 }

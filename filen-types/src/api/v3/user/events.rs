@@ -7,7 +7,13 @@ use serde::{
 };
 use serde_json::value::RawValue;
 
-use crate::{crypto::EncryptedString, fs::Uuid, traits::CowHelpers};
+use crate::{
+	api::v3::dir::color::DirColor,
+	auth::FileEncryptionVersion,
+	crypto::EncryptedString,
+	fs::{ObjectType, Uuid},
+	traits::CowHelpers,
+};
 
 pub const ENDPOINT: &str = "v3/user/events";
 
@@ -105,7 +111,7 @@ pub enum UserEventKind<'a> {
 	FileTrash(FileMetadataInfo<'a>),
 	FileRm(FileMetadataInfo<'a>),
 	FileShared(FileSharedInfo<'a>),
-	FileLinkEdited(FileMetadataInfo<'a>),
+	FileLinkEdited(FileLinkEditedInfo<'a>),
 	DeleteFilePermanently(FileMetadataInfo<'a>),
 
 	FolderTrash(FolderNameInfo<'a>),
@@ -116,7 +122,7 @@ pub enum UserEventKind<'a> {
 	SubFolderCreated(FolderNameInfo<'a>),
 	BaseFolderCreated(FolderNameInfo<'a>),
 	FolderRestored(FolderNameInfo<'a>),
-	FolderColorChanged(FolderNameInfo<'a>),
+	FolderColorChanged(FolderColorChangedInfo<'a>),
 	DeleteFolderPermanently(FolderNameInfo<'a>),
 
 	Login(BaseInfo<'a>),
@@ -148,14 +154,53 @@ pub struct BaseInfo<'a> {
 	pub user_agent: Cow<'a, str>,
 }
 
+/// Shared by the single-metadata file events. Which of the optional fields are
+/// actually populated varies per kind; the captured fixtures in
+/// `tests/fixtures/user_events/` are the reference:
+///
+/// - `fileUploaded`: everything except `favorited` and `current_uuid`
+/// - `fileMoved` / `fileRestored`: everything except `current_uuid`
+/// - `versionedFileRestored`: everything, `current_uuid` being the uuid that
+///   was current before the old version was restored over it
+/// - `fileVersioned` / `fileTrash`: only `uuid` (of the superseded / trashed
+///   file — there is no `newUUID`-style field pointing at a successor)
+/// - `deleteFilePermanently`: none of them, not even `uuid`
+/// - `fileRm`: unverified (never observed live)
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadataInfo<'a> {
 	pub ip: Cow<'a, str>,
 	pub user_agent: Cow<'a, str>,
 	pub metadata: EncryptedString<'a>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+	#[serde(default)]
+	pub parent: Option<Uuid>,
+	#[serde(default)]
+	pub bucket: Option<Cow<'a, str>>,
+	#[serde(default)]
+	pub region: Option<Cow<'a, str>>,
+	#[serde(default)]
+	pub rm: Option<Cow<'a, str>>,
+	#[serde(default, with = "crate::serde::number::permissive_u64_opt")]
+	pub chunks: Option<u64>,
+	#[serde(default)]
+	pub version: Option<FileEncryptionVersion>,
+	#[serde(default, with = "crate::serde::boolean::maybe_number")]
+	pub favorited: Option<bool>,
+	/// The file's own (creation/upload) timestamp; the event time is the
+	/// outer [`UserEvent::timestamp`].
+	#[serde(default, with = "crate::serde::time::optional")]
+	pub timestamp: Option<DateTime<Utc>>,
+	/// `versionedFileRestored` only: the uuid that was current before the
+	/// restore replaced it with [`Self::uuid`].
+	#[serde(default, rename = "currentUUID")]
+	pub current_uuid: Option<Uuid>,
 }
 
+/// `fileRenamed` and `fileMetadataChanged` (observed identical): both carry
+/// the file uuid and the standalone encrypted-name blob next to the old/new
+/// full metadata.
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadataPairInfo<'a> {
@@ -163,6 +208,12 @@ pub struct FileMetadataPairInfo<'a> {
 	pub user_agent: Cow<'a, str>,
 	pub metadata: EncryptedString<'a>,
 	pub old_metadata: EncryptedString<'a>,
+	/// The new name, encrypted with the file key (the blob stored server-side
+	/// for public-link consumers), unlike `metadata` which uses the master key.
+	#[serde(default)]
+	pub name: Option<EncryptedString<'a>>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
@@ -172,16 +223,52 @@ pub struct FileSharedInfo<'a> {
 	pub user_agent: Cow<'a, str>,
 	pub metadata: EncryptedString<'a>,
 	pub receiver_email: Cow<'a, str>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+	/// Observed as an explicit `null` when the item was shared from the root.
+	#[serde(default)]
+	pub parent: Option<Uuid>,
 }
 
+/// `fileLinkEdited`: emitted for both enabling and disabling a public file
+/// link (the payloads are identical, so the two cannot be told apart).
+#[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
+#[serde(rename_all = "camelCase")]
+pub struct FileLinkEditedInfo<'a> {
+	pub ip: Cow<'a, str>,
+	pub user_agent: Cow<'a, str>,
+	pub metadata: EncryptedString<'a>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+	#[serde(default, rename = "linkUUID")]
+	pub link_uuid: Option<Uuid>,
+}
+
+/// Shared by the single-name folder events. Per-kind population (see the
+/// fixtures):
+///
+/// - `subFolderCreated` / `folderMoved` / `folderRestored`: `uuid`, `parent`
+///   (the *new* parent for a move) and `timestamp`
+/// - `folderTrash`: `uuid` and `parent`
+/// - `deleteFolderPermanently`: none of the optionals
+/// - `baseFolderCreated`: unverified (never observed live)
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderNameInfo<'a> {
 	pub ip: Cow<'a, str>,
 	pub user_agent: Cow<'a, str>,
 	pub name: EncryptedString<'a>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+	#[serde(default)]
+	pub parent: Option<Uuid>,
+	/// The folder's own creation timestamp; the event time is the outer
+	/// [`UserEvent::timestamp`].
+	#[serde(default, with = "crate::serde::time::optional")]
+	pub timestamp: Option<DateTime<Utc>>,
 }
 
+/// `folderRenamed` and `folderMetadataChanged` (observed identical).
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderNamePairInfo<'a> {
@@ -189,6 +276,24 @@ pub struct FolderNamePairInfo<'a> {
 	pub user_agent: Cow<'a, str>,
 	pub name: EncryptedString<'a>,
 	pub old_name: EncryptedString<'a>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderColorChangedInfo<'a> {
+	pub ip: Cow<'a, str>,
+	pub user_agent: Cow<'a, str>,
+	pub name: EncryptedString<'a>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+	#[serde(default)]
+	pub color: Option<DirColor<'a>>,
+	/// Observed as an explicit `null` when the folder still had the default
+	/// colour.
+	#[serde(default)]
+	pub old_color: Option<DirColor<'a>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
@@ -198,6 +303,11 @@ pub struct FolderSharedInfo<'a> {
 	pub user_agent: Cow<'a, str>,
 	pub name: EncryptedString<'a>,
 	pub receiver_email: Cow<'a, str>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+	/// Observed as an explicit `null` when the item was shared from the root.
+	#[serde(default)]
+	pub parent: Option<Uuid>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
@@ -246,6 +356,9 @@ pub struct RemovedSharedOutItemsInfo<'a> {
 	pub receiver_email: Cow<'a, str>,
 }
 
+/// `folderLinkEdited`: emitted for both enabling and disabling a public
+/// folder link (identical payloads). Unlike `fileLinkEdited` it carries no
+/// metadata/name blob at all — only the two uuids.
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderLinkEditedInfo<'a> {
@@ -253,6 +366,9 @@ pub struct FolderLinkEditedInfo<'a> {
 	pub user_agent: Cow<'a, str>,
 	#[serde(rename = "linkUUID")]
 	pub link_uuid: Uuid,
+	/// The linked folder's uuid.
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
@@ -262,7 +378,13 @@ pub struct ItemFavoriteInfo<'a> {
 	pub user_agent: Cow<'a, str>,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub value: bool,
+	/// Encrypted file metadata for files, encrypted `{"name": …}` for folders
+	/// — discriminated by [`Self::item_type`].
 	pub metadata: EncryptedString<'a>,
+	#[serde(default)]
+	pub uuid: Option<Uuid>,
+	#[serde(default, rename = "type")]
+	pub item_type: Option<ObjectType>,
 }
 
 #[cfg(test)]
