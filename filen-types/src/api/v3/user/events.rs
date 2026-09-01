@@ -11,7 +11,7 @@ use crate::{
 	api::v3::dir::color::DirColor,
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
-	fs::{ObjectType, Uuid},
+	fs::{ObjectType, StableUuid, Uuid},
 	traits::CowHelpers,
 };
 
@@ -174,6 +174,23 @@ pub struct FileMetadataInfo<'a> {
 	pub metadata: EncryptedString<'a>,
 	#[serde(default)]
 	pub uuid: Option<Uuid>,
+	/// The lineage's whole-life id, as the socket twins carry it. Omitted for
+	/// archived-version rows — on `deleteFilePermanently` that absence is the
+	/// signal that only old VERSIONS died and the live head stands, exactly as
+	/// [`super::super::socket::FileDeletedPermanent::stable_uuid`] means it.
+	/// Also absent on any event logged before the server carried the field, so
+	/// a replaying consumer must treat missing as "cannot replay", never as a
+	/// default.
+	#[serde(default, rename = "stableUUID")]
+	pub stable_uuid: Option<StableUuid>,
+	/// Present iff `uuid` was superseded by `new_uuid`. Its ABSENCE means
+	/// different things per event kind, and neither may be inferred from the
+	/// other: on `fileTrash` a real user trash (the row stays, restorable,
+	/// keeping its stable id), on `fileVersioned` a lineage that was replaced
+	/// outright. Mirrors [`super::super::socket::FileTrash::new_uuid`] and
+	/// [`super::super::socket::FileArchived::new_uuid`].
+	#[serde(default, rename = "newUUID")]
+	pub new_uuid: Option<Uuid>,
 	#[serde(default)]
 	pub parent: Option<Uuid>,
 	#[serde(default)]
@@ -214,6 +231,10 @@ pub struct FileMetadataPairInfo<'a> {
 	pub name: Option<EncryptedString<'a>>,
 	#[serde(default)]
 	pub uuid: Option<Uuid>,
+	/// Keyed on by the applier: a rename arriving after an edit re-minted the
+	/// file's uuid still names the same lineage through this.
+	#[serde(default, rename = "stableUUID")]
+	pub stable_uuid: Option<StableUuid>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
@@ -383,6 +404,10 @@ pub struct ItemFavoriteInfo<'a> {
 	pub metadata: EncryptedString<'a>,
 	#[serde(default)]
 	pub uuid: Option<Uuid>,
+	/// File payloads only — directories never carry a stable id, matching
+	/// [`super::super::socket::ItemFavorite::stable_uuid`].
+	#[serde(default, rename = "stableUUID")]
+	pub stable_uuid: Option<StableUuid>,
 	#[serde(default, rename = "type")]
 	pub item_type: Option<ObjectType>,
 }
@@ -395,6 +420,115 @@ mod tests {
 		format!(
 			r#"{{"id":{id},"timestamp":1700000,"uuid":"11111111-1111-1111-1111-111111111111","type":"login","info":{{"ip":"1.2.3.4","userAgent":"ua"}}}}"#
 		)
+	}
+
+	/// The identity fields the replay path keys on. They are optional so that
+	/// events logged before the server carried them still parse — which makes
+	/// "absent" a load-bearing value, not a default, and worth pinning both ways.
+	fn file_event(kind: &str, extra: &str) -> String {
+		format!(
+			r#"{{"id":9,"timestamp":1700000,"uuid":"33333333-3333-3333-3333-333333333333","type":"{kind}","info":{{"ip":"1.2.3.4","userAgent":"ua","metadata":"enc"{extra}}}}}"#
+		)
+	}
+
+	fn file_info(kind: &str, extra: &str) -> FileMetadataInfo<'static> {
+		let event: UserEvent = serde_json::from_str(&file_event(kind, extra)).unwrap();
+		match event.kind {
+			UserEventKind::FileUploaded(info)
+			| UserEventKind::FileTrash(info)
+			| UserEventKind::FileVersioned(info)
+			| UserEventKind::DeleteFilePermanently(info) => info,
+			other => panic!("unexpected kind: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn file_events_carry_the_stable_id_and_survive_without_it() {
+		let uploaded = file_info(
+			"fileUploaded",
+			r#","uuid":"44444444-4444-4444-4444-444444444444","stableUUID":"55555555-5555-5555-5555-555555555555""#,
+		);
+		assert_eq!(
+			uploaded.stable_uuid.map(Uuid::from),
+			Some("55555555-5555-5555-5555-555555555555".parse().unwrap())
+		);
+		assert_eq!(uploaded.new_uuid, None);
+
+		// A pre-rollout event: parses, but announces it cannot be replayed.
+		assert_eq!(file_info("fileUploaded", "").stable_uuid, None);
+	}
+
+	/// `newUUID` is the discriminator that keeps a versioning-disabled edit from
+	/// being applied as a user trash, so both halves are pinned.
+	#[test]
+	fn file_trash_distinguishes_a_supersede_from_a_user_trash() {
+		let supersede = file_info(
+			"fileTrash",
+			r#","uuid":"44444444-4444-4444-4444-444444444444","stableUUID":"55555555-5555-5555-5555-555555555555","newUUID":"66666666-6666-6666-6666-666666666666""#,
+		);
+		assert_eq!(
+			supersede.new_uuid,
+			Some("66666666-6666-6666-6666-666666666666".parse().unwrap())
+		);
+
+		let user_trash = file_info(
+			"fileTrash",
+			r#","uuid":"44444444-4444-4444-4444-444444444444","stableUUID":"55555555-5555-5555-5555-555555555555""#,
+		);
+		assert_eq!(user_trash.new_uuid, None);
+		assert!(user_trash.stable_uuid.is_some());
+	}
+
+	/// The same absence on `fileVersioned` means the opposite of the trash case:
+	/// the lineage was replaced rather than superseded.
+	#[test]
+	fn file_versioned_carries_the_retiring_lineage() {
+		let replaced = file_info(
+			"fileVersioned",
+			r#","uuid":"44444444-4444-4444-4444-444444444444","stableUUID":"55555555-5555-5555-5555-555555555555""#,
+		);
+		assert!(replaced.stable_uuid.is_some());
+		assert_eq!(replaced.new_uuid, None);
+	}
+
+	/// `deleteFilePermanently` without a stable id is an archived-VERSION delete;
+	/// the live head stands. With one, the whole lineage is gone.
+	#[test]
+	fn permanent_delete_separates_a_version_from_the_whole_lineage() {
+		let versions_only = file_info(
+			"deleteFilePermanently",
+			r#","uuid":"44444444-4444-4444-4444-444444444444""#,
+		);
+		assert!(versions_only.uuid.is_some());
+		assert_eq!(versions_only.stable_uuid, None);
+
+		let lineage = file_info(
+			"deleteFilePermanently",
+			r#","uuid":"44444444-4444-4444-4444-444444444444","stableUUID":"55555555-5555-5555-5555-555555555555""#,
+		);
+		assert!(lineage.stable_uuid.is_some());
+	}
+
+	#[test]
+	fn rename_and_favorite_carry_the_stable_id() {
+		let renamed: UserEvent = serde_json::from_str(
+			r#"{"id":10,"timestamp":1700000,"uuid":"33333333-3333-3333-3333-333333333333","type":"fileRenamed","info":{"ip":"1.2.3.4","userAgent":"ua","metadata":"enc","oldMetadata":"old","uuid":"44444444-4444-4444-4444-444444444444","stableUUID":"55555555-5555-5555-5555-555555555555"}}"#,
+		)
+		.unwrap();
+		let UserEventKind::FileRenamed(info) = renamed.kind else {
+			panic!("expected fileRenamed");
+		};
+		assert!(info.stable_uuid.is_some());
+
+		let favorite: UserEvent = serde_json::from_str(
+			r#"{"id":11,"timestamp":1700000,"uuid":"33333333-3333-3333-3333-333333333333","type":"itemFavorite","info":{"ip":"1.2.3.4","userAgent":"ua","metadata":"enc","value":1,"type":"file","uuid":"44444444-4444-4444-4444-444444444444","stableUUID":"55555555-5555-5555-5555-555555555555"}}"#,
+		)
+		.unwrap();
+		let UserEventKind::ItemFavorite(info) = favorite.kind else {
+			panic!("expected itemFavorite");
+		};
+		assert!(info.stable_uuid.is_some());
+		assert_eq!(info.item_type, Some(ObjectType::File));
 	}
 
 	#[test]

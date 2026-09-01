@@ -3,7 +3,7 @@ use filen_macros::js_type;
 use filen_types::{
 	api::v3::user::events::UserEventDeserializeError,
 	auth::FileEncryptionVersion,
-	fs::{ObjectType, Uuid},
+	fs::{ObjectType, StableUuid, Uuid},
 };
 
 use crate::{
@@ -119,6 +119,8 @@ pub struct UserEventFileInfo {
 	pub user_agent: String,
 	pub metadata: FileMeta,
 	pub uuid: Option<Uuid>,
+	pub stable_uuid: Option<StableUuid>,
+	pub new_uuid: Option<Uuid>,
 	pub parent: Option<Uuid>,
 	pub bucket: Option<String>,
 	pub region: Option<String>,
@@ -143,6 +145,7 @@ pub struct UserEventFilePairInfo {
 	pub metadata: FileMeta,
 	pub old_metadata: FileMeta,
 	pub uuid: Option<Uuid>,
+	pub stable_uuid: Option<StableUuid>,
 }
 
 #[js_type(export, no_deser)]
@@ -276,6 +279,7 @@ pub struct UserEventItemFavoriteInfo {
 	/// schema doesn't match the file one).
 	pub metadata: FileMeta,
 	pub uuid: Option<Uuid>,
+	pub stable_uuid: Option<StableUuid>,
 	pub item_type: Option<ObjectType>,
 }
 
@@ -426,6 +430,7 @@ impl From<DecryptedUserEventKindRs> for UserEventKind {
 					value: info.value,
 					metadata: info.metadata.into(),
 					uuid: info.uuid,
+					stable_uuid: info.stable_uuid,
 					item_type: info.item_type,
 				})
 			}
@@ -449,6 +454,8 @@ impl From<crate::user::events::UserEventFileInfo> for UserEventFileInfo {
 			user_agent: info.user_agent,
 			metadata: info.metadata.into(),
 			uuid: info.uuid,
+			stable_uuid: info.stable_uuid,
+			new_uuid: info.new_uuid,
 			parent: info.parent,
 			bucket: info.bucket,
 			region: info.region,
@@ -470,6 +477,7 @@ impl From<crate::user::events::UserEventFilePairInfo> for UserEventFilePairInfo 
 			metadata: info.metadata.into(),
 			old_metadata: info.old_metadata.into(),
 			uuid: info.uuid,
+			stable_uuid: info.stable_uuid,
 		}
 	}
 }

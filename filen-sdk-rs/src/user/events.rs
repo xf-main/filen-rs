@@ -9,7 +9,7 @@ use filen_types::{
 		},
 	},
 	auth::FileEncryptionVersion,
-	fs::{ObjectType, Uuid},
+	fs::{ObjectType, StableUuid, Uuid},
 	traits::CowHelpers,
 };
 
@@ -325,6 +325,13 @@ pub struct UserEventFileInfo {
 	pub user_agent: String,
 	pub metadata: FileMeta<'static>,
 	pub uuid: Option<Uuid>,
+	/// The lineage's whole-life id; `None` on archived-version rows and on
+	/// events predating the field. See the wire type for what its absence means
+	/// per kind.
+	pub stable_uuid: Option<StableUuid>,
+	/// Set iff `uuid` was superseded. Absent means a user trash on `fileTrash`
+	/// but a replaced lineage on `fileVersioned` — read it with the kind.
+	pub new_uuid: Option<Uuid>,
 	pub parent: Option<Uuid>,
 	pub bucket: Option<String>,
 	pub region: Option<String>,
@@ -351,6 +358,8 @@ impl UserEventFileInfo {
 			ip: info.ip.into_owned(),
 			user_agent: info.user_agent.into_owned(),
 			uuid: info.uuid,
+			stable_uuid: info.stable_uuid,
+			new_uuid: info.new_uuid,
 			parent: info.parent,
 			bucket: info.bucket.map(|v| v.into_owned()),
 			region: info.region.map(|v| v.into_owned()),
@@ -374,6 +383,7 @@ pub struct UserEventFilePairInfo {
 	pub metadata: FileMeta<'static>,
 	pub old_metadata: FileMeta<'static>,
 	pub uuid: Option<Uuid>,
+	pub stable_uuid: Option<StableUuid>,
 }
 
 impl UserEventFilePairInfo {
@@ -394,6 +404,7 @@ impl UserEventFilePairInfo {
 			)
 			.into_owned_cow(),
 			uuid: info.uuid,
+			stable_uuid: info.stable_uuid,
 		}
 	}
 }
@@ -614,6 +625,8 @@ pub struct UserEventItemFavoriteInfo {
 	/// `FileMeta::DecryptedUTF8` with the raw JSON.
 	pub metadata: FileMeta<'static>,
 	pub uuid: Option<Uuid>,
+	/// Files only — folder favourites never carry a stable id.
+	pub stable_uuid: Option<StableUuid>,
 	pub item_type: Option<ObjectType>,
 }
 
@@ -630,6 +643,7 @@ impl UserEventItemFavoriteInfo {
 			)
 			.into_owned_cow(),
 			uuid: info.uuid,
+			stable_uuid: info.stable_uuid,
 			item_type: info.item_type,
 		}
 	}
