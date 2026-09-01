@@ -73,6 +73,10 @@ mod meter {
 	pub fn dropped() -> usize {
 		0
 	}
+
+	pub fn healed() -> usize {
+		0
+	}
 }
 
 /// libmalloc's logging hook. Installing a `malloc_logger` gets a callback for
@@ -86,6 +90,14 @@ mod meter {
 /// table is static, insertion is CAS-only, and overflow is counted (never
 /// dropped silently) — an untracked block inflates CURRENT forever, which only
 /// over-reports the peak, and `dropped()` is asserted zero regardless.
+///
+/// The table is exact only under exactly-once event delivery. Nightly CI has
+/// produced overshoots that are whole multiples of one decode buffer with no
+/// repo change touching the path — consistent with the runner's libmalloc
+/// duplicating an alloc event or losing a free, either of which strands a live
+/// entry that inflates CURRENT permanently. `insert` heals the detectable
+/// half (a second alloc for a still-live pointer), and `measured_peak` prints
+/// per-window drift so a future failure tells the two apart.
 #[cfg(target_os = "macos")]
 mod meter {
 	use std::sync::Once;
@@ -111,6 +123,7 @@ mod meter {
 	static PTRS: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
 	static SIZES: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
 	static DROPPED: AtomicUsize = AtomicUsize::new(0);
+	static HEALED: AtomicUsize = AtomicUsize::new(0);
 
 	fn slot(ptr: usize, step: usize) -> usize {
 		(((ptr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) + step) & (SLOTS - 1)
@@ -119,6 +132,28 @@ mod meter {
 	/// The malloc callback for `ptr` runs before malloc returns it, so no other
 	/// thread can race an insert of the same pointer with its own free.
 	fn insert(ptr: usize, size: usize) {
+		// A second alloc for a pointer the table still holds live is physically
+		// impossible for real memory: the logger duplicated this alloc event, or
+		// lost the free that let the address be reused. Both would strand the old
+		// entry and inflate CURRENT by its size forever — so replace it and refund
+		// the stale bytes. This scan must come before claiming a slot: taking a
+		// tombstone that precedes the stale entry would leave both live.
+		for step in 0..PROBE_LIMIT {
+			let idx = slot(ptr, step);
+			let found = PTRS[idx].load(Ordering::Relaxed);
+			if found == ptr {
+				// Counted, not silent: healing hides the duplicated-event anomaly
+				// from CURRENT, so the counter is the only remaining witness that
+				// the meter saw one at all.
+				HEALED.fetch_add(1, Ordering::Relaxed);
+				let stale = SIZES[idx].swap(size, Ordering::AcqRel);
+				CURRENT.fetch_sub(stale, Ordering::Relaxed);
+				return;
+			}
+			if found == 0 {
+				break;
+			}
+		}
 		for step in 0..PROBE_LIMIT {
 			let s = &PTRS[slot(ptr, step)];
 			let found = s.load(Ordering::Relaxed);
@@ -194,15 +229,34 @@ mod meter {
 	pub fn dropped() -> usize {
 		DROPPED.load(Ordering::Relaxed)
 	}
+
+	pub fn healed() -> usize {
+		HEALED.load(Ordering::Relaxed)
+	}
 }
 
 /// Peak extra bytes allocated while `f` ran, on top of what was already live.
 fn measured_peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
 	meter::install();
 	let baseline = CURRENT.load(Ordering::Relaxed);
+	let healed_before = meter::healed();
 	PEAK.store(baseline, Ordering::Relaxed);
 	let out = f();
 	let peak = PEAK.load(Ordering::Relaxed);
+	// By now everything the closure allocated is dead, so CURRENT should sit at
+	// the baseline minus whatever baseline-counted bytes the closure consumed
+	// (typically the moved-in source Vec). A drift far above that is phantom
+	// accounting — a duplicated alloc event or a lost free in the meter — and
+	// this line, read next to the case's own peak line, is what tells a real
+	// overshoot from a metering artifact on the next CI failure. `healed` is the
+	// duplicated-event half's only witness: healing keeps it out of CURRENT.
+	let end = CURRENT.load(Ordering::Relaxed);
+	eprintln!(
+		"  window drift: {} bytes (baseline {baseline}, end {end}, healed {})",
+		end as i64 - baseline as i64,
+		meter::healed() - healed_before
+	);
+	assert_eq!(meter::dropped(), 0, "the live-block table overflowed");
 	(out, peak.saturating_sub(baseline))
 }
 
