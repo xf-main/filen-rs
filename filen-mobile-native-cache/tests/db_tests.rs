@@ -141,6 +141,9 @@ pub async fn test_query_root_invalid_uuid() {
 // Directory children query tests
 #[shared_test_runtime]
 pub async fn test_query_children_empty_directory() {
+	// The "before update — None" assertion below is void inside a live window; see
+	// LIVE_WINDOW_LOCK.
+	let _quiescent = LIVE_WINDOW_LOCK.read().await;
 	let (db, rss) = get_db_resources().await;
 	let test_dir_path: FfiId =
 		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
@@ -369,6 +372,9 @@ pub async fn test_query_children_nonexistent_path() {
 // Item query tests
 #[shared_test_runtime]
 pub async fn test_query_item_file() {
+	// The "before update — None" assertion below is void inside a live window; see
+	// LIVE_WINDOW_LOCK.
+	let _quiescent = LIVE_WINDOW_LOCK.read().await;
 	let (db, rss) = get_db_resources().await;
 
 	let file = rss
@@ -404,6 +410,9 @@ pub async fn test_query_item_file() {
 
 #[shared_test_runtime]
 pub async fn test_query_item_directory() {
+	// The "before update — None" assertion below is void inside a live window; see
+	// LIVE_WINDOW_LOCK.
+	let _quiescent = LIVE_WINDOW_LOCK.read().await;
 	let (db, rss) = get_db_resources().await;
 
 	let dir = rss
@@ -1475,6 +1484,9 @@ pub async fn test_trash_item_empty_directory() {
 
 #[shared_test_runtime]
 pub async fn test_trash_item_already_trashed_file() {
+	// "Should fail since it doesn't exist in our DB" holds only outside a live window,
+	// where the trashed file's row would arrive by itself; see LIVE_WINDOW_LOCK.
+	let _quiescent = LIVE_WINDOW_LOCK.read().await;
 	let (db, rss) = get_db_resources().await;
 
 	// Create and trash a file using the SDK directly first
@@ -3454,6 +3466,9 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 
 #[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_partial_database_state() {
+	// The partial-state count below requires level2's contents to stay unknown, which
+	// only holds outside a live window; see LIVE_WINDOW_LOCK.
+	let _quiescent = LIVE_WINDOW_LOCK.read().await;
 	let (db, rss) = get_db_resources().await;
 
 	// Create nested structure but only update some levels in database
@@ -4016,6 +4031,9 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 
 #[shared_test_runtime]
 pub async fn test_query_path_for_uuid() {
+	// The "before update — None" assertion below is void inside a live window; see
+	// LIVE_WINDOW_LOCK.
+	let _quiescent = LIVE_WINDOW_LOCK.read().await;
 	let (db, rss) = get_db_resources().await;
 	let root_path: FfiId = db.root_uuid().unwrap().to_string().into();
 	let parent_path = root_path.join(rss.dir.name().unwrap());
@@ -6949,14 +6967,36 @@ pub async fn test_a_pre_aborted_signal_stops_before_anything_happens() {
 	tokio::fs::remove_file(&external).await.ok();
 }
 
-/// Serializes the live-path tests within this process. The cache state is a process-wide
-/// singleton, and both pieces of live state these tests exercise are global to it: the ONE
-/// `working_set_listener` slot (a sibling test's `set_working_set_listener` silently replaces
+/// Fences the live window within this process. The cache state is a process-wide singleton,
+/// and `start_live_updates` arms an ACCOUNT-wide drainer on it: every drive event — including
+/// the echoes of sibling tests' own create/upload calls — is upserted into the shared DB
+/// (`live::apply_drive_event_local`) within a few hundred ms of the mutation. Writers are the
+/// live-path tests themselves; besides serializing them against each other (the ONE
+/// `working_set_listener` slot — a sibling's `set_working_set_listener` silently replaces
 /// ours, after which our listener counts nothing and `wait_until_live_is_delivering` panics
-/// with "the socket loop is not live"), and the ONE subscription + drainer that
-/// `stop_live_updates` tears down for everybody. An in-process mutex is the right scope:
-/// sibling CI legs run separate processes on separate cache DBs and do not share this state.
-static TRACKING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// with "the socket loop is not live" — and the ONE subscription + drainer that
+/// `stop_live_updates` tears down for everybody), the write guard keeps the drainer from
+/// running under the readers. Readers are the tests whose assertions require the cache to NOT
+/// yet know a fixture they just created server-side ("before update — None", partial-listing
+/// counts, trash-of-unknown-item errors): inside a live window those rows arrive by
+/// themselves and the assertions are meaningless. Readers run freely alongside each other and
+/// the rest of the suite; they only exclude the live window. An in-process lock is the right
+/// scope: sibling CI legs run separate processes on separate cache DBs and separate accounts
+/// per auth version, so nothing crosses processes except wall-clock slowdown.
+static LIVE_WINDOW_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// Tears the drainer down on drop, as a panic safety net: the write guard is released on
+/// unwind no matter what, and without this a failing live test would leave the account-wide
+/// drainer armed for the rest of the binary — every later `read()` would then pass under a
+/// false invariant, turning one genuine failure into a cascade. Declared after the write
+/// guard in each test so it drops first. `stop_live_updates` is idempotent, so the tests'
+/// own happy-path stops (and the reconnect test's stop/start/stop dance) are unaffected.
+struct LiveWindow(Arc<FilenMobileCacheState>);
+impl Drop for LiveWindow {
+	fn drop(&mut self) {
+		self.0.stop_live_updates();
+	}
+}
 
 /// Counts the "something in your working set moved" signals the cache raises.
 #[derive(Default)]
@@ -7020,8 +7060,9 @@ async fn wait_until_live_is_delivering(rss: &TestResources, listener: &CountingW
 // `native_cache.db`.
 #[shared_test_runtime]
 pub async fn test_live_path_delivers_a_remote_edit_without_being_asked() {
-	let _tracking = TRACKING_TEST_LOCK.lock().await;
+	let _live_window = LIVE_WINDOW_LOCK.write().await;
 	let (db, rss) = get_db_resources().await;
+	let _teardown = LiveWindow(db.clone());
 
 	let file = rss
 		.client
@@ -7126,8 +7167,9 @@ pub async fn test_live_path_delivers_a_remote_edit_without_being_asked() {
 /// retirement would have told every replica the file is gone for good.
 #[shared_test_runtime]
 pub async fn test_a_remote_trash_of_a_held_file_trashes_the_row() {
-	let _tracking = TRACKING_TEST_LOCK.lock().await;
+	let _live_window = LIVE_WINDOW_LOCK.write().await;
 	let (db, rss) = get_db_resources().await;
+	let _teardown = LiveWindow(db.clone());
 
 	let mut file = rss
 		.client
@@ -7224,8 +7266,9 @@ pub async fn test_a_remote_trash_of_a_held_file_trashes_the_row() {
 /// exists, and reporting it deleted would tear the item out from under the OS.
 #[shared_test_runtime]
 pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent() {
-	let _tracking = TRACKING_TEST_LOCK.lock().await;
+	let _live_window = LIVE_WINDOW_LOCK.write().await;
 	let (db, rss) = get_db_resources().await;
+	let _teardown = LiveWindow(db.clone());
 
 	let mut file = rss
 		.client
@@ -7440,8 +7483,9 @@ pub async fn test_relisting_the_trash_drops_a_purged_file() {
 /// report's best-effort probe seeded it.
 #[shared_test_runtime]
 pub async fn test_reconnect_closes_a_socket_gap_by_relisting_containers() {
-	let _live = TRACKING_TEST_LOCK.lock().await;
+	let _live_window = LIVE_WINDOW_LOCK.write().await;
 	let (db, rss) = get_db_resources().await;
+	let _teardown = LiveWindow(db.clone());
 
 	let container = rss
 		.client
