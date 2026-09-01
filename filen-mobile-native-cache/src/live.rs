@@ -395,15 +395,36 @@ async fn reconcile_containers(state: &Arc<RwLock<CacheState>>) -> bool {
 		};
 		auth.working_set_containers()
 	};
+	relist_containers(state, containers.into_iter().map(Uuid::from).collect()).await
+}
+
+/// Re-lists the given containers, concurrency bounded, best-effort per container — one failure
+/// must not abort the rest. Returns whether EVERY container converged, which is what gates the
+/// watermark.
+///
+/// The working-set signal fires PER CONTAINER rather than once at the end. A container is fresh
+/// the moment its own listing lands, and on a full pass the end is thousands of listings away —
+/// on the trace that prompted this, files already sitting in the cache waited 46 seconds behind
+/// containers that had nothing to do with them. Signalling as they land also means a pass torn
+/// down early (the extension is killed far more often than it finishes) has still delivered
+/// everything it managed to list, instead of nothing at all. The extra signals are nearly free:
+/// `notify_if_changed` drops the ones that moved no row, and the platform side coalesces the
+/// rest.
+async fn relist_containers(state: &Arc<RwLock<CacheState>>, containers: Vec<Uuid>) -> bool {
 	let results: Vec<bool> = futures::stream::iter(containers.into_iter().map(|uuid| {
 		let state = state.clone();
 		async move {
-			// The guard is PER CONTAINER, so a queued writer waits for one listing at most.
-			let guard = state.read().await;
-			let AuthStatus::Authenticated(auth) = &guard.status else {
-				return false;
+			let before = change_stamp(&state).await;
+			let converged = {
+				// The guard is PER CONTAINER, so a queued writer waits for one listing at most.
+				let guard = state.read().await;
+				let AuthStatus::Authenticated(auth) = &guard.status else {
+					return false;
+				};
+				auth.refresh_container(uuid).await
 			};
-			auth.refresh_container(Uuid::from(uuid)).await
+			notify_if_changed(&state, before).await;
+			converged
 		}
 	}))
 	.buffer_unordered(CONTAINER_PROBE_CONCURRENCY)
