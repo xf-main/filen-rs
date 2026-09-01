@@ -1147,8 +1147,13 @@ test("authError", async () => {
 		expect(e).toBeInstanceOf(FilenSdkError)
 		expect((e as FilenSdkError).kind).toEqual("Unauthenticated")
 		expect((e as FilenSdkError).toString()).toContain("socket")
-		expect(gotAuthFailedEvent).toBe(true)
 	}
+	// The SDK guarantees the authFailed event is ENQUEUED before the registration
+	// promise rejects — not that the JS listener has already run. The event is
+	// drained by its own main-thread task, and nothing orders that task's poll
+	// ahead of the rejection's, so asserting the flag synchronously in the catch
+	// races the drain (and loses on slow firefox runners). Await it instead.
+	await expect.poll(() => gotAuthFailedEvent, { timeout: 10_000 }).toBe(true)
 })
 
 test("sockets", async () => {
