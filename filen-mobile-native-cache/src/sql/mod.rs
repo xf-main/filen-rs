@@ -605,6 +605,20 @@ pub(crate) fn select_child_by_name(
 		.transpose()
 }
 
+/// Every directory's `last_listed`, keyed by uuid — the stamps a reconcile pass
+/// orders itself by (see [`crate::live`]). One query rather than one per
+/// container: the whole table is a few thousand rows on a large account, and a
+/// pass reads it once.
+pub(crate) fn select_dir_last_listed(
+	conn: &Connection,
+) -> Result<std::collections::HashMap<Uuid, i64>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(statements::SELECT_DIR_LAST_LISTED)?;
+	let rows = stmt.query_map([], |row| {
+		Ok((row.get::<_, Uuid>(0)?, row.get::<_, i64>(1)?))
+	})?;
+	rows.collect()
+}
+
 /// The uuids of the non-trashed child DIRECTORIES of `parent` — the candidates a listing-driven
 /// sweep would cascade through.
 pub(crate) fn select_child_dir_uuids(

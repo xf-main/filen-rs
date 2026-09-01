@@ -19,6 +19,8 @@ pub(crate) const SELECT_ITEM_BY_PARENT_NAME: &str =
 	include_str!("../../sql/select_item_by_parent_name.sql");
 pub(crate) const SELECT_UUID_TYPE_NAME_BY_PARENT: &str =
 	include_str!("../../sql/select_uuid_type_name_by_parent.sql");
+pub(crate) const SELECT_DIR_LAST_LISTED: &str =
+	include_str!("../../sql/select_dir_last_listed.sql");
 pub(crate) const UPDATE_LOCAL_DATA_BY_UUID: &str = include_str!("../../sql/update_local_data.sql");
 pub(crate) const MARK_STALE_WITH_PARENT: &str =
 	include_str!("../../sql/mark_stale_with_parent.sql");

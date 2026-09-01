@@ -576,9 +576,44 @@ async fn reconcile_containers(state: &Arc<RwLock<CacheState>>) -> bool {
 		let AuthStatus::Authenticated(auth) = &guard.status else {
 			return false;
 		};
-		auth.working_set_containers()
+		let containers: Vec<Uuid> = auth
+			.working_set_containers()
+			.into_iter()
+			.map(Uuid::from)
+			.collect();
+		// Stalest first. The pass is thousands of listings long and is routinely killed before
+		// it finishes — the extension is torn down far more often than it runs to completion —
+		// so the order decides what a truncated pass actually accomplished. Unordered, a
+		// container can lose the race every time and stay stale indefinitely while others are
+		// re-listed for the third time.
+		match crate::sql::select_dir_last_listed(&auth.conn()) {
+			Ok(stamps) => stalest_first(&stamps, containers),
+			// Ordering is an optimisation; a pass in an arbitrary order still converges.
+			Err(e) => {
+				tracing::debug!("could not order the pass by staleness: {e}");
+				containers
+			}
+		}
 	};
-	relist_containers(state, containers.into_iter().map(Uuid::from).collect()).await
+	tracing::info!(
+		"re-listing all {} materialized container(s)",
+		containers.len()
+	);
+	relist_containers(state, containers).await
+}
+
+/// Orders containers by how long they have gone unlisted, oldest first.
+///
+/// A container with no stamp sorts first: it has either never been listed, or it is the account
+/// root (roots carry no `last_listed` row of their own), and both are the least safe thing to
+/// leave for a pass that may not finish. Ties keep their relative order, so the result is stable
+/// across passes rather than reshuffling on every reconnect.
+fn stalest_first(
+	stamps: &std::collections::HashMap<Uuid, i64>,
+	mut containers: Vec<Uuid>,
+) -> Vec<Uuid> {
+	containers.sort_by_key(|uuid| stamps.get(uuid).copied().unwrap_or(0));
+	containers
 }
 
 /// Re-lists the given containers, concurrency bounded, best-effort per container — one failure
@@ -1329,6 +1364,41 @@ impl FilenMobileCacheState {
 	pub fn set_working_set_listener(&self, listener: Option<Arc<dyn WorkingSetUpdateListener>>) {
 		let state = self.sync_get_cache_state_borrowed();
 		*lock(&state.working_set_listener) = listener;
+	}
+}
+
+#[cfg(test)]
+mod pass_order_tests {
+	use std::collections::HashMap;
+
+	use filen_types::fs::Uuid;
+
+	use super::stalest_first;
+
+	fn uuid(byte: u8) -> Uuid {
+		Uuid::from_bytes([byte; 16])
+	}
+
+	/// The pass is routinely killed before it finishes, so the order is what a truncated pass
+	/// actually delivered. Oldest-listed first, and anything with no stamp at all — never listed,
+	/// or the account root, which carries no `last_listed` row — ahead of everything.
+	#[test]
+	fn the_pass_walks_the_stalest_containers_first() {
+		let stamps = HashMap::from([(uuid(1), 300), (uuid(2), 100), (uuid(3), 200)]);
+		assert_eq!(
+			stalest_first(&stamps, vec![uuid(1), uuid(2), uuid(3), uuid(4)]),
+			vec![uuid(4), uuid(2), uuid(3), uuid(1)],
+			"unstamped first, then oldest listing to newest"
+		);
+	}
+
+	/// Stable across passes: two containers listed in the same millisecond must not reshuffle on
+	/// every reconnect, or a pass that is always cut short keeps starting somewhere new.
+	#[test]
+	fn ties_keep_their_order() {
+		let stamps = HashMap::from([(uuid(1), 100), (uuid(2), 100), (uuid(3), 100)]);
+		let order = vec![uuid(3), uuid(1), uuid(2)];
+		assert_eq!(stalest_first(&stamps, order.clone()), order);
 	}
 }
 
