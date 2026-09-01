@@ -7619,3 +7619,378 @@ pub async fn test_a_stable_id_relist_still_answers_not_found_for_a_dead_containe
 	// `forget_item` did.
 	assert_eq!(db.query_item_by_uuid(&dir_uuid.to_string()).unwrap(), None);
 }
+
+/// Reads a directory's `last_listed` stamp — the only observable that distinguishes a TARGETED
+/// gap close from the full sweep, since a sweep re-lists every materialized container and a
+/// replay re-lists only the ones its events named.
+fn last_listed(db: &FilenMobileCacheState, uuid: &str) -> i64 {
+	match db.query_item_by_uuid(uuid).unwrap() {
+		Some(FfiObject::Dir(dir)) => dir.last_listed,
+		other => panic!("expected a directory row for {uuid}, got {other:?}"),
+	}
+}
+
+/// Brings the live path up and waits out the full sweep that establishes the event cursor.
+///
+/// Replay cannot close the FIRST gap a cache ever sees: with no cursor there is no lower bound
+/// to page back to, so `gap_check` sweeps every materialized container and stamps the cursor
+/// from before that sweep. Only later gaps are replayable, which is the state these tests are
+/// about, so a test that does not wait for the sweep to finish is testing the fallback.
+///
+/// `witness` is a materialized container the sweep must therefore re-list; its `last_listed`
+/// moving is the only externally visible proof that the pass ran to completion and converged —
+/// and convergence is exactly what stamps the cursor. Waiting on a row DELIVERED instead would
+/// prove nothing: the live socket delivers rows the moment they are created, long before the
+/// pass that is running alongside it has reached anything.
+async fn seed_the_event_cursor(
+	db: &Arc<FilenMobileCacheState>,
+	rss: &TestResources,
+	listener: &CountingWorkingSetListener,
+	witness: &str,
+) {
+	let before = last_listed(db, witness);
+	db.start_live_updates();
+	wait_until_live_is_delivering(rss, listener).await;
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+	while last_listed(db, witness) <= before {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the launch sweep never re-listed the witness container; with no cursor stamped, \
+			 every later gap falls back to the sweep and replay cannot be tested"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+}
+
+/// Waits out the server's own dispatch of whatever was just changed.
+///
+/// An outage measured in milliseconds is not an outage: reconnect that fast and the socket
+/// delivers the mutation live, the applier handles it, and the gap path is never asked anything
+/// — so the test passes while proving nothing about replay. Every one of these tests changes the
+/// drive with the socket down and then reconnects, so every one of them needs this.
+async fn outlast_the_dispatch() {
+	tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+}
+
+/// The point of replaying the event log: a gap closes by re-listing the containers that actually
+/// moved, not every materialized container on the account. The decoy is the assertion — it is
+/// reported materialized and stays untouched through the outage, so the sweep would re-list it
+/// and a replay must not.
+///
+/// Note what this proves about cost. The sweep is `containers x RTT / 4` REGARDLESS of gap size:
+/// the trace that prompted this work re-listed 2,977 containers for a gap of eight events. Here
+/// the decoy standing still is that difference, in miniature.
+#[shared_test_runtime]
+pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() {
+	let _live_window = LIVE_WINDOW_LOCK.write().await;
+	let (db, rss) = get_db_resources().await;
+
+	let target = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "replay_target")
+		.await
+		.unwrap();
+	let decoy = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "replay_decoy")
+		.await
+		.unwrap();
+	let target_uuid = target.uuid().to_string();
+	let decoy_uuid = decoy.uuid().to_string();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path).await.unwrap();
+	db.set_materialized_containers(vec![target_uuid.clone(), decoy_uuid.clone()])
+		.await
+		.unwrap();
+
+	let listener = Arc::new(CountingWorkingSetListener::default());
+	db.set_working_set_listener(Some(listener.clone()));
+	// The decoy doubles as the witness: the sweep that stamps the cursor is the same sweep whose
+	// absence the decoy is about to demonstrate.
+	seed_the_event_cursor(&db, &rss, &listener, &decoy_uuid).await;
+	let decoy_listed_before = last_listed(&db, &decoy_uuid);
+
+	// The outage, and a change in exactly one of the two containers.
+	db.stop_live_updates();
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("replayed.txt", target.uuid())
+				.unwrap(),
+			b"landed while the socket was down",
+		)
+		.await
+		.unwrap();
+	let stable_id = format!("stable/{}", file.stable_uuid());
+	assert_eq!(
+		db.query_item_by_uuid(&stable_id).unwrap(),
+		None,
+		"the socket was down; nothing may have delivered this yet"
+	);
+	outlast_the_dispatch().await;
+
+	db.start_live_updates();
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	let delivered = loop {
+		if let Some(FfiObject::File(f)) = db.query_item_by_uuid(&stable_id).unwrap() {
+			break f;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the gap never closed; neither replay nor the fallback pass delivered the upload"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	};
+	assert_eq!(delivered.parent, target_uuid);
+
+	// The whole claim, in one assertion: the container the events named was re-listed and the
+	// one they did not was left alone. A fallback to the sweep moves this stamp.
+	assert_eq!(
+		last_listed(&db, &decoy_uuid),
+		decoy_listed_before,
+		"replay must re-list only the containers its events named; a moved stamp here means the \
+		 gap fell back to the full sweep"
+	);
+	assert!(
+		last_listed(&db, &target_uuid) > decoy_listed_before,
+		"the container the upload landed in must have been re-listed"
+	);
+
+	db.stop_live_updates();
+	db.set_working_set_listener(None);
+	db.set_materialized_containers(vec![]).await.unwrap();
+	rss.client.delete_file_permanently(file).await.unwrap();
+	rss.client.delete_dir_permanently(target).await.unwrap();
+	rss.client.delete_dir_permanently(decoy).await.unwrap();
+}
+
+/// A move is the case that makes replay's resolution rule non-obvious: the event names the
+/// DESTINATION, but the origin is just as stale — it still shows a file that has left. Resolving
+/// only what the event names would leave the file visible in two places until something unrelated
+/// listed the origin, which for a materialized container is never.
+#[shared_test_runtime]
+pub async fn test_replaying_a_move_relists_both_ends() {
+	let _live_window = LIVE_WINDOW_LOCK.write().await;
+	let (db, rss) = get_db_resources().await;
+
+	let origin = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "move_origin")
+		.await
+		.unwrap();
+	let destination = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "move_destination")
+		.await
+		.unwrap();
+	// Reported materialized and never touched: the sweep would re-list it, a replay must not.
+	let decoy = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "move_decoy")
+		.await
+		.unwrap();
+	let origin_uuid = origin.uuid().to_string();
+	let destination_uuid = destination.uuid().to_string();
+	let decoy_uuid = decoy.uuid().to_string();
+
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("travels.txt", origin.uuid())
+				.unwrap(),
+			b"about to move",
+		)
+		.await
+		.unwrap();
+	let stable_id = format!("stable/{}", file.stable_uuid());
+
+	// Both ends listed, so both rows are held and the origin genuinely holds the file.
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	db.update_dir_children(test_dir_path.join("move_origin"))
+		.await
+		.unwrap();
+	db.update_dir_children(test_dir_path.join("move_destination"))
+		.await
+		.unwrap();
+	db.set_materialized_containers(vec![
+		origin_uuid.clone(),
+		destination_uuid.clone(),
+		decoy_uuid.clone(),
+	])
+	.await
+	.unwrap();
+	assert_eq!(
+		match db.query_item_by_uuid(&stable_id).unwrap() {
+			Some(FfiObject::File(f)) => f.parent,
+			other => panic!("the origin must hold the file before the move, got {other:?}"),
+		},
+		origin_uuid
+	);
+
+	let listener = Arc::new(CountingWorkingSetListener::default());
+	db.set_working_set_listener(Some(listener.clone()));
+	seed_the_event_cursor(&db, &rss, &listener, &origin_uuid).await;
+	let origin_listed_before = last_listed(&db, &origin_uuid);
+	let decoy_listed_before = last_listed(&db, &decoy_uuid);
+
+	// The outage, and the move nobody told us about.
+	db.stop_live_updates();
+	rss.client
+		.move_file(&mut file, &(&destination).into())
+		.await
+		.unwrap();
+	outlast_the_dispatch().await;
+
+	db.start_live_updates();
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	loop {
+		if let Some(FfiObject::File(f)) = db.query_item_by_uuid(&stable_id).unwrap()
+			&& f.parent == destination_uuid
+		{
+			break;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the move never reached the cache"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+
+	// The half a destination-only resolution would miss — and it has to be asserted on
+	// `last_listed`, not on the origin's children. A file keeps its uuid across a move and this
+	// cache holds ONE row per uuid, so re-listing the destination alone already re-parents that
+	// row and the origin's children query stops returning it either way. Only "was the origin
+	// re-listed at all" separates the union rule from a destination-only one.
+	assert!(
+		last_listed(&db, &origin_uuid) > origin_listed_before,
+		"the origin was never re-listed; a resolution that follows only the container the event \
+		 NAMES leaves the origin holding a file that left, which for a materialized container \
+		 nothing else ever heals"
+	);
+	assert_eq!(
+		last_listed(&db, &decoy_uuid),
+		decoy_listed_before,
+		"an untouched container was re-listed, so the gap fell back to the full sweep and this \
+		 test proved nothing about replay"
+	);
+	let origin_path = test_dir_path.join("move_origin");
+	assert!(
+		!db.query_dir_children(&origin_path, None)
+			.unwrap()
+			.expect("the origin container must still be listable")
+			.objects
+			.iter()
+			.any(
+				|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string())
+			),
+		"the origin still presents a file that moved away"
+	);
+
+	db.stop_live_updates();
+	db.set_working_set_listener(None);
+	db.set_materialized_containers(vec![]).await.unwrap();
+	rss.client.delete_file_permanently(file).await.unwrap();
+	rss.client.delete_dir_permanently(origin).await.unwrap();
+	rss.client
+		.delete_dir_permanently(destination)
+		.await
+		.unwrap();
+	rss.client.delete_dir_permanently(decoy).await.unwrap();
+}
+
+/// The listing a trashed row belongs to is the TRASH, and replay has to know that.
+///
+/// Half the event kinds carry no parent of their own — the permanent deletes, favourites,
+/// renames, metadata changes — so the row this cache holds is the only thing that can place
+/// them. A row held trashed is in NO directory listing, so resolving such an event through a
+/// directory parent finds nothing, drops the event, and advances the cursor past it.
+///
+/// Purging from the trash is the case that can only be answered by the trash listing, which is
+/// what makes it worth a live test: no directory re-listing can retire the row, because no
+/// directory contains it. Get this wrong and the cache keeps presenting a file the account no
+/// longer has, until the user happens to open Trash.
+#[shared_test_runtime]
+pub async fn test_replaying_a_purge_from_the_trash_retires_the_row() {
+	let _live_window = LIVE_WINDOW_LOCK.write().await;
+	let (db, rss) = get_db_resources().await;
+
+	let container = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "trash_replay_container")
+		.await
+		.unwrap();
+	let container_uuid = container.uuid().to_string();
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("trashed_then_purged.txt", container.uuid())
+				.unwrap(),
+			b"headed for the trash",
+		)
+		.await
+		.unwrap();
+	let stable_id = format!("stable/{}", file.stable_uuid());
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	db.update_dir_children(test_dir_path.join("trash_replay_container"))
+		.await
+		.unwrap();
+
+	// Trash it, and let the cache learn that through the trash listing — so the row we hold is
+	// parented to the trash, which is the state this test is about.
+	rss.client.trash_file(&mut file).await.unwrap();
+	db.update_trash().await.unwrap();
+	let trashed = match db.query_item_by_uuid(&stable_id).unwrap() {
+		Some(FfiObject::File(f)) => f,
+		other => panic!("the cache must hold the trashed row, got {other:?}"),
+	};
+	assert!(
+		trashed.original_parent.is_some(),
+		"the row must be held TRASHED, or this test proves nothing"
+	);
+
+	db.set_materialized_containers(vec![container_uuid.clone()])
+		.await
+		.unwrap();
+	let listener = Arc::new(CountingWorkingSetListener::default());
+	db.set_working_set_listener(Some(listener.clone()));
+	seed_the_event_cursor(&db, &rss, &listener, &container_uuid).await;
+
+	// The outage, and the purge. `deleteFilePermanently` carries the lineage but no parent, and
+	// the row it names sits in the trash — so the trash listing is the only thing that can
+	// answer for it.
+	db.stop_live_updates();
+	rss.client.delete_file_permanently(file).await.unwrap();
+	// Nothing may have retired the row yet, or the assertion below would pass without the gap
+	// path doing anything at all.
+	assert!(
+		db.query_item_by_uuid(&stable_id).unwrap().is_some(),
+		"the purge was reconciled before the reconnect; this test would prove nothing"
+	);
+	outlast_the_dispatch().await;
+
+	db.start_live_updates();
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	while db.query_item_by_uuid(&stable_id).unwrap().is_some() {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the purged lineage is still in the cache; the event resolved to no listing, so \
+			 nothing ever reconciled the trash"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+
+	db.stop_live_updates();
+	db.set_working_set_listener(None);
+	db.set_materialized_containers(vec![]).await.unwrap();
+	rss.client.delete_dir_permanently(container).await.unwrap();
+}
