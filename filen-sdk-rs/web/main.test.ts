@@ -56,6 +56,35 @@ const listenerHandles: ListenerHandle[] = []
 // let _shareTestDir: Dir
 const listenerErrors: Error[] = []
 
+// Random-suffixed like the native suites' `rs-<random>` dirs. A fixed name let any
+// other invocation of this suite — a local wasm-test.sh, a concurrent run — find and
+// permanently delete the live run's parent dir mid-run, which once took out the whole
+// tail of a nightly. Stale leftovers are swept by age in beforeAll instead.
+const testDirName = `wasm-test-dir-${Array.from(crypto.getRandomValues(new Uint8Array(6)), b =>
+	b.toString(16).padStart(2, "0")
+).join("")}`
+
+/// The suite-wide capture: correctness checks on every event, plus a black box for the
+/// shared account — if something server-side trashes, deletes or moves the suite's
+/// parent dir mid-run, the wire event is the only witness that can name the actor's
+/// change before unrelated tests start failing on cannot_create_in_this_folder.
+function suiteListener(event: SocketEvent) {
+	if (!assertNoMaps(event)) {
+		listenerErrors.push(new Error("Socket event contained a Map", { cause: event }))
+	}
+	allEvents.push(event)
+	if (testDir && event.type === "drive") {
+		const inner = event.inner
+		const itemUuid = "uuid" in inner ? inner.uuid : "dir" in inner ? inner.dir.uuid : undefined
+		const hitsTestDir =
+			itemUuid === testDir.uuid &&
+			(inner.type === "folderMove" || inner.type === "folderTrash" || inner.type === "folderDeletedPermanent")
+		if (hitsTestDir || inner.type === "trashEmpty" || inner.type === "deleteAll") {
+			console.error(`suite fixture at risk, ${inner.type} event:`, JSON.stringify(event, jsonBigIntReplacer))
+		}
+	}
+}
+
 function assertNoMaps(value: unknown): boolean {
 	if (value instanceof Map) {
 		return false
@@ -87,24 +116,34 @@ beforeAll(async () => {
 			})
 
 			console.log("logged in, setting up socket listener")
-			listenerHandles.push(
-				await state.addEventListener((event: SocketEvent) => {
-					if (!assertNoMaps(event)) {
-						listenerErrors.push(new Error("Socket event contained a Map", { cause: event }))
-					}
-					allEvents.push(event)
-				}, null)
-			)
+			listenerHandles.push(await state.addEventListener(suiteListener, null))
 
-			const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
-			if (maybeDir) {
-				if (maybeDir.type === "normalDir") {
-					await state.deleteDirPermanently(maybeDir)
-				} else {
-					throw new Error("Expected testDir to be a Dir, but it was a File")
-				}
-			}
-			testDir = await state.createDir(state.root(), "wasm-test-dir")
+			// Sweep stale fixtures by age, never by exact name: a leftover older than the
+			// cutoff is a dead run's debris, while anything younger may be a run that is
+			// live right now — deleting it would recreate the mid-run cascade the random
+			// suffix exists to prevent. The prefix match also picks up the fixed-name
+			// "wasm-test-dir" that older revisions of this suite left behind.
+			const listing = await state.listDir(state.root())
+			const cutoff = BigInt(Date.now() - 6 * 60 * 60 * 1000)
+			await Promise.all(
+				listing.dirs
+					.filter(dir => {
+						const meta = getDirMeta(dir.meta)
+						return (
+							meta !== null &&
+							/^wasm-test-dir(-|$)/.test(meta.name) &&
+							meta.created !== undefined &&
+							meta.created < cutoff
+						)
+					})
+					.map(dir =>
+						// Best-effort, like test-utils' cleanup: one transient failure on a
+						// stale leftover must not reject beforeAll and take the whole file
+						// down — a worse blast radius than the leak it was sweeping.
+						state.deleteDirPermanently(dir).catch(e => console.warn("stale fixture sweep failed", dir.uuid, e))
+					)
+			)
+			testDir = await state.createDir(state.root(), testDirName)
 		})(),
 		(async () => {
 			if (!import.meta.env.VITE_TEST_SHARE_EMAIL) {
@@ -1161,6 +1200,7 @@ test("sockets", async () => {
 	for (const handle of listenerHandles) {
 		handle.free()
 	}
+	listenerHandles.length = 0
 	expect(await state.isSocketConnected()).toBe(false)
 	{
 		/* eslint-disable @typescript-eslint/no-unused-vars */
@@ -1168,6 +1208,9 @@ test("sockets", async () => {
 		expect(await state.isSocketConnected()).toBe(true)
 	}
 	expect(await state.isSocketConnected()).toBe(false)
+	// Re-arm the suite-wide capture freed above: without it the run is blind to
+	// exactly the kind of external mutation of testDir this suite once suffered.
+	listenerHandles.push(await state.addEventListener(suiteListener, null))
 })
 
 test("listLinkedItems", async () => {
@@ -1613,21 +1656,21 @@ test("getItemPath", async () => {
 
 	// Test nested dir: path ends with "/" and includes ancestors + own name
 	const dirResult = await state.getItemPath(childDir)
-	expect(dirResult.path).toBe("wasm-test-dir/path-parent/path-child/")
+	expect(dirResult.path).toBe(`${testDirName}/path-parent/path-child/`)
 	expect(dirResult.ancestors).toBeInstanceOf(Array)
 	expect(dirResult.ancestors.length).toBe(2)
 	expect(getDirMeta(dirResult.ancestors[1].meta)?.name).toBe("path-parent")
 
 	// Test nested file: path does NOT end with "/" and includes ancestors + own name
 	const fileResult = await state.getItemPath(childFile)
-	expect(fileResult.path).toBe("wasm-test-dir/path-parent/path-file.txt")
+	expect(fileResult.path).toBe(`${testDirName}/path-parent/path-file.txt`)
 	expect(fileResult.ancestors).toBeInstanceOf(Array)
 	expect(fileResult.ancestors.length).toBe(2)
 	expect(getDirMeta(fileResult.ancestors[1].meta)?.name).toBe("path-parent")
 
 	// Test item directly under root:
 	const topLevelDirResult = await state.getItemPath(testDir)
-	expect(topLevelDirResult.path).toBe("wasm-test-dir/")
+	expect(topLevelDirResult.path).toBe(`${testDirName}/`)
 	expect(topLevelDirResult.ancestors.length).toBe(0)
 })
 
