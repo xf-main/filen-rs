@@ -26,11 +26,14 @@
 
 use std::{
 	borrow::Cow,
+	collections::HashSet,
 	sync::{
 		Arc, Mutex, Weak,
 		atomic::{AtomicBool, Ordering},
 	},
 };
+
+use chrono::{DateTime, Utc};
 
 use filen_sdk_rs::{
 	fs::{
@@ -55,6 +58,7 @@ use tokio::sync::{
 use crate::{
 	CacheError,
 	auth::{AuthCacheState, AuthStatus, CacheState, FilenMobileCacheState},
+	replay::{self, ReplayOutcome},
 	sql::{
 		dir::DBDir, error::OptionalExtensionSQL, file::DBFile, item::RawDBItem, object::DBObject,
 	},
@@ -238,7 +242,14 @@ async fn drain_live_events(
 			} => {
 				tracing::warn!("deleteAll received; reconciling every materialized container");
 				let before = change_stamp(&state).await;
-				reconcile_pass(&state, drive_message_id).await;
+				// Stamped from before the pass, and only over a pass that converged — the same
+				// rule `gap_check` follows. Without it the cursor still points behind this
+				// deleteAll, and the next gap's replay walks back across an event it must
+				// refuse, spending a whole log walk to reach the pass it could have started with.
+				let started = replay::pass_cursor(Utc::now());
+				if reconcile_pass(&state, drive_message_id).await {
+					advance_events_cursor(&state, started).await;
+				}
 				notify_if_changed(&state, before).await;
 			}
 			DecryptedSocketEvent::Drive {
@@ -307,7 +318,7 @@ async fn drain_live_events(
 /// records the debt, because the watermark alone cannot hold a retry open (the next event
 /// advances it past the gap).
 async fn gap_check(state: &Arc<RwLock<CacheState>>) {
-	let (client, watermark, owed) = {
+	let (client, watermark, owed, cursor) = {
 		let guard = state.read().await;
 		let AuthStatus::Authenticated(auth) = &guard.status else {
 			return;
@@ -316,6 +327,7 @@ async fn gap_check(state: &Arc<RwLock<CacheState>>) {
 			auth.client.clone(),
 			auth.drive_watermark(),
 			auth.pending_reconcile() > 0,
+			auth.events_cursor(),
 		)
 	};
 	// NO state guard across the round trip (the module's lock discipline).
@@ -329,14 +341,182 @@ async fn gap_check(state: &Arc<RwLock<CacheState>>) {
 	if !pass_owed(owed, watermark, remote) {
 		return;
 	}
-	tracing::info!(
-		"drive event gap (local {watermark:?}, remote {remote}, owed {owed}); re-listing \
-		 materialized containers"
-	);
+	// Says what was found, NOT what will be done about it — which is decided below, and was
+	// worth splitting apart: this line used to promise a full re-list before anything had
+	// chosen one, so a log could show a sweep that never happened.
+	tracing::info!("drive event gap (local {watermark:?}, remote {remote}, owed {owed})");
 	// A pass that wrote no row has nothing for the replica to diff (see `notify_if_changed`).
 	let before = change_stamp(state).await;
-	reconcile_pass(state, remote).await;
+	// The event log can usually say WHICH containers moved, turning a ~3,000-listing sweep into
+	// one or two. It refuses rather than guesses (see [`crate::replay`]), and a refusal — or a
+	// targeted pass that failed to converge — leaves the full pass exactly as it was.
+	// Leans BEHIND the local clock on purpose — see [`replay::pass_cursor`]; this value is read
+	// back against server timestamps, and the two clocks are not the same clock.
+	let started = replay::pass_cursor(Utc::now());
+	// Whether the log may answer this gap at all is [`replay::replay_allowed`]'s to decide — a
+	// pure predicate precisely because the debt rule it encodes is one careless reordering away
+	// from reintroducing the stale-forever bug, and a predicate can be unit-tested where this
+	// `if` cannot.
+	let replayed = match cursor {
+		Some(cursor) if replay::replay_allowed(owed, Some(cursor)) => {
+			close_gap_by_replay(state, &client, remote, cursor).await
+		}
+		// Each refusal says so. Silence here is what made a correct first-run sweep look like a
+		// broken feature: the decision left no trace at all, so the only way to tell which path
+		// had run was to read the source.
+		Some(_) => {
+			tracing::info!("a reconcile pass is owed, so the log cannot answer this gap");
+			false
+		}
+		None => {
+			tracing::info!(
+				"no event cursor yet, so this gap has no lower bound to replay from; the pass \
+				 below stamps one and the next gap can use the log"
+			);
+			false
+		}
+	};
+	if !replayed {
+		// The cursor may only move over a pass that actually converged: it says "everything
+		// before this is accounted for", and a partial pass has not accounted for it. Stamped
+		// from BEFORE the pass, not after, so events that landed while it ran are re-covered
+		// rather than skipped — re-listing a container is idempotent.
+		if reconcile_pass(state, remote).await {
+			advance_events_cursor(state, started).await;
+		}
+	}
 	notify_if_changed(state, before).await;
+}
+
+/// Tries to close the gap from the event log. `false` means the caller must run the full pass —
+/// no cursor yet, an event replay could not attribute, paging that could not reach the cursor,
+/// or a targeted re-list that did not converge.
+async fn close_gap_by_replay(
+	state: &Arc<RwLock<CacheState>>,
+	client: &filen_sdk_rs::auth::Client,
+	remote: u64,
+	cursor: DateTime<Utc>,
+) -> bool {
+	let (containers, relist_trash, next) = match attempt_replay(state, client, cursor).await {
+		ReplayOutcome::Fallback => return false,
+		ReplayOutcome::Targeted {
+			containers,
+			relist_trash,
+			cursor,
+		} => (containers, relist_trash, cursor),
+	};
+	tracing::info!(
+		"replaying the gap from the event log: {} container(s) to re-list{}",
+		containers.len(),
+		if relist_trash { " plus the trash" } else { "" }
+	);
+	if relist_trash {
+		let guard = state.read().await;
+		let AuthStatus::Authenticated(auth) = &guard.status else {
+			return false;
+		};
+		if let Err(e) = auth.update_trash().await {
+			tracing::warn!("replay could not re-list the trash: {e}");
+			return false;
+		}
+	}
+	if !relist_containers(state, containers.into_iter().collect()).await {
+		return false;
+	}
+	// Only now: a cursor advanced over a container that did not converge would leave it stale
+	// with nothing owed, which is the stale-forever bug this whole path exists to remove.
+	advance_events_cursor(state, next).await;
+	// This gap is as closed as a pass closes it, and has to be recorded as such. Without it the
+	// watermark sits behind the counter forever: `pass_owed` stays true, the cheap "nothing
+	// happened" return is dead, and every reconnect replays a gap that is no longer there.
+	advance_watermark(state, remote).await;
+	true
+}
+
+/// Pages the event feed back to `cursor`, folding each page into the container set it implies.
+///
+/// The loop's own termination is the truncation check: `v3/user/events` is cursored by a
+/// seconds-resolution timestamp, so a second holding more events than one page cannot be paged
+/// through — asking again just returns the same page. A page that contributes no new event id
+/// is exactly that, and falls back rather than silently skipping the remainder of the second.
+async fn attempt_replay(
+	state: &Arc<RwLock<CacheState>>,
+	client: &filen_sdk_rs::auth::Client,
+	cursor: DateTime<Utc>,
+) -> ReplayOutcome {
+	let mut containers: HashSet<Uuid> = HashSet::new();
+	let mut relist_trash = false;
+	let mut seen: HashSet<u64> = HashSet::new();
+	let mut newest: Option<DateTime<Utc>> = None;
+	let mut cutoff = replay::first_cutoff(Utc::now());
+
+	for page_number in 0.. {
+		if replay::page_budget_exhausted(page_number) {
+			tracing::info!("event replay exceeded its page budget; a full pass is cheaper");
+			return ReplayOutcome::Fallback;
+		}
+		let page = match client.get_user_events(None, Some(cutoff)).await {
+			Ok(page) => page,
+			Err(e) => {
+				tracing::info!("event replay could not read the log: {e}");
+				return ReplayOutcome::Fallback;
+			}
+		};
+		let mut decoded = Vec::with_capacity(page.len());
+		for result in page {
+			match result {
+				Ok(event) => decoded.push(event),
+				// An event we cannot read may be a mutation we cannot see. The pass can.
+				Err(e) => {
+					tracing::info!("event replay hit an undecodable event ({e}); full pass");
+					return ReplayOutcome::Fallback;
+				}
+			}
+		}
+		// The feed ran out before reaching the cursor: the gap is older than what the log keeps.
+		if decoded.is_empty() {
+			tracing::info!("event log is exhausted before the cursor; full pass");
+			return ReplayOutcome::Fallback;
+		}
+		if !replay::made_progress(&mut seen, &decoded) {
+			tracing::info!(
+				"event log page made no progress (a second exceeds one page); full pass"
+			);
+			return ReplayOutcome::Fallback;
+		}
+		{
+			let guard = state.read().await;
+			let AuthStatus::Authenticated(auth) = &guard.status else {
+				return ReplayOutcome::Fallback;
+			};
+			if !replay::fold_targets(
+				&auth.conn(),
+				&decoded,
+				cursor,
+				&mut containers,
+				&mut relist_trash,
+			) {
+				return ReplayOutcome::Fallback;
+			}
+		}
+		newest = newest.max(replay::newest(&decoded));
+		let Some(next) = replay::next_cutoff(&decoded) else {
+			return ReplayOutcome::Fallback;
+		};
+		if replay::reached(next, cursor) {
+			break;
+		}
+		cutoff = next;
+	}
+
+	match newest {
+		Some(cursor) => ReplayOutcome::Targeted {
+			containers,
+			relist_trash,
+			cursor,
+		},
+		None => ReplayOutcome::Fallback,
+	}
 }
 
 /// The gap gate: a pass runs when the remote counter has moved past our watermark, and ALSO
@@ -351,22 +531,25 @@ fn pass_owed(owed: bool, watermark: Option<u64>, remote: u64) -> bool {
 /// One reconcile pass and the durable bookkeeping it owes: the watermark advances to `id` and
 /// the pending flag clears only when EVERY container converged. A partial pass leaves the
 /// watermark where it was AND records the debt, which is what makes the retry survive the later
-/// events that carry the watermark past `id`.
-async fn reconcile_pass(state: &Arc<RwLock<CacheState>>, id: u64) {
+/// events that carry the watermark past `id`. Returns whether it converged — the caller's cue
+/// for whether anything downstream of the pass may be recorded as accounted for.
+async fn reconcile_pass(state: &Arc<RwLock<CacheState>>, id: u64) -> bool {
 	// Read BEFORE the container set is, so a report landing mid-pass fails the compare-and-clear
 	// below instead of being cleared by a pass that never listed it.
 	let owed = {
 		let guard = state.read().await;
 		let AuthStatus::Authenticated(auth) = &guard.status else {
-			return;
+			return false;
 		};
 		auth.pending_reconcile()
 	};
 	if reconcile_containers(state).await {
 		advance_watermark(state, id).await;
 		clear_pending_reconcile(state, owed).await;
+		true
 	} else {
 		mark_pending_reconcile(state).await;
+		false
 	}
 }
 
@@ -400,16 +583,15 @@ async fn reconcile_containers(state: &Arc<RwLock<CacheState>>) -> bool {
 
 /// Re-lists the given containers, concurrency bounded, best-effort per container — one failure
 /// must not abort the rest. Returns whether EVERY container converged, which is what gates the
-/// watermark.
+/// watermark and the event cursor.
 ///
 /// The working-set signal fires PER CONTAINER rather than once at the end. A container is fresh
 /// the moment its own listing lands, and on a full pass the end is thousands of listings away —
-/// on the trace that prompted this, files already sitting in the cache waited 46 seconds behind
-/// containers that had nothing to do with them. Signalling as they land also means a pass torn
-/// down early (the extension is killed far more often than it finishes) has still delivered
-/// everything it managed to list, instead of nothing at all. The extra signals are nearly free:
-/// `notify_if_changed` drops the ones that moved no row, and the platform side coalesces the
-/// rest.
+/// on the trace that prompted this, 46 seconds of already-cached rows sat undelivered behind the
+/// last of them. Signalling as they land also means a pass torn down early (the extension is
+/// killed far more often than it finishes) has still delivered everything it managed to list.
+/// The extra signals are nearly free: `notify_if_changed` drops the ones that moved no row, and
+/// the platform side coalesces what is left.
 async fn relist_containers(state: &Arc<RwLock<CacheState>>, containers: Vec<Uuid>) -> bool {
 	let results: Vec<bool> = futures::stream::iter(containers.into_iter().map(|uuid| {
 		let state = state.clone();
@@ -431,6 +613,13 @@ async fn relist_containers(state: &Arc<RwLock<CacheState>>, containers: Vec<Uuid
 	.collect()
 	.await;
 	results.into_iter().all(|converged| converged)
+}
+
+async fn advance_events_cursor(state: &Arc<RwLock<CacheState>>, at: DateTime<Utc>) {
+	let guard = state.read().await;
+	if let AuthStatus::Authenticated(auth) = &guard.status {
+		auth.advance_events_cursor(at).await;
+	}
 }
 
 async fn advance_watermark(state: &Arc<RwLock<CacheState>>, id: u64) {
@@ -820,6 +1009,33 @@ impl AuthCacheState {
 
 	pub(crate) fn drive_watermark(&self) -> Option<u64> {
 		*lock(&self.drive_watermark)
+	}
+
+	/// The newest event-log second this cache has replayed (see
+	/// [`crate::auth::SavedDBState::events_cursor`]). `None` means replay has never run and the
+	/// next gap must be closed by a full pass.
+	pub(crate) fn events_cursor(&self) -> Option<DateTime<Utc>> {
+		lock(&self.events_cursor).and_then(|secs| DateTime::from_timestamp(secs, 0))
+	}
+
+	/// Advances the event cursor (monotonic; an older stamp is a no-op) and mirrors it to
+	/// `db_state.json`. Called only after the containers the replay named have converged.
+	pub(crate) async fn advance_events_cursor(&self, at: DateTime<Utc>) {
+		let secs = at.timestamp();
+		{
+			let mut cursor = lock(&self.events_cursor);
+			if cursor.is_some_and(|current| current >= secs) {
+				return;
+			}
+			*cursor = Some(secs);
+		}
+		if let Err(e) = crate::auth::update_saved_db_state(&self.cache_state_file, move |state| {
+			state.events_cursor = Some(state.events_cursor.unwrap_or(i64::MIN).max(secs));
+		})
+		.await
+		{
+			tracing::warn!("failed to persist the event cursor: {e}");
+		}
 	}
 
 	/// Advances the drive watermark to `id` (monotonic; a lower id is a no-op) and mirrors it to

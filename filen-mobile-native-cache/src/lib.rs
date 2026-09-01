@@ -14,5 +14,6 @@ pub mod auth;
 pub(crate) mod live;
 pub mod local;
 pub mod remote;
+pub(crate) mod replay;
 pub mod thumbnail;
 pub mod traits;

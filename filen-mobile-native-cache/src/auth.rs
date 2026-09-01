@@ -83,6 +83,8 @@ pub struct AuthCacheState {
 	pub(crate) materialized_containers: RwLock<std::collections::HashSet<Uuid>>,
 	/// See [`SavedDBState::drive_watermark`]; this is the live copy, persisted on advance.
 	pub(crate) drive_watermark: Mutex<Option<u64>>,
+	/// See [`SavedDBState::events_cursor`]; this is the live copy, persisted on advance.
+	pub(crate) events_cursor: Mutex<Option<i64>>,
 	/// See [`SavedDBState::pending_reconcile`]; this is the live copy, persisted on change.
 	/// A COUNTER rather than a flag: zero means nothing is owed, and every mark bumps it, so a
 	/// pass can only clear the debt it actually saw (compare-and-clear). A report landing while
@@ -198,6 +200,13 @@ pub(crate) struct SavedDBState {
 	/// `needs_resync`, and for the same reason.
 	#[serde(default)]
 	pub(crate) pending_reconcile: Option<bool>,
+	/// The newest `v3/user/events` second this cache has replayed, in whole seconds — the feed
+	/// carries no finer resolution. Resumed from INCLUSIVELY: the newest second may still have
+	/// been gaining events when it was read, and re-listing a container twice costs one
+	/// listing, where missing one costs freshness until the container is next browsed.
+	/// `None` means replay has never run, and the gap can only be closed by a full pass.
+	#[serde(default)]
+	pub(crate) events_cursor: Option<i64>,
 }
 
 impl Default for SavedDBState {
@@ -210,6 +219,7 @@ impl Default for SavedDBState {
 			materialized_containers: None,
 			drive_watermark: None,
 			pending_reconcile: None,
+			events_cursor: None,
 		}
 	}
 }
@@ -913,6 +923,7 @@ impl AuthCacheState {
 					.unwrap_or_default(),
 			),
 			drive_watermark: Mutex::new(state.as_ref().and_then(|s| s.drive_watermark)),
+			events_cursor: Mutex::new(state.as_ref().and_then(|s| s.events_cursor)),
 			pending_reconcile: std::sync::atomic::AtomicU64::new(
 				state
 					.as_ref()
@@ -971,6 +982,7 @@ impl AuthCacheState {
 			live: Default::default(),
 			materialized_containers: RwLock::new(Default::default()),
 			drive_watermark: Mutex::new(None),
+			events_cursor: Mutex::new(None),
 			pending_reconcile: std::sync::atomic::AtomicU64::new(0),
 			listing_barrier: tokio::sync::RwLock::new(()),
 			file_locks: crate::file_locks::FileLocks::default(),
