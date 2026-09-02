@@ -21,7 +21,12 @@ pub const ENDPOINT: &str = "v3/user/events";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub filter: Cow<'a, str>,
-	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	/// The page cutoff, in whole SECONDS: the server answers with the newest page (~100
+	/// events) whose timestamps are strictly before this second. It compares in seconds —
+	/// sent in millis, like every other timestamp on the wire, the cutoff exceeds every event
+	/// and each page request returns the same newest page (pinned live by
+	/// `user_tests::events_page_back_by_timestamp`).
+	#[serde(with = "crate::serde::time::seconds")]
 	pub timestamp: DateTime<Utc>,
 }
 
@@ -415,6 +420,21 @@ pub struct ItemFavoriteInfo<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The cutoff is the one timestamp this crate sends that the server COMPARES rather than
+	/// stores, and it compares in seconds. Millis here paged nothing: every request answered
+	/// with the newest page.
+	#[test]
+	fn request_cutoff_is_sent_in_whole_seconds() {
+		let request = Request {
+			filter: Cow::Borrowed("all"),
+			timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+		};
+		assert_eq!(
+			serde_json::to_string(&request).unwrap(),
+			r#"{"filter":"all","timestamp":1700000000}"#
+		);
+	}
 
 	fn login_event_json(id: u64) -> String {
 		format!(

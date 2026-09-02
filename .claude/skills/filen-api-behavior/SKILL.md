@@ -79,3 +79,24 @@ Passing the link uuid to `remove` returns `public_link_not_found`. This is why
 
 Note the asymmetry: **file** link removal genuinely needs the link uuid + salt, because it
 goes through `file/link/edit` with a Disable action rather than a dedicated endpoint.
+
+---
+
+## 4. `v3/user/events` pages by a whole-seconds cutoff, strictly less-than
+
+`v3/user/events` takes `{ filter, timestamp }` and returns the newest page (~100 events)
+whose timestamps are **strictly before** `timestamp`, which the server compares in
+**seconds** (`filen-sdk-ts` sends `Math.floor(Date.now() / 1000) + 60`). Sent in millis —
+the scale every other timestamp on the wire uses — the cutoff exceeds every event and each
+request answers with the same newest page: paging silently never advances. Confirmed live
+2026-09-02 with paired calls (a millis cutoff at page 1's oldest second returned page 1
+again; the same value in seconds returned 101 strictly older events).
+
+- The request type therefore serializes its cutoff with `crate::serde::time::seconds`,
+  not the `seconds_or_millis` every other wire timestamp uses; pinned by
+  `user_tests::events_page_back_by_timestamp`.
+- Paging backwards means asking again with **one second past** the oldest second seen — the
+  boundary second may have been split by the page, and the exclusive cutoff would otherwise
+  drop the rest of it. A second holding more events than one page cannot be paged through
+  at all; `filen-mobile-native-cache/src/replay.rs` detects that as a page that adds no new
+  event id and falls back to a full pass.

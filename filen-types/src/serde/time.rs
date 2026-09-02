@@ -220,10 +220,37 @@ pub mod seconds_or_millis {
 	}
 }
 
+/// Whole SECONDS on the wire, for the request fields the backend compares in seconds.
+///
+/// Everything else this crate sends is millis, and the backend tolerates either scale where
+/// it merely stores a value — but a field it COMPARES is read in one scale only.
+/// `v3/user/events` pages by its `timestamp` in seconds: sent in millis the cutoff is an
+/// unbounded upper bound, so every page request answers with the same newest page and paging
+/// silently never advances. Deserialization stays the tolerant [`seconds_or_millis`], so a
+/// value in either scale reads back.
+pub mod seconds {
+	use chrono::{DateTime, Utc};
+	use serde::{Deserializer, Serializer};
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		super::seconds_or_millis::deserialize(deserializer)
+	}
+
+	pub fn serialize<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		serializer.serialize_i64(value.timestamp())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use chrono::{DateTime, Utc};
-	use serde::Deserialize;
+	use serde::{Deserialize, Serialize};
 
 	use super::seconds_or_millis::from_seconds_or_millis;
 
@@ -231,6 +258,27 @@ mod tests {
 	struct Strict {
 		#[serde(with = "super::seconds_or_millis")]
 		t: DateTime<Utc>,
+	}
+
+	#[derive(Serialize, Deserialize)]
+	struct Seconds {
+		#[serde(with = "super::seconds")]
+		t: DateTime<Utc>,
+	}
+
+	/// The one scale the backend compares in. A millis value here is not "a bit off", it is
+	/// larger than every timestamp the server will ever compare it against.
+	#[test]
+	fn seconds_serializes_whole_seconds_and_reads_either_scale() {
+		let t = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+		assert_eq!(
+			serde_json::to_string(&Seconds { t }).unwrap(),
+			r#"{"t":1700000000}"#
+		);
+		let from_secs: Seconds = serde_json::from_str(r#"{"t":1700000000}"#).unwrap();
+		assert_eq!(from_secs.t, t);
+		let from_millis: Seconds = serde_json::from_str(r#"{"t":1700000000000}"#).unwrap();
+		assert_eq!(from_millis.t, t);
 	}
 
 	#[derive(Deserialize)]

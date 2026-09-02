@@ -32,13 +32,14 @@
 //!
 //! ## Paging without a sub-second cursor
 //!
-//! `v3/user/events` takes one seconds-resolution `timestamp` and returns the events at or
-//! before it, so paging backwards means re-asking with the oldest timestamp seen. A second
-//! holding more events than one page therefore cannot be paged through: asking again returns
-//! the same page. That is detected rather than assumed — a page contributing no new event id
-//! is no progress, and no progress falls back. The cursor is a whole SECOND and the range is
-//! re-applied inclusively, which needs no id bookkeeping because re-listing a container is
-//! idempotent.
+//! `v3/user/events` takes one whole-seconds `timestamp` and returns the newest page of events
+//! strictly BEFORE that second, so paging backwards means re-asking with one second past the
+//! oldest second seen — the boundary second is fetched again in full, because a page may have
+//! split it. A second holding more events than one page therefore cannot be paged through:
+//! asking again returns the same page. That is detected rather than assumed — a page
+//! contributing no new event id is no progress, and no progress falls back. The cursor is a
+//! whole SECOND and the range is re-applied inclusively, which needs no id bookkeeping because
+//! re-listing a container is idempotent.
 
 use std::collections::HashSet;
 
@@ -302,10 +303,16 @@ pub(crate) fn made_progress(seen: &mut HashSet<u64>, page: &[DecryptedUserEvent]
 	fresh
 }
 
-/// The cutoff for the next page: the oldest second this page reached. Returns `None` for an
-/// empty page (the feed is exhausted).
+/// The cutoff for the next page: one second past the oldest second this page reached. The feed
+/// answers strictly BEFORE the cutoff, and a page may have split its oldest second, so the next
+/// page has to ask for that second again in full — the events already seen come back with it,
+/// which is free, and a second holding more than a page repeats and is caught by
+/// [`made_progress`]. Returns `None` for an empty page (the feed is exhausted).
 pub(crate) fn next_cutoff(page: &[DecryptedUserEvent]) -> Option<DateTime<Utc>> {
-	page.iter().map(|event| event.timestamp).min()
+	page.iter()
+		.map(|event| event.timestamp)
+		.min()
+		.map(|oldest| oldest + chrono::TimeDelta::seconds(1))
 }
 
 /// The newest second the walk covered — the cursor to resume from. Inclusive on purpose: the
@@ -336,7 +343,10 @@ pub(crate) fn pass_cursor(now: DateTime<Utc>) -> DateTime<Utc> {
 	now - SKEW
 }
 
-/// Whether the walk has reached the cursor and can stop.
+/// Whether the walk has reached the cursor and can stop. `cutoff` is the NEXT page's cutoff
+/// ([`next_cutoff`], one past the oldest second seen), so this holds once a page reached a
+/// second strictly older than the cursor's — which is the only proof that the cursor's own
+/// second came back whole rather than split across a page boundary.
 pub(crate) fn reached(cutoff: DateTime<Utc>, cursor: DateTime<Utc>) -> bool {
 	cutoff <= cursor
 }
@@ -650,6 +660,35 @@ mod tests {
 		assert!(
 			!made_progress(&mut seen, &page),
 			"the same page again means the cutoff cannot go lower"
+		);
+	}
+
+	/// The feed answers strictly BEFORE the cutoff, and a page can end partway through a
+	/// second. Asking next for exactly the oldest second seen would skip the rest of it, so the
+	/// next cutoff is one second past it — and the walk may only stop once a page reached a
+	/// second strictly older than the cursor's, which is when the cursor second is known whole.
+	#[test]
+	fn the_next_cutoff_refetches_the_boundary_second() {
+		let oldest = when();
+		let at = |seconds_after: i64| DecryptedUserEvent {
+			timestamp: oldest + chrono::TimeDelta::seconds(seconds_after),
+			..event(DecryptedUserEventKind::Login(base_info()))
+		};
+		let page = [at(5), at(0), at(2)];
+		let next = next_cutoff(&page).expect("a non-empty page has a next cutoff");
+		assert_eq!(next, oldest + chrono::TimeDelta::seconds(1));
+		assert!(
+			!reached(next, oldest),
+			"a page whose oldest second IS the cursor second may have split it; ask once more"
+		);
+		assert!(
+			reached(next, oldest + chrono::TimeDelta::seconds(1)),
+			"a page reaching strictly past the cursor second has fetched that second whole"
+		);
+		assert_eq!(
+			next_cutoff(&[]),
+			None,
+			"an empty page is the end of the feed"
 		);
 	}
 

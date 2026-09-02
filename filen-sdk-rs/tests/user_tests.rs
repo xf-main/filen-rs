@@ -202,6 +202,40 @@ async fn events_returns_recent_events() {
 	);
 }
 
+/// `v3/user/events` pages by a whole-seconds cutoff and answers strictly BEFORE it. Sent in
+/// millis — the scale every other timestamp on the wire uses — the cutoff exceeds every event
+/// and each page request returns the same newest page, which silently broke the mobile cache's
+/// gap replay and the Events screen's pagination. The request type looks like every other one,
+/// so the contract is pinned against the live server rather than inferred.
+#[shared_test_runtime]
+async fn events_page_back_by_timestamp() {
+	let client = test_utils::RESOURCES.client().await;
+	let decrypted = |events: Vec<_>| -> Vec<DecryptedUserEvent> {
+		events.into_iter().filter_map(Result::ok).collect()
+	};
+	let first = decrypted(client.get_user_events(None, None).await.unwrap());
+	let oldest = first
+		.iter()
+		.map(|event| event.timestamp)
+		.min()
+		.expect("the shared account has events");
+	let second = decrypted(client.get_user_events(None, Some(oldest)).await.unwrap());
+	assert!(
+		!second.is_empty(),
+		"paging back from {oldest} returned nothing"
+	);
+	let first_ids: std::collections::HashSet<u64> = first.iter().map(|event| event.id).collect();
+	assert!(
+		second.iter().all(|event| !first_ids.contains(&event.id)),
+		"a cutoff at the oldest second of page 1 must page back to OLDER events; getting page 1 \
+		 again means the cutoff was not honoured"
+	);
+	assert!(
+		second.iter().all(|event| event.timestamp < oldest),
+		"the cutoff is exclusive: nothing at or after {oldest} may come back"
+	);
+}
+
 #[shared_test_runtime]
 async fn event_by_uuid_fetches_single_event() {
 	let client = test_utils::RESOURCES.client().await;
