@@ -8,14 +8,17 @@
 //!
 //! Two boxes carry one, both nested inside `uuid` boxes Canon defines: `PRVW`
 //! (1620x1080 across every pinned body, from the EOS R to the PowerShot V1)
-//! and `THMB` (160x120). The larger one wins when both are present.
+//! and `THMB` (160x120). The larger one wins when both are present. Both hold
+//! a bare JPEG — SOI straight into the quantisation tables, no APP1 — so the
+//! shot's orientation is not in the stream. It is in `CMT1`, the box beside
+//! them that carries the file's EXIF IFD0 as a plain TIFF.
 //!
 //! The walk is its own bounded parser rather than a media library: box sizes
 //! are attacker-controlled, so every one is checked against its parent's
 //! extent, recursion is depth-capped, the total number of boxes visited is
 //! capped, and no read is ever sized from a header without that check.
 
-use crate::{ByteSource, FormatDecoder, PreparedDecode, ThumbError, ThumbSpec};
+use crate::{ByteSource, FormatDecoder, PreparedDecode, ThumbError, ThumbSpec, exif};
 
 use super::raw::{self, Preview};
 
@@ -31,6 +34,10 @@ const BOX_HEADER: u64 = 8;
 /// Bytes of a preview box's payload searched for the SOI. Both box types put
 /// their JPEG at offset 16, behind a small fixed descriptor.
 const PREVIEW_PROBE: u64 = 32;
+/// Most of `CMT1` read for the orientation tag. The box is IFD0 alone — make,
+/// model, timestamps, a few hundred bytes on every pinned body — so this caps
+/// a forged box size rather than budgeting a real one.
+const CMT1_MAX_BYTES: u64 = 64 * 1024;
 
 impl FormatDecoder for Cr3 {
 	fn detect(&self, prefix: &[u8]) -> bool {
@@ -48,6 +55,7 @@ impl FormatDecoder for Cr3 {
 		let mut walk = Walk {
 			boxes: 0,
 			previews: Vec::new(),
+			cmt1: None,
 		};
 		let end = src.len();
 		walk.boxes_in(&mut *src, 0, end, 0);
@@ -61,9 +69,16 @@ impl FormatDecoder for Cr3 {
 				"cr3: no preview box; the sensor data is not a decodable image".into(),
 			));
 		};
-		// Canon's preview boxes hold a bare JPEG with its own EXIF, so the
-		// orientation comes from there.
-		raw::prepare(src, preview, 1, spec)
+		// The preview JPEGs carry no EXIF of their own, so a portrait shot
+		// would come out sideways without the file-level tag. `CMT1` is a
+		// TIFF, which is exactly the payload the EXIF walker takes.
+		let orientation = walk
+			.cmt1
+			.and_then(|(body, body_end)| {
+				raw::read_exact_at(&mut *src, body, (body_end - body).min(CMT1_MAX_BYTES))
+			})
+			.map_or(1, |tiff| exif::orientation(&tiff));
+		raw::prepare(src, preview, orientation, spec)
 	}
 }
 
@@ -71,6 +86,8 @@ struct Walk {
 	boxes: usize,
 	/// Byte ranges claimed to hold a JPEG, unverified.
 	previews: Vec<(u64, u64)>,
+	/// Payload range of the first `CMT1` box: the file's EXIF IFD0.
+	cmt1: Option<(u64, u64)>,
 }
 
 impl Walk {
@@ -111,6 +128,11 @@ impl Walk {
 			let (body, body_end) = (at + header_len, at + size);
 			match &kind {
 				b"PRVW" | b"THMB" => self.preview_box(src, body, body_end),
+				b"CMT1" => {
+					if self.cmt1.is_none() {
+						self.cmt1 = Some((body, body_end));
+					}
+				}
 				b"moov" => self.boxes_in(src, body, body_end, depth + 1),
 				// A `uuid` box names itself with 16 bytes and then, in Canon's
 				// case, either starts its children immediately or first writes
@@ -195,6 +217,7 @@ mod tests {
 		let mut walk = Walk {
 			boxes: 0,
 			previews: Vec::new(),
+			cmt1: None,
 		};
 		let end = src.len();
 		walk.boxes_in(&mut src, 0, end, 0);
@@ -301,5 +324,89 @@ mod tests {
 		file.extend_from_slice(&boxed(b"mdat", &[0u8; 64]));
 		let spec = ThumbSpec::new(512, 512, crate::DEFAULT_MEM_BUDGET);
 		assert!(Cr3.open(Box::new(MemSource(file)), &spec).is_err());
+	}
+
+	/// A real, decodable JPEG: `raw::prepare` opens the preview with the JPEG
+	/// decoder, which needs more than an SOF to say yes.
+	fn real_jpeg(w: u16, h: u16) -> Vec<u8> {
+		let mut out = Vec::new();
+		let enc = jpeg_encoder::Encoder::new(&mut out, 80);
+		enc.encode(
+			&vec![0x80u8; usize::from(w) * usize::from(h) * 3],
+			w,
+			h,
+			jpeg_encoder::ColorType::Rgb,
+		)
+		.expect("encode");
+		out
+	}
+
+	/// `CMT1`'s payload: a little-endian TIFF whose IFD0 holds one
+	/// Orientation entry.
+	fn cmt1(orientation: u16) -> Vec<u8> {
+		let mut tiff = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+		tiff.extend_from_slice(&1u16.to_le_bytes());
+		tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+		tiff.extend_from_slice(&3u16.to_le_bytes());
+		tiff.extend_from_slice(&1u32.to_le_bytes());
+		tiff.extend_from_slice(&u32::from(orientation).to_le_bytes());
+		tiff.extend_from_slice(&0u32.to_le_bytes());
+		tiff
+	}
+
+	/// The real layout: `moov` -> Canon `uuid` -> `CMT1` beside `THMB`, and
+	/// the `PRVW` in its own versioned `uuid`.
+	fn cr3(cmt1_body: Option<&[u8]>) -> Vec<u8> {
+		let mut canon = vec![0u8; 16];
+		if let Some(body) = cmt1_body {
+			canon.extend_from_slice(&boxed(b"CMT1", body));
+		}
+		let mut thmb = vec![0u8; 16];
+		thmb.extend_from_slice(&real_jpeg(160, 120));
+		canon.extend_from_slice(&boxed(b"THMB", &thmb));
+
+		let mut versioned = vec![0u8; 16];
+		versioned.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+		let mut prvw = vec![0u8; 16];
+		prvw.extend_from_slice(&real_jpeg(640, 480));
+		versioned.extend_from_slice(&boxed(b"PRVW", &prvw));
+
+		let mut file = boxed(b"ftyp", b"crx iso");
+		file.extend_from_slice(&boxed(b"moov", &boxed(b"uuid", &canon)));
+		file.extend_from_slice(&boxed(b"uuid", &versioned));
+		file
+	}
+
+	fn orientation_of(file: Vec<u8>) -> u8 {
+		let spec = ThumbSpec::new(512, 512, crate::DEFAULT_MEM_BUDGET);
+		let prepared = Cr3
+			.open(Box::new(MemSource(file)), &spec)
+			.expect("a preview");
+		assert_eq!(prepared.dims(), (640, 480), "the PRVW must win over THMB");
+		prepared.orientation()
+	}
+
+	/// The preview JPEGs are bare — no APP1 — so the only orientation is the
+	/// file's, in `CMT1`. Reading it is what keeps a portrait shot upright:
+	/// before it was read, every portrait CR3 came out on its side.
+	#[test]
+	fn the_orientation_comes_from_cmt1_not_the_bare_preview() {
+		assert_eq!(orientation_of(cr3(Some(&cmt1(6)))), 6);
+		assert_eq!(orientation_of(cr3(Some(&cmt1(1)))), 1);
+		assert_eq!(orientation_of(cr3(None)), 1);
+	}
+
+	/// `CMT1` is attacker-controlled bytes like every other box: garbage, a
+	/// value out of range, an IFD0 pointer past the read cap and an empty box
+	/// all fall back to upright, never to a panic.
+	#[test]
+	fn a_forged_cmt1_falls_back_to_upright() {
+		assert_eq!(orientation_of(cr3(Some(&[0x41u8; 64]))), 1);
+		assert_eq!(orientation_of(cr3(Some(&cmt1(9)))), 1);
+		assert_eq!(orientation_of(cr3(Some(&[]))), 1);
+		let mut far = b"II\x2a\x00".to_vec();
+		far.extend_from_slice(&u32::MAX.to_le_bytes());
+		far.resize(80 * 1024, 0);
+		assert_eq!(orientation_of(cr3(Some(&far))), 1);
 	}
 }
