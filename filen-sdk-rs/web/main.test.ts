@@ -20,7 +20,8 @@ import init, {
 	type CacheStatusMessage,
 	type CacheSearchSnapshot,
 	type MakeThumbnailInMemoryResult,
-	type InMemoryThumbnail
+	type InMemoryThumbnail,
+	type EmbeddedPreviewResult
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
@@ -861,50 +862,74 @@ test("large webp thumbnail", async () => {
 /// cache (vitest.config.ts) — the same files the Rust suite pins — and are verified by
 /// length and SHA-256 before anything is uploaded. An absent file is a skip: the library
 /// is a volunteer-run host and its outages are not this SDK's; a wrong file is a failure.
+///
+/// `preview` is what `writeEmbeddedPreview` must hand out for the same file: the
+/// embedded JPEG's own dimensions, as microthumb's characterisation measured them
+/// (`the_located_preview_is_the_jpeg_it_claims`), or null where the file embeds nothing
+/// past the 512 px preview floor — the E-10 carries a 160x120 stamp and no more, which
+/// still thumbnails but is not a preview.
 const RAW_FIXTURES = [
 	{
 		name: "2102.CR2",
 		path: "2102/nice/Canon%20-%20EOS%2040D%20-%20sRAW2%20%28sRAW%29%20%283%3A2%29.CR2",
 		length: 5805950,
-		sha256: "ba644e7dd2abe74eca260e67f0206ff113bf0f62e710f8130611e964d6be5bf1"
+		sha256: "ba644e7dd2abe74eca260e67f0206ff113bf0f62e710f8130611e964d6be5bf1",
+		preview: { width: 1936, height: 1288 }
 	},
 	{
 		name: "4659.CR3",
 		path: "4659/nice/Canon%20-%20EOS%20R6%20-%203%3A2.CR3",
 		length: 5273174,
-		sha256: "74abb0a113d075ad9887a058082f40dd2a938c4813a08474d82356f11a027778"
+		sha256: "74abb0a113d075ad9887a058082f40dd2a938c4813a08474d82356f11a027778",
+		preview: { width: 1620, height: 1080 }
 	},
 	{
 		name: "7737.NEF",
 		path: "7737/nice/Nikon%20-%20Z5_2%20-%208bit%20compressed%20%283%3A2%29.NEF",
 		length: 6174720,
-		sha256: "196971ea960cfa6f5c0a19cebe515ac118e079c57ceeef850ab3a4995dc7d20f"
+		sha256: "196971ea960cfa6f5c0a19cebe515ac118e079c57ceeef850ab3a4995dc7d20f",
+		preview: { width: 3984, height: 2656 }
 	},
 	{
 		name: "1033.DNG",
 		path: "1033/nice/Adobe%20DNG%20Converter%20-%20Canon%20EOS%205D%20Mark%20III%20-%20Lossy%20JPEG%20compression%2C%20rgb%20%283%3A2%29.DNG",
 		length: 2484836,
-		sha256: "b22f1e36331f679abb8b13e433b9bbde3988723adf10fee7aa0dda6381016a98"
+		sha256: "b22f1e36331f679abb8b13e433b9bbde3988723adf10fee7aa0dda6381016a98",
+		preview: { width: 3960, height: 2640 }
 	},
 	{
 		name: "2726.RAF",
 		path: "2726/nice/Fujifilm%20-%20FinePix%20S5000%20-%204%3A3.RAF",
 		length: 6851240,
-		sha256: "dabd5e74521a6980156be9fd4b88d0c37b0fe4d0e0e6f5c12db8cffff1b76297"
+		sha256: "dabd5e74521a6980156be9fd4b88d0c37b0fe4d0e0e6f5c12db8cffff1b76297",
+		preview: { width: 1280, height: 960 }
 	},
 	{
 		name: "5424.ORF",
 		path: "5424/nice/Olympus%20-%20E-10%20-%2016bit%20%284%3A3%29.ORF",
 		length: 7614592,
-		sha256: "2bfdade72439017a60a47aad1e5bbcb1aca36f2be7a21e94a4257a678fb6f4da"
+		sha256: "2bfdade72439017a60a47aad1e5bbcb1aca36f2be7a21e94a4257a678fb6f4da",
+		preview: null
 	},
 	{
 		name: "7008.RW2",
 		path: "7008/nice/Panasonic%20-%20DMC-LX7%20-%201%3A1.RW2",
 		length: 3249664,
-		sha256: "d142a23aca836053ed53e9ce3cb3ed2d434541d734d71a94a6eefadcd08bd31b"
+		sha256: "d142a23aca836053ed53e9ce3cb3ed2d434541d734d71a94a6eefadcd08bd31b",
+		preview: { width: 1920, height: 1920 }
 	}
 ]
+
+/// `writeEmbeddedPreview` into an OPFS file — the shape a web caller uses, so the preview
+/// never sits in wasm memory and the result is a File it can `createObjectURL`. Returns the
+/// verdict and the file as written; the caller removes the entry.
+async function writePreviewToOpfs(file: File, name: string): Promise<{ result: EmbeddedPreviewResult; written: globalThis.File }> {
+	const root = await navigator.storage.getDirectory()
+	const handle = await root.getFileHandle(name, { create: true })
+	const writer = await handle.createWritable()
+	const result = await state.writeEmbeddedPreview({ file, writer })
+	return { result, written: await handle.getFile() }
+}
 
 async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
 	const digest = await crypto.subtle.digest("SHA-256", bytes)
@@ -940,7 +965,34 @@ test("raw thumbnails come from the embedded preview", async () => {
 			expect(bitmap.height).toBe(thumb.height)
 			bitmap.close()
 
-			return `${fixture.name} ${thumb.width}x${thumb.height}`
+			// The preview: the same embedded JPEG, handed out as stored rather than
+			// shrunk to a thumbnail. Written into OPFS, read back as a File, and
+			// decoded by the browser — which is the whole point of not transcoding.
+			const opfsName = `${fixture.name}.preview.jpg`
+			const { result, written } = await writePreviewToOpfs(file, opfsName)
+			try {
+				if (fixture.preview === null) {
+					expect(result.type, `${fixture.name} should have no preview`).toBe("noPreview")
+					expect(written.size).toBe(0)
+				} else {
+					expect(result.type, `${fixture.name} preview verdict`).toBe("preview")
+					if (result.type !== "preview") {
+						throw new Error("unreachable")
+					}
+					expect({ width: result.width, height: result.height }).toEqual(fixture.preview)
+					expect(written.size).toBe(Number(result.bytes))
+					// `imageOrientation: "none"`: the stored frame, so a spliced EXIF rotation
+					// cannot swap the axes under the comparison.
+					const preview = await createImageBitmap(written, { imageOrientation: "none" })
+					expect(preview.width).toBe(result.width)
+					expect(preview.height).toBe(result.height)
+					preview.close()
+				}
+			} finally {
+				await (await navigator.storage.getDirectory()).removeEntry(opfsName)
+			}
+
+			return `${fixture.name} ${thumb.width}x${thumb.height} preview=${fixture.preview ? `${fixture.preview.width}x${fixture.preview.height}` : "none"}`
 		})
 	)
 	const produced = results.filter((r): r is string => r !== null)
@@ -951,6 +1003,67 @@ test("raw thumbnails come from the embedded preview", async () => {
 
 	console.log("raw thumbnails:", produced.join(", "))
 }, 600_000)
+
+/// Removes an OPFS entry whose writable the SDK still holds, once the SDK's abort of that
+/// stream has released the lock — within a bound, so a stream never aborted is a failure.
+async function removeOnceReleased(root: FileSystemDirectoryHandle, name: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await root.removeEntry(name)
+
+			return
+		} catch (e) {
+			if (attempt >= 100) {
+				throw e
+			}
+
+			await new Promise(resolve => setTimeout(resolve, 50))
+		}
+	}
+}
+
+/// On wasm every decode and locate runs on ONE worker thread that blocks on chunk replies
+/// from the caller's driver task. Aborting a preview mid-fetch drops that driver; the worker
+/// must see its reply channel close and give the job up, not park on an answer that is
+/// never coming with every later thumbnail queued behind it for a 60 s stall deadline. The
+/// clock on the follow-up thumbnail is the assertion: a parked worker costs a minute.
+test("an aborted preview does not park the decode worker", async () => {
+	const fixture = RAW_FIXTURES.find(f => f.name === "7008.RW2")!
+	const res = await fetch(`raw-fixtures/${fixture.name}/${fixture.path}`)
+
+	if (!res.ok) {
+		console.warn(`SKIP ${fixture.name}: ${res.status} from the fixture cache`)
+
+		return
+	}
+
+	const bytes = new Uint8Array(await res.arrayBuffer())
+	expect(await sha256Hex(bytes)).toBe(fixture.sha256)
+	const file = await state.uploadFile(bytes, { parent: testDir, name: `abort-${fixture.name}` })
+
+	const root = await navigator.storage.getDirectory()
+	const opfsName = `abort-${fixture.name}.preview.jpg`
+	const handle = await root.getFileHandle(opfsName, { create: true })
+	const abortController = new AbortController()
+	const aborted = state.writeEmbeddedPreview({
+		file,
+		writer: await handle.createWritable(),
+		managedFuture: { abortSignal: abortController.signal }
+	})
+	// Straight away: the locate's first chunk fetch is where the driver is waiting, and where
+	// a dropped driver used to leave the worker.
+	abortController.abort()
+	await expect(aborted).rejects.toThrow()
+	// The SDK aborts the stream from its side once the producer is gone, which is what
+	// releases the file's lock; that lands a tick after the rejection, and until it does
+	// removeEntry answers NoModificationAllowedError. Waiting for it is also the check that
+	// the abort happens at all.
+	await removeOnceReleased(root, opfsName)
+
+	const started = Date.now()
+	expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 128, maxWidth: 128 }))
+	expect(Date.now() - started, "a thumbnail after an aborted preview waited on a dead worker").toBeLessThan(30_000)
+}, 240_000)
 
 test("thumbnail verdicts are distinguishable", async () => {
 	// The point of the verdicts: three different "no picture" answers that a UI

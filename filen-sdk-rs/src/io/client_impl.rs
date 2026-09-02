@@ -342,19 +342,19 @@ impl Client {
 /// filters the quarantine dir — would treat it as a new local file and upload
 /// the partial garbage.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-struct TmpFileGuard {
+pub(crate) struct TmpFileGuard {
 	path: Option<PathBuf>,
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 impl TmpFileGuard {
-	fn new(path: PathBuf) -> Self {
+	pub(crate) fn new(path: PathBuf) -> Self {
 		Self { path: Some(path) }
 	}
 
 	/// Call once the temp file has been committed (renamed into place) so drop
 	/// does not remove the now-final file.
-	fn disarm(&mut self) {
+	pub(crate) fn disarm(&mut self) {
 		self.path = None;
 	}
 }

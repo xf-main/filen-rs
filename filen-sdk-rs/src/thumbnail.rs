@@ -399,6 +399,177 @@ where
 	}))
 }
 
+// ---------------------------------------------------------------------------
+// The embedded preview, handed out as it is.
+// ---------------------------------------------------------------------------
+
+pub use microthumb::{LocatedPreview, MIN_PREVIEW_LONG_SIDE};
+
+/// Refusal ceiling on a preview's DECLARED length, checked before a single
+/// payload byte is read. The largest real previews — a full-size CR2 strip, a
+/// Leica or Adobe full-size DNG — run 10–25 MB, so this only ever fires on a
+/// forged container length. Not a config knob: nothing legitimate needs to
+/// tune it.
+pub const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The smallest legal EXIF APP1 carrying an orientation and nothing else:
+/// marker and length, `Exif\0\0`, a TIFF header, a one-entry IFD0 and its
+/// null next-IFD pointer.
+pub const ORIENTATION_APP1_LEN: usize = 36;
+
+/// A file's embedded preview, ready to be written out.
+///
+/// "Untouched" is the contract: the entropy-coded scan, the quantisation and
+/// Huffman tables and the SOF are copied verbatim. The one edit is
+/// [`app1`](Self::app1) — 36 bytes of metadata that make the bytes
+/// self-describing for a viewer we do not control. Reporting the orientation
+/// and leaving the rotation to the consumer would mean one implementation per
+/// image stack, and an `<img>` has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddedPreview {
+	pub located: LocatedPreview,
+	/// Spliced at `located.exif_insert_at` when the container declares a
+	/// rotation the stream does not — the Nikon/Sony SubIFD case, and CR3.
+	/// `None` leaves the bytes exactly as stored: either the stream carries
+	/// an EXIF of its own (Fuji, Panasonic), whose tag then wins even where
+	/// the container disagrees, or nothing needs rotating.
+	pub app1: Option<[u8; ORIENTATION_APP1_LEN]>,
+}
+
+/// One piece of a written preview, in order: a range of the source, or the
+/// spliced APP1 between two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewSegment {
+	/// `[start, end)` of the source, verbatim.
+	Source {
+		start: u64,
+		end: u64,
+	},
+	App1([u8; ORIENTATION_APP1_LEN]),
+}
+
+impl EmbeddedPreview {
+	/// What to emit, in order. Shared by the synchronous copy and the
+	/// streaming FFI paths so they cannot disagree about the bytes.
+	pub fn segments(&self) -> Vec<PreviewSegment> {
+		let start = self.located.offset;
+		let end = start + self.located.len;
+		match (self.app1, self.located.exif_insert_at) {
+			(Some(app1), Some(at)) => {
+				let splice = start + u64::from(at);
+				vec![
+					PreviewSegment::Source { start, end: splice },
+					PreviewSegment::App1(app1),
+					PreviewSegment::Source { start: splice, end },
+				]
+			}
+			_ => vec![PreviewSegment::Source { start, end }],
+		}
+	}
+
+	/// Bytes a consumer receives.
+	pub fn written_len(&self) -> u64 {
+		self.located.len + self.app1.map_or(0, |app1| app1.len() as u64)
+	}
+
+	/// The EXIF orientation (1–8) a viewer will apply to the written bytes:
+	/// the stream's own where it carries an EXIF (Fuji, Panasonic), the
+	/// container's where that was spliced in, and upright where neither —
+	/// the bytes then declare nothing, and nothing is what a viewer does.
+	pub fn viewer_orientation(&self) -> u8 {
+		match (self.app1, self.located.stream_orientation) {
+			(Some(_), _) => self.located.orientation,
+			(None, Some(own)) => own,
+			(None, None) => 1,
+		}
+	}
+}
+
+/// An EXIF APP1 declaring nothing but `orientation`.
+fn orientation_app1(orientation: u8) -> [u8; ORIENTATION_APP1_LEN] {
+	let mut app1 = [0u8; ORIENTATION_APP1_LEN];
+	// The marker, a length that counts itself and the payload, `Exif\0\0`.
+	app1[..10].copy_from_slice(&[0xFF, 0xE1, 0x00, 0x22, b'E', b'x', b'i', b'f', 0, 0]);
+	// A little-endian TIFF header whose IFD0 sits right behind it ...
+	app1[10..18].copy_from_slice(&[b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+	// ... holding one SHORT entry, Orientation, with the value inline ...
+	app1[18..20].copy_from_slice(&1u16.to_le_bytes());
+	app1[20..22].copy_from_slice(&0x0112u16.to_le_bytes());
+	app1[22..24].copy_from_slice(&3u16.to_le_bytes());
+	app1[24..28].copy_from_slice(&1u32.to_le_bytes());
+	app1[28..30].copy_from_slice(&u16::from(orientation).to_le_bytes());
+	// ... the value's pad bytes and the next-IFD pointer both zero.
+	app1
+}
+
+/// Locates a file's embedded preview and decides what to write.
+///
+/// Two to four bounded reads on a real file whatever its size, and on a forged
+/// container only what the parsers' own caps allow, each read at most a chunk
+/// or two; nothing is decoded — see [`microthumb::locate_preview`]. `None` is one answer for
+/// every no-preview reason (not a container this build walks, nothing
+/// embedded at [`MIN_PREVIEW_LONG_SIDE`], a declared length past
+/// [`MAX_PREVIEW_BYTES`]): unlike [`ThumbnailOutcome`], whose arms exist
+/// because platform caches store them differently, every one of these leads
+/// to the identical fallback, the thumbnail. Only a source read fails.
+pub fn locate_embedded_preview(src: &mut dyn ByteSource) -> Result<Option<EmbeddedPreview>, Error> {
+	let located = match microthumb::locate_preview(src) {
+		Ok(located) => located,
+		Err(microthumb::ThumbError::Io(e)) => return Err(e.into()),
+		Err(e) => return Err(Error::custom(ErrorKind::ImageError, e.to_string())),
+	};
+	Ok(located
+		.filter(|located| located.len <= MAX_PREVIEW_BYTES)
+		.map(|located| EmbeddedPreview {
+			app1: match (located.orientation, located.exif_insert_at) {
+				(2..=8, Some(_)) => Some(orientation_app1(located.orientation)),
+				_ => None,
+			},
+			located,
+		}))
+}
+
+/// Copies a located preview into `out`, splicing the APP1 where there is
+/// one. Never holds more than one copy buffer; a source that runs out inside
+/// the range it declared is an error, never a short file.
+///
+/// Synchronous like the locate, for callers whose bytes are local. The FFI
+/// wrappers stream the same [`segments`](EmbeddedPreview::segments) over the
+/// network with the async range reader instead of blocking on chunks.
+pub fn write_embedded_preview<W: std::io::Write>(
+	src: &mut dyn ByteSource,
+	preview: &EmbeddedPreview,
+	out: &mut W,
+) -> Result<u64, Error> {
+	let mut written = 0u64;
+	let mut buf = vec![0u8; 64 * 1024];
+	for segment in preview.segments() {
+		match segment {
+			PreviewSegment::Source { start, end } => {
+				let mut at = start;
+				while at < end {
+					let want = usize::try_from(end - at).map_or(buf.len(), |n| n.min(buf.len()));
+					let n = src.read_at(at, &mut buf[..want])?;
+					if n == 0 {
+						return Err(Error::custom(
+							ErrorKind::ImageError,
+							format!("embedded preview ends at {at}, {} bytes short", end - at),
+						));
+					}
+					out.write_all(&buf[..n])?;
+					at += n as u64;
+					written += n as u64;
+				}
+			}
+			PreviewSegment::App1(app1) => {
+				out.write_all(&app1)?;
+				written += app1.len() as u64;
+			}
+		}
+	}
+	Ok(written)
+}
+
 // Everything from here on needs a way to fetch remote bytes and a thread it may
 // block. The `service-worker` profile has neither — it is built WITHOUT atomics,
 // where `std`'s parker is a silent no-op rather than a real wait — so none of it
@@ -410,11 +581,13 @@ where
 mod remote_chunks {
 	use super::{ByteSource, Error};
 	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
-	use super::{ErrorKind, ThumbSpec, ThumbnailFit, ThumbnailOutcome, make_thumbnail_from_source};
-	use crate::{
-		auth::Client,
-		fs::file::{RemoteFile, traits::HasFileInfo},
+	use super::{
+		EmbeddedPreview, ErrorKind, PreviewSegment, ThumbSpec, ThumbnailFit, ThumbnailOutcome,
+		locate_embedded_preview, make_thumbnail_from_source,
 	};
+	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+	use crate::fs::file::enums::RemoteFileType;
+	use crate::{auth::Client, fs::file::traits::File};
 	use std::sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -467,8 +640,8 @@ mod remote_chunks {
 		/// on wasm this check is a permanent no-op: nothing there has a cancel
 		/// to raise (a `wasm_bindgen` export is wrapped in `future_to_promise`,
 		/// so JS holds a Promise and the task queue owns the future), and the
-		/// only thing that stops a running decode is its next chunk REQUEST
-		/// failing.
+		/// only things that stop a running decode are its next chunk request,
+		/// or the reply to one, failing once the driver is gone.
 		cancel: Option<Arc<AtomicBool>>,
 		len: u64,
 		slots: [Option<(u64, Vec<u8>)>; 2],
@@ -494,9 +667,9 @@ mod remote_chunks {
 		/// fetch, which is legal because the pipeline runs inside
 		/// `spawn_blocking`.
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		pub fn new<Id: Send + Sync + 'static>(
+		pub fn new<F: File + Send + Sync + 'static>(
 			client: Arc<Client>,
-			file: RemoteFile<Id>,
+			file: F,
 			handle: tokio::runtime::Handle,
 			cancel: Option<Arc<AtomicBool>>,
 		) -> Self {
@@ -523,10 +696,6 @@ mod remote_chunks {
 			cancel: Option<Arc<AtomicBool>>,
 			requests: tokio::sync::mpsc::UnboundedSender<ChunkRequest>,
 		) -> Self {
-			// One reply channel for the whole decode, not one per request: the
-			// source blocks until each answer arrives, so there is never more
-			// than one in flight.
-			let (reply, replies) = std::sync::mpsc::channel();
 			Self::with_fetcher(
 				len,
 				cancel,
@@ -535,21 +704,18 @@ mod remote_chunks {
 					// `requests`, and the decode unwinds at the same chunk
 					// granularity a cancel flag would give it.
 					//
-					// `replies.recv()` cannot report the same thing: this
-					// closure holds its own `reply` sender, so the channel is
-					// never fully closed, and a driver dropped BETWEEN taking a
-					// request and answering it parks this worker here forever.
-					// Nothing recovers that worker in place — the next caller's
-					// stall deadline retires it (see `decode_worker::retire`).
+					// The reply channel is per request and the driver holds
+					// its only sender: a driver dropped BETWEEN taking a
+					// request and answering it disconnects `recv` the same
+					// way, instead of parking this worker here for good with
+					// every later caller queued behind it. One allocation per
+					// chunk fetch is nothing against the fetch.
 					let cancelled = || {
 						std::io::Error::new(std::io::ErrorKind::Interrupted, "thumbnail cancelled")
 					};
+					let (reply, replies) = std::sync::mpsc::channel();
 					requests
-						.send(ChunkRequest {
-							start,
-							end,
-							reply: reply.clone(),
-						})
+						.send(ChunkRequest { start, end, reply })
 						.map_err(|_| cancelled())?;
 					replies.recv().map_err(|_| cancelled())?
 				}),
@@ -663,8 +829,12 @@ mod remote_chunks {
 		///   `length_error`/`bad_alloc` into a trap on this worker. A trap
 		///   abandons the thread's stack without running a single destructor, so
 		///   the `Receiver` is leaked rather than closed;
-		/// - a park. `RemoteChunkSource::over_requests` can block forever on a
-		///   reply that is never coming (see there).
+		/// - a park, in an earlier shape of `RemoteChunkSource::over_requests`
+		///   that shared one reply channel across a decode: a driver dropped
+		///   between taking a request and answering it left the worker waiting
+		///   for a reply that never came. The reply channel is per request now
+		///   and closes with the driver, so that shape is gone — the machinery
+		///   below stays for the trap.
 		///
 		/// Either way `send` below keeps SUCCEEDING into a channel nothing
 		/// drains, and every later thumbnail on the page queues behind a worker
@@ -820,8 +990,8 @@ mod remote_chunks {
 	/// the wasm module's 1 GiB linker cap. The sites that WOULD clear that cap
 	/// are the uncompressed-codec ones, which are not compiled in (see the
 	/// `WITH_UNCOMPRESSED_CODEC` note in `heif-decoder/build.rs`). So the trap
-	/// arm guards a libheif bump, a newly enabled codec, or the `over_requests`
-	/// park mode — none of which is live today.
+	/// arm guards a libheif bump or a newly enabled codec — neither of which is
+	/// live today.
 	///
 	/// What IS pinned by tests is the queued-caller half: the browser suite's
 	/// "a queued thumbnail is not expired by another caller's decode". Worker
@@ -831,18 +1001,22 @@ mod remote_chunks {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	const DECODE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-	/// Thumbnails a remote file straight from its chunks, off the async
-	/// runtime's threads: the webp bytes and the verdict, without the file ever
-	/// being resident in full.
+	/// Runs a synchronous job over a remote file's chunks, off the async
+	/// runtime's threads — a thumbnail decode, or a preview locate — without
+	/// the file ever being resident in full.
 	///
-	/// The two arms differ only in how the synchronous pipeline is taken off the
+	/// The two arms differ only in how the synchronous work is taken off the
 	/// runtime and how its source gets back on it.
 	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
-	pub(crate) async fn thumbnail_remote_file<Id: Send + Sync + 'static>(
+	pub(crate) async fn over_remote_chunks<F, R>(
 		client: Arc<Client>,
-		file: RemoteFile<Id>,
-		spec: ThumbSpec,
-	) -> Result<(ThumbnailOutcome, Vec<u8>), Error> {
+		file: &F,
+		job: impl FnOnce(Box<dyn ByteSource>) -> Result<R, Error> + Send + 'static,
+	) -> Result<R, Error>
+	where
+		F: File + Clone + Send + Sync + 'static,
+		R: Send + 'static,
+	{
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
 			// A dropped caller (a cancelled request, a closed view) leaves the
@@ -863,27 +1037,21 @@ mod remote_chunks {
 			// only by tokio's 512 blocking threads. Acquired BEFORE the source and the spawn, so
 			// parked work costs a future rather than a blocked pool thread; MOVED INTO the
 			// closure so the permit outlives a cancelled caller's future the way the detached
-			// decode does.
+			// job does. A locate holds it for two to four chunk reads — worth one gate over a
+			// second one that would admit nothing more.
 			let decode_permit = client.thumbnails().decode_permit().await;
 			let source = RemoteChunkSource::new(
 				client,
-				file,
+				file.clone(),
 				tokio::runtime::Handle::current(),
 				Some(cancel),
 			);
 			let joined = tokio::task::spawn_blocking(move || {
 				let _decode_permit = decode_permit;
-				let mut webp = Vec::new();
-				let outcome = make_thumbnail_from_source(
-					Box::new(source),
-					&spec,
-					ThumbnailFit::Contain,
-					&mut webp,
-				)?;
-				Ok::<_, Error>((outcome, webp))
+				job(Box::new(source))
 			})
 			.await;
-			// The decode is over — nothing is left for a late drop to cancel.
+			// The job is over — nothing is left for a late drop to cancel.
 			guard.0 = None;
 			joined.map_err(|e| {
 				Error::custom(
@@ -897,27 +1065,18 @@ mod remote_chunks {
 			let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
 			// `None`, not a flag: nothing on this target can raise one (see
 			// `RemoteChunkSource::cancel`). What a dropped driver does give the
-			// decode is `incoming` closing, which fails its next chunk REQUEST.
+			// job is `incoming` closing, which fails its next chunk REQUEST.
 			let source = RemoteChunkSource::over_requests(file.size(), None, requests);
 			// Same gate as the native arm, but the permit is held HERE rather than moved into
 			// the job. A trapped worker runs no destructor, so a permit living inside the job
 			// would be lost for the life of the page and the gate would close for good — the
 			// same wedge this deadline exists to remove, one step earlier. The accounting the
 			// native arm buys by moving it (a cancelled caller must not free a slot while its
-			// orphaned decode still runs) is worth nothing here: every decode goes through the
-			// one worker in turn, so a spare permit buys no extra concurrency, only an earlier
+			// orphaned job still runs) is worth nothing here: every job goes through the one
+			// worker in turn, so a spare permit buys no extra concurrency, only an earlier
 			// place in that queue.
 			let _decode_permit = client.thumbnails().decode_permit().await;
-			let (generation, mut done) = decode_worker::submit(move || {
-				let mut webp = Vec::new();
-				make_thumbnail_from_source(
-					Box::new(source),
-					&spec,
-					ThumbnailFit::Contain,
-					&mut webp,
-				)
-				.map(|outcome| (outcome, webp))
-			});
+			let (generation, mut done) = decode_worker::submit(move || job(Box::new(source)));
 			let died = || {
 				Error::custom(
 					ErrorKind::ImageError,
@@ -953,7 +1112,7 @@ mod remote_chunks {
 						// connection — which is time another driver must not count against
 						// the worker.
 						decode_worker::note_activity();
-						let data = fetch_range(&client, &file, request.start, request.end)
+						let data = fetch_range(&client, file, request.start, request.end)
 							.await
 							.map_err(std::io::Error::other);
 						let _ = request.reply.send(data);
@@ -990,6 +1149,96 @@ mod remote_chunks {
 			}
 		}
 	}
+
+	/// Thumbnails a remote file straight from its chunks: the webp bytes and
+	/// the verdict, without the file ever being resident in full.
+	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+	pub(crate) async fn thumbnail_remote_file<F>(
+		client: Arc<Client>,
+		file: F,
+		spec: ThumbSpec,
+	) -> Result<(ThumbnailOutcome, Vec<u8>), Error>
+	where
+		F: File + Clone + Send + Sync + 'static,
+	{
+		over_remote_chunks(client, &file, move |source| {
+			let mut webp = Vec::new();
+			let outcome =
+				make_thumbnail_from_source(source, &spec, ThumbnailFit::Contain, &mut webp)?;
+			Ok((outcome, webp))
+		})
+		.await
+	}
+
+	/// Writes a remote file's embedded preview into `writer`, as it is stored.
+	///
+	/// The locate runs over the chunks exactly like a thumbnail does (two to
+	/// four fetches on a real file); the bytes then stream through the
+	/// ordinary range reader, reading ahead within the client's file-IO
+	/// memory budget like any other download, so a 25 MB full-size preview
+	/// is never resident — neither here nor, on wasm, in linear memory that
+	/// is never returned. The chunk the locate sniffed is fetched once more
+	/// by the stream: one mebibyte, not worth plumbing around.
+	///
+	/// The writer is closed on every `Ok`, empty when there was nothing to
+	/// write, so a consumer always sees a finished stream — and can remove the
+	/// empty file it created for a `None`.
+	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+	pub(crate) async fn write_embedded_preview_remote<W>(
+		client: Arc<Client>,
+		file: RemoteFileType<'static>,
+		writer: &mut W,
+	) -> Result<Option<EmbeddedPreview>, Error>
+	where
+		W: futures::AsyncWrite + Unpin,
+	{
+		use futures::AsyncWriteExt;
+
+		let located = over_remote_chunks(client.clone(), &file, |mut source| {
+			locate_embedded_preview(&mut *source)
+		})
+		.await?;
+		if let Some(preview) = &located {
+			use futures::AsyncReadExt;
+
+			// One reader over the whole range, consumed segment by segment:
+			// the segments are contiguous and in order, and a reader per
+			// segment would fetch and decrypt the first chunk once per
+			// segment.
+			let start = preview.located.offset;
+			let mut reader =
+				crate::fs::file::read::FileReaderBuilder::new(client.unauthed(), &file)
+					.with_start(start)
+					.with_end(start + preview.located.len)
+					.build();
+			for segment in preview.segments() {
+				match segment {
+					PreviewSegment::Source { start, end } => {
+						// A source that runs out inside the range it declared
+						// — a lying uploader; the chunks still authenticate —
+						// is an error, never a short file: the writer is then
+						// dropped unclosed, which aborts the JS stream and
+						// leaves the temp file to its guard.
+						let copied =
+							futures::io::copy(&mut (&mut reader).take(end - start), writer).await?;
+						if copied != end - start {
+							return Err(Error::custom(
+								ErrorKind::ImageError,
+								format!(
+									"embedded preview ends at {}, {} bytes short",
+									start + copied,
+									end - start - copied
+								),
+							));
+						}
+					}
+					PreviewSegment::App1(app1) => writer.write_all(&app1).await?,
+				}
+			}
+		}
+		writer.close().await?;
+		Ok(located)
+	}
 }
 
 #[cfg(any(
@@ -1003,7 +1252,8 @@ mod js_impls {
 	use filen_macros::js_type;
 
 	use super::{
-		ThumbSource, ThumbnailOutcome, might_be_thumbnailable, remote_chunks::thumbnail_remote_file,
+		EmbeddedPreview, ThumbSource, ThumbnailOutcome, might_be_thumbnailable,
+		remote_chunks::{thumbnail_remote_file, write_embedded_preview_remote},
 	};
 	use crate::{
 		Error,
@@ -1011,9 +1261,9 @@ mod js_impls {
 		error::MetadataWasNotDecryptedError,
 		fs::{
 			HasName,
-			file::{AnonymousRemoteFile, traits::HasFileInfo},
+			file::{AnonymousRemoteFile, enums::RemoteFileType, traits::HasFileInfo},
 		},
-		js::File,
+		js::{AnyFile, File},
 		runtime::do_on_commander,
 	};
 
@@ -1130,6 +1380,178 @@ mod js_impls {
 				})
 			})
 			.await
+		}
+	}
+	/// What came of writing a file's embedded preview.
+	///
+	/// Only the transport can fail outright (a rejected promise / a thrown
+	/// error). Both arms here are settled answers about these bytes: a file
+	/// that answers `noPreview` today answers it tomorrow, so a consumer may
+	/// remember it — and shows the thumbnail instead, which is the one
+	/// fallback every no-preview reason leads to.
+	#[js_type(export, no_deser, tagged)]
+	pub enum EmbeddedPreviewResult {
+		/// Written in full. The bytes are the camera's own JPEG of the shot,
+		/// as stored — the only possible edit is a 36-byte EXIF orientation
+		/// segment, spliced in when the container knows a rotation the stream
+		/// does not declare, so the file displays upright in any viewer.
+		Preview {
+			/// From the JPEG's own SOF: the stored image, before any rotation
+			/// its orientation implies.
+			width: u32,
+			height: u32,
+			/// EXIF orientation (1–8) a viewer will apply to the written bytes
+			/// — the stream's own where it carries an EXIF, the container's
+			/// where that was spliced in, upright where the bytes declare
+			/// nothing. Informational: the bytes already say it.
+			orientation: u8,
+			/// Bytes written. One word on purpose: a tagged variant's fields
+			/// reach TypeScript under their Rust names.
+			bytes: u64,
+		},
+		/// Nothing was written and the writer was closed empty: not a
+		/// container this build walks, it embeds no JPEG a viewer could show
+		/// at least 512 px across, or the length it declares is more than a
+		/// JPEG of that size could hold (a forged or corrupt container).
+		/// Remove the file you created for it.
+		NoPreview,
+	}
+
+	impl From<Option<EmbeddedPreview>> for EmbeddedPreviewResult {
+		fn from(preview: Option<EmbeddedPreview>) -> Self {
+			match preview {
+				Some(preview) => EmbeddedPreviewResult::Preview {
+					width: preview.located.width,
+					height: preview.located.height,
+					orientation: preview.viewer_orientation(),
+					bytes: preview.written_len(),
+				},
+				None => EmbeddedPreviewResult::NoPreview,
+			}
+		}
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[js_type(import, wasm_all, no_ser, no_default)]
+	pub struct WriteEmbeddedPreviewParams {
+		pub file: AnyFile,
+		/// Where the bytes go — an OPFS `FileSystemWritableFileStream` is one,
+		/// which is how a web caller gets a file it can `createObjectURL`
+		/// without the preview ever sitting in wasm memory. Closed on every
+		/// settled answer, empty for `noPreview`; aborted on a failure so a
+		/// partial preview is never saved as complete.
+		#[tsify(type = "WritableStream<Uint8Array>")]
+		#[serde(with = "serde_wasm_bindgen::preserve")]
+		pub writer: web_sys::WritableStream,
+		// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
+		#[serde(default)]
+		pub managed_future: crate::js::ManagedFuture,
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+	impl JsClient {
+		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
+		/// shot — into `writer`, as stored. See [`EmbeddedPreviewResult`].
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "writeEmbeddedPreview")]
+		pub async fn write_embedded_preview(
+			&self,
+			params: WriteEmbeddedPreviewParams,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			use crate::fs::file::service_worker::{StreamWriter, WriteFrame};
+
+			let this = self.inner();
+			// The same bridge `downloadFileToWriter` uses: frames cross to a
+			// local task that owns the JS stream, so nothing here ever holds
+			// more than one flush buffer of the preview.
+			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
+			let writer = wasm_streams::WritableStream::from_raw(params.writer)
+				.try_into_async_write()
+				.map_err(|(e, _)| {
+					Error::custom(
+						crate::ErrorKind::Conversion,
+						format!("got error when converting to WritableStream: {:?}", e),
+					)
+				})?;
+			let (result_sender, result_receiver) =
+				tokio::sync::oneshot::channel::<Result<(), Error>>();
+			crate::js::spawn_buffered_write_future(
+				data_receiver,
+				writer,
+				None::<fn(u64)>,
+				result_sender,
+			);
+
+			params
+				.managed_future
+				.into_js_managed_commander_future(move || async move {
+					let file = RemoteFileType::try_from(params.file)?;
+					let mut writer = StreamWriter::new(data_sender);
+					let preview = write_embedded_preview_remote(this, file, &mut writer).await?;
+					// The close above sent the Done frame; wait for the JS
+					// side to have taken every byte before answering, or a
+					// caller could read the file back before it is whole.
+					result_receiver.await.unwrap_or_else(|_| {
+						Err(Error::custom(
+							crate::ErrorKind::Cancelled,
+							"preview write task cancelled",
+						))
+					})?;
+					Ok(EmbeddedPreviewResult::from(preview))
+				})?
+				.await
+		}
+	}
+
+	#[cfg(feature = "uniffi")]
+	#[uniffi::export]
+	impl JsClient {
+		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
+		/// shot — to `file_path`, as stored. See [`EmbeddedPreviewResult`].
+		///
+		/// Written beside the destination and renamed into place, so nothing
+		/// a viewer might cache ever sits at the path half-finished; on
+		/// `noPreview` no file is left at all.
+		pub async fn write_embedded_preview_to_path(
+			&self,
+			file: AnyFile,
+			file_path: String,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+			let this = self.inner();
+			managed_future
+				.into_js_managed_commander_future(move || async move {
+					let file = RemoteFileType::try_from(file)?;
+					let path = std::path::PathBuf::from(file_path);
+					let file_name = path
+						.file_name()
+						.map(|name| name.to_string_lossy().into_owned())
+						.ok_or_else(|| {
+							Error::custom(
+								crate::ErrorKind::IO,
+								"preview path has no file name".to_string(),
+							)
+						})?;
+					let tmp_path =
+						path.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+					let tmp_file = tokio::fs::OpenOptions::new()
+						.write(true)
+						.create_new(true)
+						.open(&tmp_path)
+						.await?;
+					let mut tmp_guard = crate::io::client_impl::TmpFileGuard::new(tmp_path.clone());
+					let mut writer = tmp_file.compat_write();
+					let preview = write_embedded_preview_remote(this, file, &mut writer).await?;
+					drop(writer);
+					if preview.is_some() {
+						tokio::fs::rename(&tmp_path, &path).await?;
+						tmp_guard.disarm();
+					}
+					Ok(EmbeddedPreviewResult::from(preview))
+				})
+				.await
 		}
 	}
 }
@@ -1483,5 +1905,229 @@ mod tests {
 		);
 		assert_eq!(outcome, ThumbnailOutcome::Unsupported);
 		assert!(out.is_empty());
+	}
+
+	// -----------------------------------------------------------------------
+	// The embedded preview, written out as it is.
+	// -----------------------------------------------------------------------
+
+	use super::{
+		EmbeddedPreview, MAX_PREVIEW_BYTES, ORIENTATION_APP1_LEN, locate_embedded_preview,
+		write_embedded_preview,
+	};
+	use microthumb::ByteSource;
+
+	fn jpeg_bytes(width: u32, height: u32) -> Vec<u8> {
+		use image::{ImageFormat, RgbImage};
+		let image = RgbImage::from_fn(width, height, |x, y| {
+			image::Rgb([(x % 256) as u8, (y % 256) as u8, 0])
+		});
+		let mut bytes = Vec::new();
+		image
+			.write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Jpeg)
+			.unwrap();
+		bytes
+	}
+
+	/// Where a SubIFD JPEG sits in [`raw_with`]: past the two directories.
+	const PREVIEW_AT: u64 = 200;
+
+	/// A RAW-shaped container: a little-endian TIFF whose IFD0 carries
+	/// `orientation` and whose SubIFD points at a JPEG of `declared` bytes at
+	/// [`PREVIEW_AT`] — the shape every TIFF-family camera uses, and the one
+	/// microthumb's own tests prove it walks.
+	fn raw_with(jpeg: &[u8], orientation: u32, declared: u32) -> Vec<u8> {
+		fn entry(tag: u16, typ: u16, count: u32, value: u32) -> Vec<u8> {
+			let mut out = tag.to_le_bytes().to_vec();
+			out.extend_from_slice(&typ.to_le_bytes());
+			out.extend_from_slice(&count.to_le_bytes());
+			out.extend_from_slice(&value.to_le_bytes());
+			out
+		}
+		let mut file = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+		file.extend_from_slice(&2u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x0112, 3, 1, orientation));
+		file.extend_from_slice(&entry(0x014A, 4, 1, 60));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(60, 0);
+		file.extend_from_slice(&2u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x0201, 4, 1, PREVIEW_AT as u32));
+		file.extend_from_slice(&entry(0x0202, 4, 1, declared));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(PREVIEW_AT as usize, 0);
+		file.extend_from_slice(jpeg);
+		file
+	}
+
+	fn write(container: Vec<u8>) -> (EmbeddedPreview, Vec<u8>) {
+		let mut src = MemSource(container);
+		let preview = locate_embedded_preview(&mut src)
+			.unwrap()
+			.expect("a preview");
+		let mut out = Vec::new();
+		let written = write_embedded_preview(&mut src, &preview, &mut out).unwrap();
+		assert_eq!(written, out.len() as u64);
+		assert_eq!(written, preview.written_len());
+		(preview, out)
+	}
+
+	/// The one test that fails if anything starts transcoding: what comes out
+	/// is byte for byte what the camera stored.
+	#[test]
+	fn the_written_preview_is_the_stored_jpeg_and_nothing_else() {
+		let jpeg = jpeg_bytes(640, 480);
+		let (preview, out) = write(raw_with(&jpeg, 1, jpeg.len() as u32));
+		assert_eq!(out, jpeg);
+		assert_eq!(preview.app1, None);
+		assert_eq!((preview.located.width, preview.located.height), (640, 480));
+	}
+
+	/// A rotation only the container knows is spliced in as the smallest
+	/// legal EXIF segment, behind the JFIF APP0 the encoder wrote, and a
+	/// decoder reads it back as the rotation it is. Everything either side of
+	/// those 36 bytes is untouched.
+	#[test]
+	fn a_container_rotation_is_spliced_in_as_exif() {
+		use image::{ImageDecoder, metadata::Orientation};
+
+		let jpeg = jpeg_bytes(640, 480);
+		let (preview, out) = write(raw_with(&jpeg, 6, jpeg.len() as u32));
+		let at = usize::from(preview.located.exif_insert_at.expect("a splice point"));
+		// SOI, then the 16-byte JFIF APP0 with its marker and length.
+		assert_eq!(at, 2 + 2 + 16);
+		let app1 = preview.app1.expect("the container knows a rotation");
+		assert_eq!(out.len(), jpeg.len() + ORIENTATION_APP1_LEN);
+		assert_eq!(&out[..at], &jpeg[..at]);
+		assert_eq!(&out[at..at + ORIENTATION_APP1_LEN], &app1);
+		assert_eq!(&out[at + ORIENTATION_APP1_LEN..], &jpeg[at..]);
+
+		let mut decoder = image::ImageReader::new(std::io::Cursor::new(&out))
+			.with_guessed_format()
+			.unwrap()
+			.into_decoder()
+			.unwrap();
+		assert_eq!(decoder.dimensions(), (640, 480));
+		assert_eq!(decoder.orientation().unwrap(), Orientation::Rotate90);
+	}
+
+	/// A stream that carries an EXIF of its own — Fuji, Panasonic — is left
+	/// alone whatever the container says, and the orientation reported is the
+	/// one that EXIF declares, because that is what a viewer will apply.
+	#[test]
+	fn a_stream_with_its_own_exif_is_left_alone_and_speaks_for_itself() {
+		let plain = jpeg_bytes(640, 480);
+		let mut jpeg = vec![0xFF, 0xD8];
+		jpeg.extend_from_slice(&super::orientation_app1(6));
+		jpeg.extend_from_slice(&plain[2..]);
+		// The container claims 8; the stream says 6 and the stream wins.
+		let (preview, out) = write(raw_with(&jpeg, 8, jpeg.len() as u32));
+		assert_eq!(out, jpeg);
+		assert_eq!(preview.app1, None);
+		assert_eq!(preview.located.stream_orientation, Some(6));
+		assert_eq!(preview.viewer_orientation(), 6);
+		// Neither side declares anything: upright, and nothing spliced.
+		let (preview, out) = write(raw_with(&plain, 1, plain.len() as u32));
+		assert_eq!(out, plain);
+		assert_eq!(preview.viewer_orientation(), 1);
+		// Only the container knows: spliced, and reported.
+		let (preview, _) = write(raw_with(&plain, 3, plain.len() as u32));
+		assert!(preview.app1.is_some());
+		assert_eq!(preview.viewer_orientation(), 3);
+	}
+
+	/// A source that hands out a fixed prefix and claims to be much longer:
+	/// every read past the prefix answers zeros, and the furthest offset asked
+	/// for is recorded.
+	struct Sparse {
+		prefix: Vec<u8>,
+		len: u64,
+		furthest: Arc<AtomicUsize>,
+	}
+
+	impl ByteSource for Sparse {
+		fn len(&self) -> u64 {
+			self.len
+		}
+
+		fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+			if offset >= self.len {
+				return Ok(0);
+			}
+			self.furthest
+				.fetch_max(offset as usize + buf.len(), Ordering::Relaxed);
+			let n = (self.len - offset).min(buf.len() as u64) as usize;
+			for (i, b) in buf[..n].iter_mut().enumerate() {
+				*b = self.prefix.get(offset as usize + i).copied().unwrap_or(0);
+			}
+			Ok(n)
+		}
+	}
+
+	/// `jpeg` with its SOF0 rewritten to claim `w`x`h`; nothing here decodes
+	/// it, and microthumb's own per-pixel cap scales with what the SOF says.
+	fn with_sof_dims(mut jpeg: Vec<u8>, w: u16, h: u16) -> Vec<u8> {
+		let at = jpeg
+			.windows(2)
+			.position(|m| m == [0xFF, 0xC0])
+			.expect("a baseline SOF");
+		jpeg[at + 5..at + 7].copy_from_slice(&h.to_be_bytes());
+		jpeg[at + 7..at + 9].copy_from_slice(&w.to_be_bytes());
+		jpeg
+	}
+
+	/// A forged length is refused on the container's word, before a single
+	/// payload byte is read — what stops a hostile file turning one preview
+	/// into a 60 MB stream. The SOF claims 48 Mpx so that microthumb's own
+	/// per-pixel cap (4 B/px) clears and this ceiling is the one deciding;
+	/// both sides of it are pinned.
+	#[test]
+	fn a_forged_length_is_refused_before_any_payload_is_read() {
+		let jpeg = with_sof_dims(jpeg_bytes(640, 480), 8000, 6000);
+		let sparse = |declared: u32| {
+			let furthest = Arc::new(AtomicUsize::new(0));
+			let src = Sparse {
+				prefix: raw_with(&jpeg, 1, declared),
+				len: u64::from(declared) + PREVIEW_AT + 1024,
+				furthest: furthest.clone(),
+			};
+			(src, furthest)
+		};
+		let (mut src, furthest) = sparse(MAX_PREVIEW_BYTES as u32 + 1);
+		assert_eq!(locate_embedded_preview(&mut src).unwrap(), None);
+		assert!(
+			furthest.load(Ordering::Relaxed) < 64 * 1024,
+			"read {} bytes into a preview it was going to refuse",
+			furthest.load(Ordering::Relaxed)
+		);
+		// One byte under the ceiling is served — and locating it reads no
+		// payload either.
+		let (mut src, furthest) = sparse(MAX_PREVIEW_BYTES as u32);
+		assert!(locate_embedded_preview(&mut src).unwrap().is_some());
+		assert!(furthest.load(Ordering::Relaxed) < 64 * 1024);
+	}
+
+	/// A source that runs out inside the range it declared is an error: a
+	/// short file at the consumer's path would be cached as the whole preview.
+	#[test]
+	fn a_source_that_runs_short_is_an_error_not_a_short_file() {
+		let jpeg = jpeg_bytes(640, 480);
+		let declared = jpeg.len() as u32 + 4096;
+		let container = raw_with(&jpeg, 1, declared);
+		let real_len = container.len() as u64;
+		struct Truncated(MemSource, u64);
+		impl ByteSource for Truncated {
+			fn len(&self) -> u64 {
+				self.1
+			}
+			fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+				self.0.read_at(offset, buf)
+			}
+		}
+		let mut src = Truncated(MemSource(container), real_len + 4096);
+		let preview = locate_embedded_preview(&mut src)
+			.unwrap()
+			.expect("the declared range fits the claimed length");
+		let mut out = Vec::new();
+		assert!(write_embedded_preview(&mut src, &preview, &mut out).is_err());
 	}
 }
