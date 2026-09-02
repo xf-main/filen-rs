@@ -893,6 +893,52 @@ async fn count_cache_files(dir: &Path) -> std::io::Result<Vec<(PathBuf, DateTime
 	results.into_iter().collect()
 }
 
+/// One `thumbnails/<uuid>` directory: every `<w>x<h>.webp` inside is a candidate for the
+/// sweep. Nothing else is ever written at the top level (`get_or_make_thumbnail` creates the
+/// per-uuid directory first), so a bare file there is a leftover of nothing and goes.
+///
+/// Two things inside are left alone: a `.tmp` is an encode in flight (its guard removes it if
+/// that encode dies), and an empty directory is a slot an encode is about to fill — eviction
+/// removes a directory with its last size, and `cleanup_uuid_dir` prunes those of items gone
+/// from the database, so nothing else has to.
+async fn thumbnails_in(
+	entry: tokio::fs::DirEntry,
+) -> std::io::Result<Vec<(PathBuf, DateTime<Utc>, u64)>> {
+	let path = entry.path();
+	if !entry.file_type().await?.is_dir() {
+		tokio::fs::remove_file(&path).await?;
+		return Ok(Vec::new());
+	}
+	let mut contents = tokio::fs::read_dir(&path).await?;
+	let mut found = Vec::new();
+	while let Some(file) = next_entry_filter_icloud_files(&mut contents).await? {
+		let file_path = file.path();
+		if file_path.extension().is_some_and(|ext| ext == "tmp") {
+			continue;
+		}
+		let meta = match file.metadata().await {
+			Ok(meta) => meta,
+			// Renamed into place or removed between the listing and the stat: an encode
+			// finishing. The rest of the item still counts.
+			Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+			Err(e) => return Err(e),
+		};
+		if meta.is_file() {
+			found.push((
+				file_path,
+				FilenMetaExt::accessed_or_modified(&meta),
+				FilenMetaExt::size(&meta),
+			));
+		}
+	}
+	Ok(found)
+}
+
+/// The thumbnail dir is laid out `thumbnails/<uuid>/<w>x<h>.webp`, one directory per item
+/// holding every size made for it. The sweep used to expect thumbnails as direct children and
+/// removed every directory it met as "invalid state" — which was every thumbnail on the device,
+/// on each cleanup pass. Each size is its own entry, evicted on its own: an item's sizes have
+/// their own ages, and charging one while removing all was how the sweep over-evicted.
 async fn count_thumbnail_files(
 	thumbnail_dir: &Path,
 ) -> std::io::Result<Vec<(PathBuf, DateTime<Utc>, u64)>> {
@@ -900,42 +946,25 @@ async fn count_thumbnail_files(
 		tokio_stream::wrappers::ReadDirStream::new(tokio::fs::read_dir(thumbnail_dir).await?);
 
 	let results = stream
-		.map(|entry| async move {
-			let entry = entry?;
-			let path = entry.path();
-			let file_type = entry.file_type().await?;
-
-			if file_type.is_file() {
-				let meta = entry.metadata().await?;
-				let modified = FilenMetaExt::accessed_or_modified(&meta);
-				let size = FilenMetaExt::size(&meta);
-				Ok(Some((path, modified, size)))
-			} else if file_type.is_dir() {
-				// if it's not a file, we remove the directory
-				tokio::fs::remove_dir_all(path).await?;
-				Ok(None)
-			} else {
-				tokio::fs::remove_file(path).await?;
-				Ok(None)
-			}
-		})
+		.map(|entry| async move { thumbnails_in(entry?).await })
 		.buffer_unordered(128)
-		// don't care about Ok(None), means we fixed the issue by removing invalid files
-		// we also don't care about NotFound errors, they mean the file was already removed
-		.filter_map(|res: Result<Option<_>, std::io::Error>| async {
-			if let Err(e) = &res
-				&& e.kind() == io::ErrorKind::NotFound
-			{
-				None
-			} else {
-				res.transpose()
+		// a NotFound is a directory something else removed between the listing and the read —
+		// the identity sweep runs over this directory concurrently — and is not worth stopping for
+		.filter_map(|res: Result<Vec<_>, std::io::Error>| async {
+			match res {
+				Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+				res => Some(res),
 			}
 		})
 		.collect::<Vec<_>>()
 		.await;
 	// we first want to make sure we try to cleanup as many files as possible
 	// and only then return an error if there was one
-	results.into_iter().collect()
+	let mut files = Vec::new();
+	for res in results {
+		files.extend(res?);
+	}
+	Ok(files)
 }
 
 const MIN_CACHED_FILES: usize = 5;
@@ -959,15 +988,21 @@ where
 		if total_size < size_budget || file_count < MIN_CACHED_FILES {
 			break;
 		}
-		// Cache files live inside per-file directories (cache/<uuid>/<name>), so we
-		// remove the parent directory to avoid leaving empty UUID directories behind.
-		// Thumbnail files live directly in the thumbnail dir, so we remove the file itself.
+		// Exactly the file, so what is charged is what was freed. A concurrent sweep may
+		// have got there first; that is not a reason to stop.
+		match tokio::fs::remove_file(&path).await {
+			Ok(()) => {}
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+			Err(e) => return Err(e),
+		}
+		// Both directories keep their files one level down (cache/<uuid>/<name>,
+		// thumbnails/<uuid>/<w>x<h>.webp), so the uuid directory goes with its last file
+		// rather than being left behind empty. Non-recursive on purpose: while a sibling size
+		// or an encode in flight is still inside, the directory stays.
 		if let Some(parent) = path.parent()
 			&& parent != dir
 		{
-			tokio::fs::remove_dir_all(parent).await?;
-		} else {
-			tokio::fs::remove_file(&path).await?;
+			let _ = tokio::fs::remove_dir(parent).await;
 		}
 		total_size = total_size.saturating_sub(size);
 		file_count -= 1;
@@ -1235,6 +1270,181 @@ mod tests {
 		assert!(
 			in_flight.exists(),
 			"a download writing right now must survive the sweep"
+		);
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// A thumbnail laid out the way `get_or_make_thumbnail` writes it: `<uuid>/<w>x<h>.webp`,
+	/// several sizes per item. Backdated like `stage` — both timestamps, because the sweep
+	/// orders by access time where the filesystem keeps one — so eviction order is
+	/// deterministic.
+	fn thumbnail(dir: &Path, uuid: &str, size: &str, bytes: usize, age: Duration) -> PathBuf {
+		let item = dir.join(uuid);
+		std::fs::create_dir_all(&item).unwrap();
+		let path = item.join(format!("{size}.webp"));
+		std::fs::write(&path, vec![0u8; bytes]).unwrap();
+		let then = SystemTime::now() - age;
+		std::fs::File::open(&path)
+			.unwrap()
+			.set_times(FileTimes::new().set_accessed(then).set_modified(then))
+			.unwrap();
+		path
+	}
+
+	/// The sweep once expected thumbnails as direct children of the thumbnail dir and removed
+	/// every directory it met as invalid state — which was every thumbnail on the device, on
+	/// every cleanup pass. Under budget the per-uuid layout has to come through untouched; only
+	/// what the writer never produces (a bare top-level file) goes, and an empty item directory
+	/// — a slot an encode is about to fill — is left alone.
+	#[tokio::test]
+	async fn thumbnails_under_budget_survive_the_sweep() {
+		let dir = std::env::temp_dir().join(format!("filen-thumb-sweep-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let a = "00000000-0000-0000-0000-00000000000a";
+		let b = "00000000-0000-0000-0000-00000000000b";
+		let kept = [
+			thumbnail(&dir, a, "64x64", 100, Duration::ZERO),
+			thumbnail(&dir, a, "128x128", 100, Duration::ZERO),
+			thumbnail(&dir, b, "64x64", 100, Duration::ZERO),
+		];
+		let stray = dir.join("stray.webp");
+		std::fs::write(&stray, b"x").unwrap();
+		// An empty per-uuid directory: an encode between creating it and its temp file.
+		let emptied = dir.join("00000000-0000-0000-0000-00000000000c");
+		std::fs::create_dir_all(&emptied).unwrap();
+
+		let total = remove_old_files(&dir, u64::MAX, count_thumbnail_files)
+			.await
+			.unwrap();
+
+		assert_eq!(total, 300, "every size of every item is counted");
+		for path in &kept {
+			assert!(
+				path.exists(),
+				"{} was swept while under budget",
+				path.display()
+			);
+		}
+		assert!(
+			!stray.exists(),
+			"a bare file at the top level is nothing the writer produces"
+		);
+		assert!(
+			emptied.exists(),
+			"an empty item directory is an encode's, not the sweep's"
+		);
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Each size is evicted on its own: a stale grid size goes while the item's fresh preview
+	/// size stays, and the item's directory stays with it. The old sweep removed the whole
+	/// directory for the first size it met and charged one file for it.
+	#[tokio::test]
+	async fn a_stale_size_goes_without_its_newer_siblings() {
+		let dir = std::env::temp_dir().join(format!("filen-thumb-sizes-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let hour = Duration::from_secs(3600);
+		let a = "00000000-0000-0000-0000-00000000000a";
+		let stale = thumbnail(&dir, a, "64x64", 100, 10 * hour);
+		let fresh = thumbnail(&dir, a, "512x512", 100, Duration::from_secs(60));
+		let others: Vec<_> = (0xbu32..=0xe)
+			.map(|n| {
+				thumbnail(
+					&dir,
+					&format!("00000000-0000-0000-0000-00000000000{n:x}"),
+					"64x64",
+					100,
+					(n - 8) * hour,
+				)
+			})
+			.collect();
+
+		// 600 bytes on disk against a 501-byte budget: exactly one eviction brings it under.
+		let total = remove_old_files(&dir, 501, count_thumbnail_files)
+			.await
+			.unwrap();
+
+		assert!(!stale.exists(), "the stale size is the one over budget");
+		assert!(fresh.exists(), "the fresh size of the same item stays");
+		for path in &others {
+			assert!(
+				path.exists(),
+				"{} was evicted for bytes already freed",
+				path.display()
+			);
+		}
+		assert_eq!(total, 500);
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// An encode in flight is neither counted nor evicted: its `.tmp` belongs to its guard.
+	#[tokio::test]
+	async fn an_encode_in_flight_is_left_to_its_guard() {
+		let dir = std::env::temp_dir().join(format!("filen-thumb-tmp-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let a = "00000000-0000-0000-0000-00000000000a";
+		let done = thumbnail(&dir, a, "64x64", 100, Duration::from_secs(60));
+		let in_flight = dir.join(a).join("256x256.0000.tmp");
+		std::fs::write(&in_flight, vec![0u8; 5000]).unwrap();
+
+		let total = remove_old_files(&dir, 0, count_thumbnail_files)
+			.await
+			.unwrap();
+
+		assert_eq!(total, 100, "the temp file is not counted");
+		assert!(in_flight.exists(), "the temp file is not evicted");
+		assert!(done.exists(), "one file is under MIN_CACHED_FILES");
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Over budget the oldest sizes go — here both sizes of one item, and with the last one
+	/// its directory — and the sweep finishes.
+	#[tokio::test]
+	async fn the_oldest_item_is_evicted_whole_and_the_sweep_finishes() {
+		let dir = std::env::temp_dir().join(format!("filen-thumb-evict-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let hour = Duration::from_secs(3600);
+		let old = "00000000-0000-0000-0000-00000000000a";
+		let newer = [
+			"00000000-0000-0000-0000-00000000000b",
+			"00000000-0000-0000-0000-00000000000c",
+		];
+		// MIN_CACHED_FILES keeps five files whatever the budget, so six are needed for the
+		// sweep to evict anything at all.
+		thumbnail(&dir, old, "64x64", 100, 3 * hour);
+		thumbnail(&dir, old, "128x128", 100, 3 * hour);
+		let kept: Vec<_> = newer
+			.iter()
+			.flat_map(|uuid| {
+				[
+					thumbnail(&dir, uuid, "64x64", 100, hour),
+					thumbnail(&dir, uuid, "128x128", 100, hour),
+				]
+			})
+			.collect();
+
+		let total = remove_old_files(&dir, 0, count_thumbnail_files)
+			.await
+			.unwrap();
+
+		assert!(
+			!dir.join(old).exists(),
+			"the oldest item's sizes go, and its directory with the last of them"
+		);
+		for path in &kept {
+			assert!(
+				path.exists(),
+				"{} was evicted ahead of the oldest item",
+				path.display()
+			);
+		}
+		assert_eq!(
+			total, 400,
+			"both evicted sizes come off the total, the second on its own turn"
 		);
 
 		std::fs::remove_dir_all(&dir).unwrap();

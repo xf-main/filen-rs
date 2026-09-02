@@ -126,11 +126,25 @@ impl AuthCacheState {
 			"{target_width}x{target_height}.{}.tmp",
 			Uuid::new_v4()
 		));
-		let tmp_file = tokio::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(&tmp_path)
-			.await?;
+		let create_tmp = || async {
+			tokio::fs::OpenOptions::new()
+				.write(true)
+				.create_new(true)
+				.open(&tmp_path)
+				.await
+		};
+		let tmp_file = match create_tmp().await {
+			Ok(file) => file,
+			// The sweep removes an item's directory with its last evicted size, and landing
+			// between the create_dir_all above and here it takes the directory this encode
+			// just made. Once the temp file exists the directory is not empty and the sweep
+			// leaves it alone, so making the directory once more is enough.
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				tokio::fs::create_dir_all(&file_thumbnails_path).await?;
+				create_tmp().await?
+			}
+			Err(e) => return Err(e.into()),
+		};
 		// One cleanup for every exit: the guard removes the temp file on drop unless
 		// the rename below disarmed it — covering the error arms, a failed rename,
 		// AND an aborted batch (cancel() drops this future mid-await while the
