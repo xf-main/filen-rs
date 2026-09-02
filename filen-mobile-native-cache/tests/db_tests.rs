@@ -6350,6 +6350,10 @@ pub async fn test_update_and_query_item_refreshes_a_dir_and_knows_nothing_of_unk
 // deleted.
 #[shared_test_runtime]
 pub async fn test_update_and_query_item_learns_an_unlisted_dir_from_the_server() {
+	// "Never heard of this directory" holds only outside a live window: the root row is always
+	// held, so a live drainer lands this test's own dir on its creation echo, and the fixture
+	// under it is relevant the moment it exists; see LIVE_WINDOW_LOCK.
+	let _quiescent = LIVE_WINDOW_LOCK.read().await;
 	let (db, rss) = get_db_resources().await;
 
 	// Made on the server and never listed here — nothing below puts it in the cache but the query
@@ -7295,12 +7299,21 @@ pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent(
 	let listener = Arc::new(CountingWorkingSetListener::default());
 	db.set_working_set_listener(Some(listener.clone()));
 
-	// The destination is made on the server BEFORE the socket comes up, so its own creation
-	// event is never delivered: the cache must not hold it, and the only thing that will ever
-	// name it here is the moved file's own row.
+	// The destination sits under a directory this cache holds no row for. That, not timing, is
+	// what keeps it out of the cache: the socket comes up into a gap check, and a replay re-lists
+	// every held container an event names — the test dir included, for the upload above — so a
+	// destination directly under the test dir would land as a child of that listing. One level
+	// down, the re-list lands `hidden` and nothing names the destination itself: the only thing
+	// that will ever name it here is the moved file's own row. (A reconnect inside this window
+	// would fold the move with `hidden` held and seed it; none is expected.)
+	let hidden = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "unlisted_move_parent")
+		.await
+		.unwrap();
 	let destination = rss
 		.client
-		.create_dir(&(&rss.dir).into(), "unlisted_move_target")
+		.create_dir(&(&hidden).into(), "unlisted_move_target")
 		.await
 		.unwrap();
 	let destination_uuid = destination.uuid().to_string();
@@ -7352,6 +7365,7 @@ pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent(
 		.delete_dir_permanently(destination)
 		.await
 		.unwrap();
+	rss.client.delete_dir_permanently(hidden).await.unwrap();
 }
 
 /// A file moved OUT of a listed directory by another device must be re-parented in place when the
@@ -7630,35 +7644,101 @@ fn last_listed(db: &FilenMobileCacheState, uuid: &str) -> i64 {
 	}
 }
 
+/// The live path's durable bookkeeping, read from the `db_state.json` the cache mirrors it to
+/// (`update_saved_db_state`; the in-memory test state writes it like any other).
+fn saved_db_state() -> serde_json::Value {
+	let path = std::env::temp_dir()
+		.join("test_files")
+		.join("db_state.json");
+	let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+		panic!(
+			"{} must exist once the cache has run (get_db_resources builds the same path): {e}",
+			path.display()
+		)
+	});
+	serde_json::from_str(&text).expect("db_state.json is JSON")
+}
+
+/// The drive watermark: the last drive counter this cache accounted for. Written by the drainer
+/// ONLY — at the end of a gap pass that converged, and after each live event it applies.
+fn drive_watermark() -> i64 {
+	saved_db_state()["driveWatermark"].as_i64().unwrap_or(0)
+}
+
+/// Whether a reconcile pass is owed. Set by `set_materialized_containers` for a container it has
+/// not seen before; cleared only by a pass that converged.
+fn pending_reconcile() -> bool {
+	saved_db_state()["pendingReconcile"]
+		.as_bool()
+		.unwrap_or(false)
+}
+
+/// Waits until the drainer has run its gap check and moved on, after a `start_live_updates`
+/// whose caller read `before` from [`drive_watermark`] first.
+///
+/// The drainer is ONE task, and it handles `authSuccess` — the whole gap check, sweep or replay,
+/// listings and all — before it applies a single live event. Nothing else writes the watermark:
+/// a pass that converged writes it last, and every live event applied afterwards writes it
+/// again. So the watermark moving past `before` proves the gap check is over, whichever way it
+/// went, and every `last_listed` stamp the pass wrote is final — which is what makes a NEGATIVE
+/// assertion on a stamp ("this container was not re-listed") sound. Reading stamps any earlier
+/// races the pass: it lists its containers concurrently, so one landing says nothing about
+/// the rest.
+///
+/// A gap check that finds nothing to do writes nothing, so the wait is driven by probe dirs
+/// under the (held, hence relevant) test dir — the same shape as
+/// `wait_until_live_is_delivering`, for the same reason: an event emitted before the
+/// subscription is up is never redelivered.
+async fn wait_until_the_gap_check_has_run(rss: &TestResources, before: i64) {
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+	let mut pass = 0;
+	while drive_watermark() <= before {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the drive watermark never moved past {before}: no gap pass converged and no live \
+			 event was applied, so the socket loop is not live"
+		);
+		rss.client
+			.create_dir(&(&rss.dir).into(), &format!("gap_probe_{pass}"))
+			.await
+			.unwrap();
+		pass += 1;
+		let settle = std::time::Instant::now() + std::time::Duration::from_secs(6);
+		while drive_watermark() <= before && std::time::Instant::now() < settle {
+			tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+		}
+	}
+}
+
 /// Brings the live path up and waits out the full sweep that establishes the event cursor.
 ///
 /// Replay cannot close the FIRST gap a cache ever sees: with no cursor there is no lower bound
 /// to page back to, so `gap_check` sweeps every materialized container and stamps the cursor
 /// from before that sweep. Only later gaps are replayable, which is the state these tests are
-/// about, so a test that does not wait for the sweep to finish is testing the fallback.
+/// about, so a test that does not wait for the sweep to CONVERGE is testing the fallback.
 ///
-/// `witness` is a materialized container the sweep must therefore re-list; its `last_listed`
-/// moving is the only externally visible proof that the pass ran to completion and converged —
-/// and convergence is exactly what stamps the cursor. Waiting on a row DELIVERED instead would
-/// prove nothing: the live socket delivers rows the moment they are created, long before the
-/// pass that is running alongside it has reached anything.
-async fn seed_the_event_cursor(
-	db: &Arc<FilenMobileCacheState>,
-	rss: &TestResources,
-	listener: &CountingWorkingSetListener,
-	witness: &str,
-) {
-	let before = last_listed(db, witness);
+/// Convergence is observed through the debt: every caller has just reported fresh materialized
+/// containers, which owes a pass, and only a pass that converged clears it. A drainer leaked by
+/// a sibling test (see `LiveWindow`) fails here, loudly, rather than three assertions later:
+/// `start_live_updates` is then a no-op, no gap check runs, and the debt stands.
+async fn seed_the_event_cursor(db: &Arc<FilenMobileCacheState>, rss: &TestResources) {
+	assert!(
+		pending_reconcile(),
+		"report the materialized containers before seeding; that is what owes the pass"
+	);
+	let before = drive_watermark();
 	db.start_live_updates();
-	wait_until_live_is_delivering(rss, listener).await;
-	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-	while last_listed(db, witness) <= before {
+	wait_until_the_gap_check_has_run(rss, before).await;
+	// The pass writes the watermark before it clears the debt; give that write its moment.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+	while pending_reconcile() {
 		assert!(
 			std::time::Instant::now() < deadline,
-			"the launch sweep never re-listed the witness container; with no cursor stamped, \
+			"the launch pass did not converge, or never ran because a sibling live test left \
+			 the drainer armed and `start_live_updates` was a no-op; with the debt standing, \
 			 every later gap falls back to the sweep and replay cannot be tested"
 		);
-		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+		tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 	}
 }
 
@@ -7684,6 +7764,7 @@ async fn outlast_the_dispatch() {
 pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() {
 	let _live_window = LIVE_WINDOW_LOCK.write().await;
 	let (db, rss) = get_db_resources().await;
+	let _teardown = LiveWindow(db.clone());
 
 	let target = rss
 		.client
@@ -7705,11 +7786,9 @@ pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() 
 		.await
 		.unwrap();
 
-	let listener = Arc::new(CountingWorkingSetListener::default());
-	db.set_working_set_listener(Some(listener.clone()));
-	// The decoy doubles as the witness: the sweep that stamps the cursor is the same sweep whose
-	// absence the decoy is about to demonstrate.
-	seed_the_event_cursor(&db, &rss, &listener, &decoy_uuid).await;
+	// The sweep that stamps the cursor is the same sweep whose absence the decoy is about to
+	// demonstrate; its stamp is read only once that sweep has converged.
+	seed_the_event_cursor(&db, &rss).await;
 	let decoy_listed_before = last_listed(&db, &decoy_uuid);
 
 	// The outage, and a change in exactly one of the two containers.
@@ -7732,7 +7811,11 @@ pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() 
 	);
 	outlast_the_dispatch().await;
 
+	let before_reconnect = drive_watermark();
 	db.start_live_updates();
+	// The decoy's stamp below is a negative assertion, so it may only be read once the gap
+	// check — and every listing it started — is over.
+	wait_until_the_gap_check_has_run(&rss, before_reconnect).await;
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 	let delivered = loop {
 		if let Some(FfiObject::File(f)) = db.query_item_by_uuid(&stable_id).unwrap() {
@@ -7760,7 +7843,6 @@ pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() 
 	);
 
 	db.stop_live_updates();
-	db.set_working_set_listener(None);
 	db.set_materialized_containers(vec![]).await.unwrap();
 	rss.client.delete_file_permanently(file).await.unwrap();
 	rss.client.delete_dir_permanently(target).await.unwrap();
@@ -7775,6 +7857,7 @@ pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() 
 pub async fn test_replaying_a_move_relists_both_ends() {
 	let _live_window = LIVE_WINDOW_LOCK.write().await;
 	let (db, rss) = get_db_resources().await;
+	let _teardown = LiveWindow(db.clone());
 
 	let origin = rss
 		.client
@@ -7833,9 +7916,7 @@ pub async fn test_replaying_a_move_relists_both_ends() {
 		origin_uuid
 	);
 
-	let listener = Arc::new(CountingWorkingSetListener::default());
-	db.set_working_set_listener(Some(listener.clone()));
-	seed_the_event_cursor(&db, &rss, &listener, &origin_uuid).await;
+	seed_the_event_cursor(&db, &rss).await;
 	let origin_listed_before = last_listed(&db, &origin_uuid);
 	let decoy_listed_before = last_listed(&db, &decoy_uuid);
 
@@ -7847,7 +7928,13 @@ pub async fn test_replaying_a_move_relists_both_ends() {
 		.unwrap();
 	outlast_the_dispatch().await;
 
+	let before_reconnect = drive_watermark();
 	db.start_live_updates();
+	// Every stamp below is read only once the gap check is over. The pass lists its containers
+	// concurrently and the destination's listing alone re-parents the row, so polling for the
+	// re-parent and then reading the origin's stamp reads it mid-pass — which is exactly how
+	// this test once failed with the origin's listing 217 µs from landing.
+	wait_until_the_gap_check_has_run(&rss, before_reconnect).await;
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 	loop {
 		if let Some(FfiObject::File(f)) = db.query_item_by_uuid(&stable_id).unwrap()
@@ -7893,7 +7980,6 @@ pub async fn test_replaying_a_move_relists_both_ends() {
 	);
 
 	db.stop_live_updates();
-	db.set_working_set_listener(None);
 	db.set_materialized_containers(vec![]).await.unwrap();
 	rss.client.delete_file_permanently(file).await.unwrap();
 	rss.client.delete_dir_permanently(origin).await.unwrap();
@@ -7919,6 +8005,7 @@ pub async fn test_replaying_a_move_relists_both_ends() {
 pub async fn test_replaying_a_purge_from_the_trash_retires_the_row() {
 	let _live_window = LIVE_WINDOW_LOCK.write().await;
 	let (db, rss) = get_db_resources().await;
+	let _teardown = LiveWindow(db.clone());
 
 	let container = rss
 		.client
@@ -7961,9 +8048,7 @@ pub async fn test_replaying_a_purge_from_the_trash_retires_the_row() {
 	db.set_materialized_containers(vec![container_uuid.clone()])
 		.await
 		.unwrap();
-	let listener = Arc::new(CountingWorkingSetListener::default());
-	db.set_working_set_listener(Some(listener.clone()));
-	seed_the_event_cursor(&db, &rss, &listener, &container_uuid).await;
+	seed_the_event_cursor(&db, &rss).await;
 
 	// The outage, and the purge. `deleteFilePermanently` carries the lineage but no parent, and
 	// the row it names sits in the trash — so the trash listing is the only thing that can
@@ -7990,7 +8075,6 @@ pub async fn test_replaying_a_purge_from_the_trash_retires_the_row() {
 	}
 
 	db.stop_live_updates();
-	db.set_working_set_listener(None);
 	db.set_materialized_containers(vec![]).await.unwrap();
 	rss.client.delete_dir_permanently(container).await.unwrap();
 }
