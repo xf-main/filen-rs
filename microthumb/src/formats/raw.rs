@@ -32,8 +32,8 @@
 
 use crate::exif::{Endian, u16_at, u32_at};
 use crate::{
-	ByteSource, FormatDecoder, PixelSink, PreparedDecode, SmallImage, SubSource, ThumbError,
-	ThumbSpec,
+	ByteSource, FormatDecoder, LocatedPreview, MIN_PREVIEW_LONG_SIDE, PixelSink, PreparedDecode,
+	SmallImage, SubSource, ThumbError, ThumbSpec,
 };
 
 /// Directories visited per file, across the IFD chain, SubIFDs and maker
@@ -84,29 +84,97 @@ pub(super) struct Index {
 	/// EXIF orientation from the first directory that declares one.
 	pub orientation: u8,
 	/// The largest believable preview, or `None` when the file hides nothing
-	/// usable.
+	/// usable. Either kind: for a thumbnail an uncompressed strip beats a
+	/// smaller JPEG stamp.
 	pub preview: Option<Preview>,
+	/// The largest believable JPEG alone — what a viewer can be handed. Kept
+	/// apart because the two kinds must not race for one slot: a bigger RGB
+	/// strip would otherwise hide a perfectly good JPEG from the preview
+	/// path.
+	pub jpeg: Option<Preview>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum Preview {
-	/// A JPEG byte range, with the dimensions its own SOF declares.
-	Jpeg { off: u64, len: u64, w: u32, h: u32 },
+	/// A JPEG byte range, described by its own leading segments.
+	Jpeg { off: u64, len: u64, head: JpegHead },
 	/// A single uncompressed 8-bit RGB strip.
 	Rgb { off: u64, w: u32, h: u32 },
 }
 
+/// What a JPEG's leading segments say about it, from one bounded read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JpegHead {
+	pub w: u32,
+	pub h: u32,
+	/// Sample precision from the SOF. 8 for anything a viewer decodes.
+	pub precision: u8,
+	/// Component count from the SOF: 1 grey, 3 YCbCr, 4 CMYK/YCCK.
+	pub components: u8,
+	/// Where an EXIF APP1 may be spliced into the stream — right after the
+	/// SOI, or behind a leading APP0/JFIF, which is the order every camera
+	/// JPEG ships. `None` when the stream already carries an EXIF APP1 ahead
+	/// of its SOF (a second one is the case no decoder's behaviour is settled
+	/// for). An XMP APP1 does not take the slot: EXIF before XMP is the order
+	/// XMP itself prescribes. (A JFIF APP0 at its 64 KB maximum pushes the
+	/// point past `u16`, and that sliver answers `None` too.)
+	pub exif_insert_at: Option<u16>,
+	/// The orientation the stream's own EXIF APP1 declares — `Some(1)` when
+	/// it carries one that says upright, `None` when it carries none. What a
+	/// viewer handed these bytes untouched will apply.
+	pub stream_orientation: Option<u8>,
+}
+
+/// Most bytes a JPEG preview may declare per pixel of its SOF. An 8-bit
+/// baseline or progressive JPEG at the highest quality any camera writes
+/// stays under 2; 4 leaves a wide margin, and the slack below covers the EXIF
+/// block Fuji and Panasonic put ahead of the SOF. A container claiming more is
+/// describing something other than this JPEG — the sensor data behind it —
+/// and believing it would stream that out as the preview.
+const MAX_PREVIEW_BYTES_PER_PIXEL: u64 = 4;
+const PREVIEW_LEN_SLACK: u64 = 1024 * 1024;
+
 impl Preview {
 	pub(super) fn area(&self) -> u64 {
-		let (w, h) = match *self {
-			Preview::Jpeg { w, h, .. } | Preview::Rgb { w, h, .. } => (w, h),
-		};
+		let (w, h) = self.dims();
 		u64::from(w) * u64::from(h)
 	}
 
-	fn dims(&self) -> (u32, u32) {
+	pub(super) fn dims(&self) -> (u32, u32) {
 		match *self {
-			Preview::Jpeg { w, h, .. } | Preview::Rgb { w, h, .. } => (w, h),
+			Preview::Jpeg { head, .. } => (head.w, head.h),
+			Preview::Rgb { w, h, .. } => (w, h),
 		}
+	}
+}
+
+/// The preview a caller can hand to a viewer untouched, or `None`.
+///
+/// Only a JPEG qualifies — an uncompressed strip is pixels with no file format
+/// around them — and only one a viewer will decode: 8-bit, grey or YCbCr
+/// (CMYK renders inverted or fails outright on every target), at least
+/// [`MIN_PREVIEW_LONG_SIDE`] on its long side.
+pub(super) fn locate(index: Index) -> Option<LocatedPreview> {
+	match index.jpeg? {
+		Preview::Jpeg { off, len, head }
+			if head.precision == 8
+				&& matches!(head.components, 1 | 3)
+				&& head.w.max(head.h) >= MIN_PREVIEW_LONG_SIDE
+				&& len
+					<= u64::from(head.w) * u64::from(head.h) * MAX_PREVIEW_BYTES_PER_PIXEL
+						+ PREVIEW_LEN_SLACK =>
+		{
+			Some(LocatedPreview {
+				offset: off,
+				len,
+				width: head.w,
+				height: head.h,
+				orientation: index.orientation,
+				exif_insert_at: head.exif_insert_at,
+				stream_orientation: head.stream_orientation,
+			})
+		}
+		_ => None,
 	}
 }
 
@@ -468,27 +536,21 @@ impl Walk<'_> {
 /// there. Reads a few KB per directory and 16 KB per candidate; nothing here
 /// pulls a preview's payload, only enough of its head to believe in it.
 pub(super) fn scan(src: &mut dyn ByteSource) -> Index {
+	let nothing = || Index {
+		orientation: 1,
+		preview: None,
+		jpeg: None,
+	};
 	let Some(header) = read_exact_at(src, 0, 8) else {
-		return Index {
-			orientation: 1,
-			preview: None,
-		};
+		return nothing();
 	};
 	let endian = match &header[0..2] {
 		b"II" => Endian::Little,
 		b"MM" => Endian::Big,
-		_ => {
-			return Index {
-				orientation: 1,
-				preview: None,
-			};
-		}
+		_ => return nothing(),
 	};
 	let Some(ifd0) = u32_at(&header, 4, endian) else {
-		return Index {
-			orientation: 1,
-			preview: None,
-		};
+		return nothing();
 	};
 
 	let mut walk = Walk {
@@ -505,14 +567,21 @@ pub(super) fn scan(src: &mut dyn ByteSource) -> Index {
 
 	let orientation = walk.orientation.unwrap_or(1);
 	let src = walk.src;
-	let preview = walk
+	let believed: Vec<Preview> = walk
 		.candidates
 		.iter()
 		.filter_map(|c| believe(src, c))
+		.collect();
+	let preview = believed.iter().copied().max_by_key(Preview::area);
+	let jpeg = believed
+		.iter()
+		.copied()
+		.filter(|p| matches!(p, Preview::Jpeg { .. }))
 		.max_by_key(Preview::area);
 	Index {
 		orientation,
 		preview,
+		jpeg,
 	}
 }
 
@@ -549,7 +618,7 @@ pub(super) fn jpeg_window(src: &mut dyn ByteSource, off: u64, len: u64) -> Optio
 			return None;
 		}
 		match jpeg_sof(&head) {
-			Ok((w, h)) => return Some(Preview::Jpeg { off, len, w, h }),
+			Ok(head) => return Some(Preview::Jpeg { off, len, head }),
 			// Structurally not a decodable JPEG. Reading more cannot help.
 			Err(Scan::Malformed) => return None,
 			Err(Scan::Truncated) => {
@@ -562,15 +631,19 @@ pub(super) fn jpeg_window(src: &mut dyn ByteSource, off: u64, len: u64) -> Optio
 	}
 }
 
-/// The frame dimensions from a JPEG's SOF, over a bounded prefix.
+/// What a JPEG's SOF declares, over a bounded prefix — and, from the same
+/// walk, where an EXIF APP1 could go.
 ///
 /// Only the three SOFs a general-purpose decoder handles are accepted, and
 /// that is a correctness requirement rather than caution: a RAW file's sensor
 /// data is itself frequently stored as a *lossless* JPEG (SOF3), often the
 /// largest JPEG-shaped thing in the file. Ranking by size without this check
 /// picks the mosaic every time.
-fn jpeg_sof(data: &[u8]) -> Result<(u32, u32), Scan> {
+fn jpeg_sof(data: &[u8]) -> Result<JpegHead, Scan> {
 	let mut at = 2usize;
+	let mut exif_insert_at = Some(2usize);
+	let mut stream_orientation = None;
+	let mut first_segment = true;
 	while at + 4 <= data.len() {
 		if data[at] != 0xFF {
 			return Err(Scan::Malformed);
@@ -601,16 +674,42 @@ fn jpeg_sof(data: &[u8]) -> Result<(u32, u32), Scan> {
 			return Err(Scan::Malformed);
 		}
 		if matches!(marker, 0xC0..=0xC2) {
-			let Some(frame) = data.get(at + 5..at + 9) else {
+			let Some(frame) = data.get(at + 4..at + 10) else {
 				return Err(Scan::Truncated);
 			};
-			let h = u16::from_be_bytes([frame[0], frame[1]]);
-			let w = u16::from_be_bytes([frame[2], frame[3]]);
-			return match (w > 0 && h > 0).then_some((u32::from(w), u32::from(h))) {
-				Some(dims) => Ok(dims),
-				None => Err(Scan::Malformed),
-			};
+			let h = u16::from_be_bytes([frame[1], frame[2]]);
+			let w = u16::from_be_bytes([frame[3], frame[4]]);
+			if w == 0 || h == 0 {
+				return Err(Scan::Malformed);
+			}
+			return Ok(JpegHead {
+				w: u32::from(w),
+				h: u32::from(h),
+				precision: frame[0],
+				components: frame[5],
+				exif_insert_at: exif_insert_at.and_then(|p| u16::try_from(p).ok()),
+				stream_orientation,
+			});
 		}
+		match marker {
+			// JFIF claims the slot right after the SOI, so an EXIF segment
+			// goes behind it — the order every camera JPEG ships.
+			0xE0 if first_segment => exif_insert_at = Some(at + 2 + len),
+			// An EXIF APP1 is the stream's own say about the bytes, and the
+			// slot is taken. Any other APP1 (XMP) leaves it free: EXIF ahead
+			// of XMP is the order every camera JPEG with both ships. The
+			// segment lies wholly ahead of the SOF, so it is in `data`.
+			0xE1 => {
+				if let Some(payload) = data.get(at + 4..at + 2 + len)
+					&& let Some(tiff) = payload.strip_prefix(b"Exif\0\0")
+				{
+					exif_insert_at = None;
+					stream_orientation = Some(crate::exif::orientation(tiff));
+				}
+			}
+			_ => {}
+		}
+		first_segment = false;
 		at = at.checked_add(2 + len).ok_or(Scan::Malformed)?;
 	}
 	Err(Scan::Truncated)
@@ -789,7 +888,7 @@ impl PreparedDecode for PreparedRawRgb {
 #[cfg(test)]
 mod tests {
 	use super::{Scan, Vocab, Walk, jpeg_sof, scan};
-	use crate::{ByteSource, MemSource, exif::Endian};
+	use crate::{ByteSource, LocatedPreview, MemSource, exif::Endian, locate_preview};
 
 	/// A little-endian TIFF header pointing at `ifd0`.
 	fn header(ifd0: u32) -> Vec<u8> {
@@ -816,28 +915,73 @@ mod tests {
 		out
 	}
 
+	fn dims_of(data: &[u8]) -> Result<(u32, u32), Scan> {
+		jpeg_sof(data).map(|head| (head.w, head.h))
+	}
+
 	#[test]
 	fn sof_is_read_and_lossless_jpeg_is_rejected() {
-		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)), Ok((1600, 1200)));
+		assert_eq!(dims_of(&jpeg_head(1600, 1200)), Ok((1600, 1200)));
 		// SOF3 is a RAW's own sensor data, and often the largest JPEG-shaped
 		// thing in the file. Picking it is the failure mode this check exists
 		// to prevent — and it must be Malformed, not Truncated, or the scan
 		// would keep reading in the hope of a better answer.
 		let mut lossless = jpeg_head(4000, 3000);
 		lossless[9] = 0xC3;
-		assert_eq!(jpeg_sof(&lossless), Err(Scan::Malformed));
+		assert_eq!(dims_of(&lossless), Err(Scan::Malformed));
 		// Running out of bytes is distinguishable from being wrong.
-		assert_eq!(jpeg_sof(&[]), Err(Scan::Truncated));
-		assert_eq!(jpeg_sof(&[0xFF, 0xD8, 0xFF]), Err(Scan::Truncated));
-		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)[..8]), Err(Scan::Truncated));
-		assert_eq!(jpeg_sof(&jpeg_head(1600, 1200)[..14]), Err(Scan::Truncated));
-		assert_eq!(jpeg_sof(b"not a jpeg at all"), Err(Scan::Malformed));
-		assert_eq!(jpeg_sof(&jpeg_head(0, 1200)), Err(Scan::Malformed));
+		assert_eq!(dims_of(&[]), Err(Scan::Truncated));
+		assert_eq!(dims_of(&[0xFF, 0xD8, 0xFF]), Err(Scan::Truncated));
+		assert_eq!(dims_of(&jpeg_head(1600, 1200)[..8]), Err(Scan::Truncated));
+		assert_eq!(dims_of(&jpeg_head(1600, 1200)[..14]), Err(Scan::Truncated));
+		assert_eq!(dims_of(b"not a jpeg at all"), Err(Scan::Malformed));
+		assert_eq!(dims_of(&jpeg_head(0, 1200)), Err(Scan::Malformed));
 		// A zero-length marker segment must not loop forever.
 		assert_eq!(
-			jpeg_sof(&[0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x00, 0xFF, 0xD9]),
+			dims_of(&[0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x00, 0xFF, 0xD9]),
 			Err(Scan::Malformed)
 		);
+	}
+
+	/// Where an EXIF APP1 could be spliced is decided by the same walk that
+	/// finds the SOF, so the two can never disagree about a stream. Behind a
+	/// leading JFIF, right after the SOI otherwise, and nowhere at all once
+	/// the stream carries an APP1 of its own — EXIF or XMP, wherever it sits.
+	#[test]
+	fn the_exif_splice_point_follows_the_leading_segments() {
+		// SOI, APP0 (4 bytes), SOF: behind the APP0.
+		let head = jpeg_sof(&jpeg_head(1600, 1200)).unwrap();
+		assert_eq!(head.exif_insert_at, Some(2 + 2 + 4));
+		assert_eq!((head.precision, head.components), (8, 3));
+		// SOI straight into the SOF: right after the SOI.
+		let bare = [&[0xFF, 0xD8][..], &jpeg_head(640, 480)[8..]].concat();
+		assert_eq!(jpeg_sof(&bare).unwrap().exif_insert_at, Some(2));
+		// An APP1 first (EXIF), and an APP1 behind the APP0 (XMP): both None.
+		let mut exif_first = vec![
+			0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x08, b'E', b'x', b'i', b'f', 0, 0,
+		];
+		exif_first.extend_from_slice(&jpeg_head(640, 480)[2..]);
+		assert_eq!(jpeg_sof(&exif_first).unwrap().exif_insert_at, None);
+		// An XMP APP1 behind the APP0 is not the stream's say: the slot ahead
+		// of it stays free, which is where EXIF goes in every camera JPEG that
+		// carries both.
+		let mut xmp_after_app0 = jpeg_head(640, 480)[..8].to_vec();
+		xmp_after_app0.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x04, 0, 0]);
+		xmp_after_app0.extend_from_slice(&jpeg_head(640, 480)[8..]);
+		assert_eq!(jpeg_sof(&xmp_after_app0).unwrap().exif_insert_at, Some(8));
+		// A JFIF APP0 fat with its own thumbnail moves the point behind it,
+		// however large: the writers stream, so nothing is copied to get there.
+		let mut fat = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x04, 0x00];
+		fat.resize(2 + 2 + 0x400, 0);
+		fat.extend_from_slice(&jpeg_head(640, 480)[8..]);
+		assert_eq!(jpeg_sof(&fat).unwrap().exif_insert_at, Some(2 + 2 + 0x400));
+		// Precision and component count are reported, not judged, here.
+		let mut twelve = jpeg_head(640, 480);
+		twelve[12] = 12;
+		assert_eq!(jpeg_sof(&twelve).unwrap().precision, 12);
+		let mut cmyk = jpeg_head(640, 480);
+		cmyk[17] = 4;
+		assert_eq!(jpeg_sof(&cmyk).unwrap().components, 4);
 	}
 
 	/// A preview whose metadata dwarfs the 4 KB first look is still found —
@@ -907,6 +1051,171 @@ mod tests {
 		assert_eq!(index.orientation, 6);
 		let preview = index.preview.expect("the SubIFD JPEG must be found");
 		assert_eq!(preview.dims(), (1600, 1200));
+	}
+
+	/// A RAW with `jpeg` in a SubIFD at 200, declared as 400 bytes (a head
+	/// alone is under `MIN_PREVIEW_BYTES`), and orientation `o` in IFD0 — the
+	/// shape `a_subifd_jpeg_is_found_and_measured_by_its_own_sof` proves.
+	fn subifd_raw(jpeg: &[u8], o: u32) -> Vec<u8> {
+		let mut file = header(8);
+		file.extend_from_slice(&2u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x0112, 3, 1, o));
+		file.extend_from_slice(&entry(0x014A, 4, 1, 60));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(60, 0);
+		file.extend_from_slice(&2u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x0201, 4, 1, 200));
+		file.extend_from_slice(&entry(0x0202, 4, 1, 400));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(200, 0);
+		file.extend_from_slice(jpeg);
+		file.resize(600, 0);
+		file
+	}
+
+	/// The locate path answers with the range the container declares, the
+	/// dimensions the JPEG's own SOF declares, and the container's
+	/// orientation — and nothing was decoded to learn any of it.
+	#[test]
+	fn a_preview_is_located_without_being_decoded() {
+		let jpeg = jpeg_head(1600, 1200);
+		let mut src = MemSource(subifd_raw(&jpeg, 6));
+		assert_eq!(
+			locate_preview(&mut src).unwrap(),
+			Some(LocatedPreview {
+				offset: 200,
+				len: 400,
+				width: 1600,
+				height: 1200,
+				orientation: 6,
+				exif_insert_at: Some(8),
+				stream_orientation: None,
+			})
+		);
+		// Bytes no format claims, and a container with nothing in it.
+		assert_eq!(
+			locate_preview(&mut MemSource(b"nonsense".to_vec())).unwrap(),
+			None
+		);
+		assert_eq!(locate_preview(&mut MemSource(header(8))).unwrap(), None);
+	}
+
+	/// A little-endian TIFF whose IFD0 holds one Orientation entry, wrapped
+	/// as an EXIF APP1 — what a camera writes into its own preview.
+	fn exif_app1(orientation: u16) -> Vec<u8> {
+		let mut tiff = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+		tiff.extend_from_slice(&1u16.to_le_bytes());
+		tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+		tiff.extend_from_slice(&3u16.to_le_bytes());
+		tiff.extend_from_slice(&1u32.to_le_bytes());
+		tiff.extend_from_slice(&u32::from(orientation).to_le_bytes());
+		tiff.extend_from_slice(&0u32.to_le_bytes());
+		let mut app1 = vec![0xFF, 0xE1];
+		app1.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+		app1.extend_from_slice(b"Exif\0\0");
+		app1.extend_from_slice(&tiff);
+		app1
+	}
+
+	/// A stream with an EXIF of its own is left alone, and what that EXIF
+	/// says is reported, because it — not the container — is what a viewer
+	/// handed the bytes will apply. Fuji and Panasonic previews are this.
+	#[test]
+	fn a_stream_with_its_own_exif_reports_that_orientation() {
+		let mut jpeg = vec![0xFF, 0xD8];
+		jpeg.extend_from_slice(&exif_app1(6));
+		jpeg.extend_from_slice(&jpeg_head(1600, 1200)[2..]);
+		let located = locate_preview(&mut MemSource(subifd_raw(&jpeg, 1)))
+			.unwrap()
+			.expect("a preview");
+		assert_eq!(located.exif_insert_at, None);
+		assert_eq!(located.stream_orientation, Some(6));
+		assert_eq!(located.orientation, 1);
+		// An EXIF that declares no orientation still counts as the stream's
+		// own say: upright, and nothing to splice.
+		let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x10];
+		jpeg.extend_from_slice(b"Exif\0\0II\x2a\x00\x08\x00\x00\x00");
+		jpeg.extend_from_slice(&jpeg_head(1600, 1200)[2..]);
+		let located = locate_preview(&mut MemSource(subifd_raw(&jpeg, 8)))
+			.unwrap()
+			.expect("a preview");
+		assert_eq!(located.stream_orientation, Some(1));
+		assert_eq!(located.orientation, 8);
+	}
+
+	/// A declared length no JPEG of that size could have is the container
+	/// describing the sensor data behind the preview, not the preview; it is
+	/// refused rather than streamed out. The thumbnail path, which only ever
+	/// reads what the decoder asks for, still serves it.
+	#[test]
+	fn a_length_no_jpeg_of_that_size_could_have_is_refused() {
+		let jpeg = jpeg_head(640, 480);
+		let mut file = subifd_raw(&jpeg, 1);
+		// Rewrite the declared length (entry 0x0202 in the SubIFD at 60) to
+		// far more than 640x480 pixels could ever compress to, and pad the
+		// file so the range still fits.
+		let declared: u32 = 640 * 480 * 4 + 2 * 1024 * 1024;
+		file[60 + 2 + 12 + 8..60 + 2 + 12 + 12].copy_from_slice(&declared.to_le_bytes());
+		file.resize(200 + declared as usize, 0);
+		assert!(scan(&mut MemSource(file.clone())).preview.is_some());
+		assert_eq!(locate_preview(&mut MemSource(file)).unwrap(), None);
+	}
+
+	/// The two candidate kinds do not race for one slot: a bigger
+	/// uncompressed strip is the better THUMBNAIL source, and the JPEG beside
+	/// it is still the preview.
+	#[test]
+	fn a_bigger_rgb_strip_does_not_hide_the_jpeg_from_the_preview_path() {
+		let jpeg = jpeg_head(640, 480);
+		// IFD0: a reduced-resolution 1024x768 RGB strip in one strip, then a
+		// SubIFD holding the JPEG.
+		let mut file = header(8);
+		file.extend_from_slice(&7u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x00FE, 4, 1, 1));
+		file.extend_from_slice(&entry(0x0100, 4, 1, 1024));
+		file.extend_from_slice(&entry(0x0101, 4, 1, 768));
+		file.extend_from_slice(&entry(0x0106, 3, 1, 2));
+		file.extend_from_slice(&entry(0x0111, 4, 1, 4096));
+		file.extend_from_slice(&entry(0x0117, 4, 1, 1024 * 768 * 3));
+		file.extend_from_slice(&entry(0x014A, 4, 1, 120));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(120, 0);
+		file.extend_from_slice(&2u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x0201, 4, 1, 200));
+		file.extend_from_slice(&entry(0x0202, 4, 1, 400));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(200, 0);
+		file.extend_from_slice(&jpeg);
+		file.resize(4096 + 1024 * 768 * 3, 0x40);
+		let index = scan(&mut MemSource(file.clone()));
+		assert_eq!(index.preview.map(|p| p.dims()), Some((1024, 768)));
+		assert_eq!(index.jpeg.map(|p| p.dims()), Some((640, 480)));
+		let located = locate_preview(&mut MemSource(file))
+			.unwrap()
+			.expect("the JPEG is still the preview");
+		assert_eq!((located.width, located.height), (640, 480));
+	}
+
+	/// What the preview path refuses that the thumbnail path still serves: a
+	/// stamp under the floor, and JPEGs a viewer would not decode — 12-bit,
+	/// or four components. Each is still a fine thumbnail source.
+	#[test]
+	fn a_preview_a_viewer_cannot_show_is_not_located() {
+		let small = subifd_raw(&jpeg_head(400, 300), 1);
+		assert!(scan(&mut MemSource(small.clone())).preview.is_some());
+		assert_eq!(locate_preview(&mut MemSource(small)).unwrap(), None);
+
+		let mut twelve_bit = jpeg_head(1600, 1200);
+		twelve_bit[12] = 12;
+		let twelve_bit = subifd_raw(&twelve_bit, 1);
+		assert!(scan(&mut MemSource(twelve_bit.clone())).preview.is_some());
+		assert_eq!(locate_preview(&mut MemSource(twelve_bit)).unwrap(), None);
+
+		let mut cmyk = jpeg_head(1600, 1200);
+		cmyk[17] = 4;
+		let cmyk = subifd_raw(&cmyk, 1);
+		assert!(scan(&mut MemSource(cmyk.clone())).preview.is_some());
+		assert_eq!(locate_preview(&mut MemSource(cmyk)).unwrap(), None);
 	}
 
 	/// Hostile directory graphs: a self-referential SubIFD, a directory

@@ -124,6 +124,50 @@ impl ThumbSpec {
 	}
 }
 
+/// A complete JPEG living inside another container — the camera's own
+/// rendering of the shot beside the sensor mosaic — found by
+/// [`locate_preview`] and never decoded: the point is that these bytes can go
+/// to a viewer untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocatedPreview {
+	/// Absolute offset of the SOI in the source.
+	pub offset: u64,
+	/// As the container claims it, bounds-checked against the source but NOT
+	/// trimmed to the JPEG's own EOI: CR3 derives it from the enclosing box's
+	/// extent, so a few bytes of box padding may follow. Every decoder stops
+	/// at the EOI.
+	pub len: u64,
+	/// From the preview's own SOF, not from any directory field claiming to
+	/// describe it.
+	pub width: u32,
+	pub height: u32,
+	/// The CONTAINER's EXIF orientation (1–8), 1 when it declares none.
+	/// Whether that applies to the bytes is the caller's call: the stream may
+	/// carry an EXIF of its own, in which case [`exif_insert_at`](Self::exif_insert_at)
+	/// is `None` and the stream's tag is the one a viewer will read.
+	pub orientation: u8,
+	/// Byte offset within the preview where an EXIF APP1 may legally be
+	/// inserted — 2, right after the SOI, or past a leading APP0/JFIF. `None`
+	/// when the stream already carries an APP1 and must not be touched.
+	///
+	/// Computed by the same marker walk that found the SOF, so no second
+	/// parser gets to disagree with the first about one stream.
+	pub exif_insert_at: Option<u16>,
+	/// What the stream's own EXIF declares, when it carries one: `Some(1)`
+	/// for upright, `None` for no EXIF at all. Fuji and Panasonic write a
+	/// full EXIF into the preview; Nikon, Sony and Canon do not. This — not
+	/// [`orientation`](Self::orientation) — is what a viewer handed the bytes
+	/// untouched will apply.
+	pub stream_orientation: Option<u8>,
+}
+
+/// Below this on the long side an embedded image is a thumbnail, not a
+/// preview: the stamps several containers carry (CR3 `THMB` 160x120, the
+/// Olympus maker-note blob, every EXIF IFD1 thumb, the Nikon D1H strip) would
+/// be upscaled mush full-screen. 512 clears 81 of the 100 pinned raw.pixls.us
+/// samples; the rest keep the thumbnail path.
+pub const MIN_PREVIEW_LONG_SIDE: u32 = 512;
+
 /// Which path produced a thumbnail.
 ///
 /// Reported rather than logged: this crate stays free of a logging dependency,
@@ -219,6 +263,15 @@ pub trait FormatDecoder: Send + Sync {
 	/// Magic-byte sniff on the first bytes of the source. Mime types are a
 	/// hint upstream; bytes are the truth.
 	fn detect(&self, prefix: &[u8]) -> bool;
+
+	/// The large JPEG this container embeds, located but not decoded. The
+	/// default is the honest answer for every format that IS the image.
+	fn locate_preview(
+		&self,
+		_src: &mut dyn ByteSource,
+	) -> Result<Option<LocatedPreview>, ThumbError> {
+		Ok(None)
+	}
 
 	/// Parses the header only — reads a few KB. The spec is available so
 	/// formats with in-decoder scaling (JPEG's IDCT scale) can commit to an
@@ -388,6 +441,34 @@ pub(crate) fn decode_bounded(
 	Ok(Some(acc.finish()))
 }
 
+/// The format that claims these bytes, from their first kilobyte.
+///
+/// 1 KB rather than the 16 bytes the magic numbers need: SVG has no magic and
+/// its `<svg` root can sit behind an XML declaration, comments and a DOCTYPE.
+/// One read either way; a short read only narrows the sniff.
+fn sniff(src: &mut dyn ByteSource) -> Result<Option<&'static dyn FormatDecoder>, ThumbError> {
+	let mut prefix = [0u8; 1024];
+	let n = src.read_at(0, &mut prefix)?;
+	Ok(formats::sniff(&prefix[..n]))
+}
+
+/// Finds the large JPEG a container embeds, decoding nothing.
+///
+/// On a real file, two to four bounded reads whatever its size — the same
+/// directory walk the thumbnail path runs, stopped before it hands the bytes
+/// to a decoder. On a forged tree the walk's own caps (boxes, directories,
+/// candidates) bound the reads instead, each at most a chunk or two. `None` when the bytes are not a container this build walks, when
+/// it hides no JPEG a viewer could show (see [`LocatedPreview`]), when the
+/// largest one is under [`MIN_PREVIEW_LONG_SIDE`], or when its declared
+/// length is more than a JPEG of its size could hold — a container
+/// describing the sensor data behind the preview. Only a source read fails.
+pub fn locate_preview(src: &mut dyn ByteSource) -> Result<Option<LocatedPreview>, ThumbError> {
+	match sniff(src)? {
+		Some(format) => format.locate_preview(src),
+		None => Ok(None),
+	}
+}
+
 /// Produces a downscaled (never exact-size, never upscaled) RGBA image for
 /// the request, or says why it could not — see [`ThumbOutcome`]. The caller
 /// does the final exact resize + encode — both operate on buffers this crate
@@ -396,12 +477,7 @@ pub fn generate(
 	mut src: Box<dyn ByteSource>,
 	spec: &ThumbSpec,
 ) -> Result<ThumbOutcome, ThumbError> {
-	// 1 KB rather than the 16 bytes the magic numbers need: SVG has no magic
-	// and its `<svg` root can sit behind an XML declaration, comments and a
-	// DOCTYPE. One read either way; a short read only narrows the sniff.
-	let mut prefix = [0u8; 1024];
-	let n = src.read_at(0, &mut prefix)?;
-	let Some(format) = formats::sniff(&prefix[..n]) else {
+	let Some(format) = sniff(&mut *src)? else {
 		return Ok(ThumbOutcome::Unsupported);
 	};
 	// Clamped before `open`, because a decoder with an in-format scaler commits

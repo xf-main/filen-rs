@@ -7,9 +7,9 @@
 //! JPEG's own SOI and SOF — because a fixed offset is no guarantee the bytes
 //! there are what the header says.
 
-use crate::{ByteSource, FormatDecoder, PreparedDecode, ThumbError, ThumbSpec};
+use crate::{ByteSource, FormatDecoder, LocatedPreview, PreparedDecode, ThumbError, ThumbSpec};
 
-use super::raw;
+use super::raw::{self, Index};
 
 pub struct Raf;
 
@@ -18,9 +18,40 @@ pub struct Raf;
 /// FinePix bodies through the X-S10.
 const JPEG_POINTER_AT: u64 = 84;
 
+/// What the header points at. Fuji writes a full EXIF block inside the
+/// preview itself, so the orientation is the stream's own and the container
+/// declares none.
+fn index(src: &mut dyn ByteSource) -> Index {
+	let mut pointer = [0u8; 8];
+	let preview = match src.read_at(JPEG_POINTER_AT, &mut pointer) {
+		Ok(8) => {
+			let off = u64::from(u32::from_be_bytes([
+				pointer[0], pointer[1], pointer[2], pointer[3],
+			]));
+			let len = u64::from(u32::from_be_bytes([
+				pointer[4], pointer[5], pointer[6], pointer[7],
+			]));
+			raw::jpeg_window(src, off, len)
+		}
+		_ => None,
+	};
+	Index {
+		orientation: 1,
+		preview,
+		jpeg: preview,
+	}
+}
+
 impl FormatDecoder for Raf {
 	fn detect(&self, prefix: &[u8]) -> bool {
 		prefix.starts_with(b"FUJIFILMCCD-RAW")
+	}
+
+	fn locate_preview(
+		&self,
+		src: &mut dyn ByteSource,
+	) -> Result<Option<LocatedPreview>, ThumbError> {
+		Ok(raw::locate(index(src)))
 	}
 
 	fn open(
@@ -28,36 +59,26 @@ impl FormatDecoder for Raf {
 		mut src: Box<dyn ByteSource>,
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
-		let mut pointer = [0u8; 8];
-		let preview = match src.read_at(JPEG_POINTER_AT, &mut pointer) {
-			Ok(8) => {
-				let off = u64::from(u32::from_be_bytes([
-					pointer[0], pointer[1], pointer[2], pointer[3],
-				]));
-				let len = u64::from(u32::from_be_bytes([
-					pointer[4], pointer[5], pointer[6], pointer[7],
-				]));
-				raw::jpeg_window(&mut *src, off, len)
-			}
-			_ => None,
-		};
-		let Some(preview) = preview else {
+		let Index {
+			orientation,
+			preview: Some(preview),
+			..
+		} = index(&mut *src)
+		else {
 			return Err(ThumbError::Decode(
 				"raf: the header points at no usable preview; the sensor data is \
 				 not a decodable image"
 					.into(),
 			));
 		};
-		// Fuji writes a full EXIF block inside the preview itself, so the
-		// orientation comes from there rather than from the outer header.
-		raw::prepare(src, preview, 1, spec)
+		raw::prepare(src, preview, orientation, spec)
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::{JPEG_POINTER_AT, Raf};
-	use crate::{DEFAULT_MEM_BUDGET, FormatDecoder, MemSource, ThumbSpec};
+	use crate::{DEFAULT_MEM_BUDGET, FormatDecoder, MemSource, ThumbSpec, locate_preview};
 
 	/// A RAF whose header points at `off` for `len` bytes, with `payload`
 	/// written at `off`.
@@ -83,6 +104,24 @@ mod tests {
 	fn open(file: Vec<u8>) -> bool {
 		let spec = ThumbSpec::new(512, 512, DEFAULT_MEM_BUDGET);
 		Raf.open(Box::new(MemSource(file)), &spec).is_ok()
+	}
+
+	/// Located as the header's own range; the orientation is the stream's to
+	/// declare (Fuji writes a full EXIF into the preview), so the container
+	/// says 1.
+	#[test]
+	fn the_pointed_at_preview_is_located() {
+		let good = jpeg(1600, 1200);
+		let located = locate_preview(&mut MemSource(raf(148, good.len() as u32, &good)))
+			.unwrap()
+			.expect("a preview");
+		assert_eq!((located.offset, located.len), (148, good.len() as u64));
+		assert_eq!((located.width, located.height), (1600, 1200));
+		assert_eq!(located.orientation, 1);
+		assert_eq!(
+			locate_preview(&mut MemSource(raf(148, 400, &[0x41; 400]))).unwrap(),
+			None
+		);
 	}
 
 	#[test]

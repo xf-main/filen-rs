@@ -14,8 +14,8 @@ use tiff::ColorType;
 use tiff::tags::Tag;
 
 use crate::{
-	ByteSource, FormatDecoder, PixelSink, PreparedDecode, SeqReader, SmallImage, ThumbError,
-	ThumbSpec, exif,
+	ByteSource, FormatDecoder, LocatedPreview, PixelSink, PreparedDecode, SeqReader, SmallImage,
+	ThumbError, ThumbSpec, exif,
 };
 
 use super::jpeg::exif_preview;
@@ -72,6 +72,15 @@ impl FormatDecoder for Tiff {
 		prefix.starts_with(b"II\x2a\x00")
 			|| prefix.starts_with(b"MM\x00\x2a")
 			|| raw::detect_vendor_tiff(prefix)
+	}
+
+	/// The same walk `open` starts with; a plain TIFF's IFD1 thumbnail is
+	/// under the preview floor, so only the RAW containers answer.
+	fn locate_preview(
+		&self,
+		src: &mut dyn ByteSource,
+	) -> Result<Option<LocatedPreview>, ThumbError> {
+		Ok(raw::locate(raw::scan(src)))
 	}
 
 	fn open(

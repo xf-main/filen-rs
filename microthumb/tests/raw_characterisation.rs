@@ -37,7 +37,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use microthumb::{ByteSource, DEFAULT_MEM_BUDGET, FileSource, ThumbSource, ThumbSpec, generate};
+use microthumb::{
+	ByteSource, DEFAULT_MEM_BUDGET, FileSource, LocatedPreview, MIN_PREVIEW_LONG_SIDE, ThumbSource,
+	ThumbSpec, generate, locate_preview,
+};
 use raw_fixtures::{RAW_FIXTURES, RawFixture};
 
 /// The request every case is characterised against.
@@ -190,6 +193,8 @@ struct Record {
 	preview_only: Outcome,
 	/// High-water byte offset reached, as a percentage of file length.
 	read_pct: u64,
+	/// What the preview path hands out for the same file, decoding nothing.
+	located: Option<LocatedPreview>,
 }
 
 fn run(path: &Path, spec: &ThumbSpec) -> (Outcome, u64) {
@@ -218,11 +223,17 @@ fn characterise() -> Vec<Record> {
 	let skipped = raw_fixtures::for_each_available(RAW_FIXTURES, |fixture, path| {
 		let (full, read) = run(path, &full_spec);
 		let (preview_only, _) = run(path, &preview_spec);
+		let located = {
+			let file = std::fs::File::open(path).expect("fixture opens");
+			let mut src = FileSource::new(file).expect("file source");
+			locate_preview(&mut src).expect("locating reads only the file")
+		};
 		records.push(Record {
 			fixture,
 			full,
 			preview_only,
 			read_pct: read * 100 / fixture.len.max(1),
+			located,
 		});
 	});
 
@@ -484,6 +495,96 @@ fn preview_sizes_match_baseline() {
 			"{met} samples reach the {TARGET}px request; baseline is \
 			 {SAMPLES_MEETING_THE_REQUEST}"
 		);
+	});
+}
+
+/// The preview path over the real files: what `locate_preview` hands out must
+/// be a JPEG whose own SOF agrees with the located dimensions, sized as the
+/// container said — and wherever it hands one out, the thumbnail of the same
+/// file must have come from an embedded JPEG and reached the request, since
+/// it is that JPEG (or the smaller box beside it) being served.
+///
+/// Prints, per sample, what a consumer would receive: the range, the SOF
+/// dimensions, the container's orientation, whether the stream carries an
+/// APP1 of its own (no splice point) and how far past the JPEG's own EOI the
+/// declared range runs — the measured answer to "can these bytes go to a
+/// viewer untouched". The per-format counts are printed, not pinned: the
+/// dimensions a preview reaches are the camera's to decide.
+#[test]
+#[ignore = "downloads ~1 GiB of pinned RAW samples; run with --ignored"]
+fn the_located_preview_is_the_jpeg_it_claims() {
+	with_records(|records| {
+		let mut located_per_format: BTreeMap<&str, usize> = BTreeMap::new();
+		for r in records {
+			let Some(located) = r.located else {
+				eprintln!("{:<12} no preview", r.fixture.cache_name);
+				continue;
+			};
+			*located_per_format.entry(r.fixture.format).or_default() += 1;
+			assert!(
+				matches!(
+					r.preview_only,
+					Outcome::Thumb(w, h, ThumbSource::EmbeddedPreview) if w.max(h) >= TARGET
+				),
+				"{} has a preview but its thumbnail {:?} did not come from an embedded JPEG \
+				 that reaches the request",
+				r.fixture.cache_name,
+				r.preview_only
+			);
+			assert!(
+				located.width.max(located.height) >= MIN_PREVIEW_LONG_SIDE,
+				"{} located a {}x{} stamp",
+				r.fixture.cache_name,
+				located.width,
+				located.height
+			);
+			let file = std::fs::File::open(raw_fixtures::cache_dir().join(r.fixture.cache_name))
+				.expect("fixture opens");
+			let mut src = FileSource::new(file).expect("file source");
+			let mut bytes = vec![0u8; usize::try_from(located.len).unwrap()];
+			let mut done = 0;
+			while done < bytes.len() {
+				let n = src
+					.read_at(located.offset + done as u64, &mut bytes[done..])
+					.unwrap();
+				assert!(
+					n > 0,
+					"{} ran out of bytes inside its preview",
+					r.fixture.cache_name
+				);
+				done += n;
+			}
+			let mut decoder = jpeg_decoder::Decoder::new(bytes.as_slice());
+			decoder
+				.read_info()
+				.unwrap_or_else(|e| panic!("{} preview is not a JPEG: {e}", r.fixture.cache_name));
+			let info = decoder.info().unwrap();
+			assert_eq!(
+				(u32::from(info.width), u32::from(info.height)),
+				(located.width, located.height),
+				"{} located dims disagree with the SOF",
+				r.fixture.cache_name
+			);
+			let eoi = bytes
+				.windows(2)
+				.rposition(|w| w == [0xFF, 0xD9])
+				.map_or(bytes.len(), |p| p + 2);
+			eprintln!(
+				"{:<12} {:>9}+{:<9} {:>5}x{:<5} orientation={} own-app1={:<5} bytes-past-eoi={}",
+				r.fixture.cache_name,
+				located.offset,
+				located.len,
+				located.width,
+				located.height,
+				located.orientation,
+				located.exif_insert_at.is_none(),
+				bytes.len() - eoi,
+			);
+		}
+		eprintln!("\n--- previews located per format ---");
+		for (format, n) in &located_per_format {
+			eprintln!("{format:<4} {n}");
+		}
 	});
 }
 

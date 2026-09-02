@@ -18,9 +18,11 @@
 //! extent, recursion is depth-capped, the total number of boxes visited is
 //! capped, and no read is ever sized from a header without that check.
 
-use crate::{ByteSource, FormatDecoder, PreparedDecode, ThumbError, ThumbSpec, exif};
+use crate::{
+	ByteSource, FormatDecoder, LocatedPreview, PreparedDecode, ThumbError, ThumbSpec, exif,
+};
 
-use super::raw::{self, Preview};
+use super::raw::{self, Index, Preview};
 
 pub struct Cr3;
 
@@ -39,6 +41,37 @@ const PREVIEW_PROBE: u64 = 32;
 /// a forged box size rather than budgeting a real one.
 const CMT1_MAX_BYTES: u64 = 64 * 1024;
 
+/// The largest preview box, and the file's orientation.
+///
+/// The preview JPEGs carry no EXIF of their own, so a portrait shot would come
+/// out sideways without the file-level tag. `CMT1` is a TIFF, which is exactly
+/// the payload the EXIF walker takes.
+fn index(src: &mut dyn ByteSource) -> Index {
+	let mut walk = Walk {
+		boxes: 0,
+		previews: Vec::new(),
+		cmt1: None,
+	};
+	let end = src.len();
+	walk.boxes_in(src, 0, end, 0);
+	let preview = walk
+		.previews
+		.into_iter()
+		.filter_map(|(off, len)| raw::jpeg_window(src, off, len))
+		.max_by_key(Preview::area);
+	let orientation = walk
+		.cmt1
+		.and_then(|(body, body_end)| {
+			raw::read_exact_at(src, body, (body_end - body).min(CMT1_MAX_BYTES))
+		})
+		.map_or(1, |tiff| exif::orientation(&tiff));
+	Index {
+		orientation,
+		preview,
+		jpeg: preview,
+	}
+}
+
 impl FormatDecoder for Cr3 {
 	fn detect(&self, prefix: &[u8]) -> bool {
 		// `ftyp` with Canon's `crx ` brand. Checking the brand as well as the
@@ -47,37 +80,28 @@ impl FormatDecoder for Cr3 {
 		prefix.get(4..12) == Some(b"ftypcrx ")
 	}
 
+	fn locate_preview(
+		&self,
+		src: &mut dyn ByteSource,
+	) -> Result<Option<LocatedPreview>, ThumbError> {
+		Ok(raw::locate(index(src)))
+	}
+
 	fn open(
 		&self,
 		mut src: Box<dyn ByteSource>,
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
-		let mut walk = Walk {
-			boxes: 0,
-			previews: Vec::new(),
-			cmt1: None,
-		};
-		let end = src.len();
-		walk.boxes_in(&mut *src, 0, end, 0);
-		let preview = walk
-			.previews
-			.into_iter()
-			.filter_map(|(off, len)| raw::jpeg_window(&mut *src, off, len))
-			.max_by_key(Preview::area);
-		let Some(preview) = preview else {
+		let Index {
+			orientation,
+			preview: Some(preview),
+			..
+		} = index(&mut *src)
+		else {
 			return Err(ThumbError::Decode(
 				"cr3: no preview box; the sensor data is not a decodable image".into(),
 			));
 		};
-		// The preview JPEGs carry no EXIF of their own, so a portrait shot
-		// would come out sideways without the file-level tag. `CMT1` is a
-		// TIFF, which is exactly the payload the EXIF walker takes.
-		let orientation = walk
-			.cmt1
-			.and_then(|(body, body_end)| {
-				raw::read_exact_at(&mut *src, body, (body_end - body).min(CMT1_MAX_BYTES))
-			})
-			.map_or(1, |tiff| exif::orientation(&tiff));
 		raw::prepare(src, preview, orientation, spec)
 	}
 }
@@ -186,7 +210,7 @@ fn child_start(src: &mut dyn ByteSource, at: u64, end: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
 	use super::{Cr3, Walk};
-	use crate::{ByteSource, FormatDecoder, MemSource, ThumbSpec};
+	use crate::{ByteSource, FormatDecoder, MemSource, ThumbSpec, locate_preview};
 
 	fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
 		let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
@@ -225,9 +249,7 @@ mod tests {
 			.into_iter()
 			.filter_map(|(off, len)| super::raw::jpeg_window(&mut src, off, len))
 			.max_by_key(super::Preview::area)
-			.map(|p| match p {
-				super::Preview::Jpeg { w, h, .. } | super::Preview::Rgb { w, h, .. } => (w, h),
-			})
+			.map(|p| p.dims())
 	}
 
 	/// The real layout: a `uuid` box whose payload starts with a version word
@@ -394,6 +416,38 @@ mod tests {
 		assert_eq!(orientation_of(cr3(Some(&cmt1(6)))), 6);
 		assert_eq!(orientation_of(cr3(Some(&cmt1(1)))), 1);
 		assert_eq!(orientation_of(cr3(None)), 1);
+	}
+
+	/// Located rather than decoded: the PRVW's own range and SOF dimensions,
+	/// the `CMT1` orientation, and a splice point behind the JFIF APP0 the
+	/// encoder wrote — the preview carries no EXIF, so the rotation has to be
+	/// spliced in for a viewer to see it.
+	#[test]
+	fn the_prvw_is_located_with_the_cmt1_orientation() {
+		let file = cr3(Some(&cmt1(8)));
+		let prvw = real_jpeg(640, 480);
+		let offset = file
+			.windows(prvw.len())
+			.position(|w| w == prvw.as_slice())
+			.expect("the PRVW JPEG is in the file") as u64;
+		let located = locate_preview(&mut MemSource(file))
+			.unwrap()
+			.expect("a preview");
+		assert_eq!((located.offset, located.len), (offset, prvw.len() as u64));
+		assert_eq!((located.width, located.height), (640, 480));
+		assert_eq!(located.orientation, 8);
+		// SOI (2), then the 16-byte JFIF APP0 with its marker and length.
+		assert_eq!(located.exif_insert_at, Some(2 + 2 + 16));
+		// THMB alone is under the preview floor: a thumbnail, not a preview.
+		let mut thmb_only = vec![0u8; 16];
+		let mut thmb = vec![0u8; 16];
+		thmb.extend_from_slice(&real_jpeg(160, 120));
+		thmb_only.extend_from_slice(&boxed(b"THMB", &thmb));
+		let mut file = boxed(b"ftyp", b"crx iso");
+		file.extend_from_slice(&boxed(b"moov", &boxed(b"uuid", &thmb_only)));
+		let spec = ThumbSpec::new(64, 64, crate::DEFAULT_MEM_BUDGET);
+		assert!(Cr3.open(Box::new(MemSource(file.clone())), &spec).is_ok());
+		assert_eq!(locate_preview(&mut MemSource(file)).unwrap(), None);
 	}
 
 	/// `CMT1` is attacker-controlled bytes like every other box: garbage, a
