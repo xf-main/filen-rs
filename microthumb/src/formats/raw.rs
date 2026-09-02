@@ -263,7 +263,9 @@ struct Walk<'a> {
 	src: &'a mut dyn ByteSource,
 	visited: Vec<u64>,
 	candidates: Vec<Candidate>,
-	orientation: u8,
+	/// The first directory's word, upright included: a deeper directory
+	/// (a SubIFD, the Exif IFD) must not overrule an IFD0 that said 1.
+	orientation: Option<u8>,
 	/// Maker note payload (offset, length), parsed after the main walk so its
 	/// own base is known.
 	maker_note: Option<(u64, u64)>,
@@ -374,10 +376,10 @@ impl Walk<'_> {
 	}
 
 	fn collect_tiff(&mut self, dir: &Directory, endian: Endian) {
-		if self.orientation == 1
+		if self.orientation.is_none()
 			&& let Some(o @ 1..=8) = dir.scalar(0x0112, endian)
 		{
-			self.orientation = o as u8;
+			self.orientation = Some(o as u8);
 		}
 		let width = dir.scalar(0x0100, endian).unwrap_or(0);
 		let height = dir.scalar(0x0101, endian).unwrap_or(0);
@@ -493,7 +495,7 @@ pub(super) fn scan(src: &mut dyn ByteSource) -> Index {
 		src,
 		visited: Vec::new(),
 		candidates: Vec::new(),
-		orientation: 1,
+		orientation: None,
 		maker_note: None,
 	};
 	walk.walk(endian, 0, u64::from(ifd0), 0, Vocab::Tiff);
@@ -501,7 +503,7 @@ pub(super) fn scan(src: &mut dyn ByteSource) -> Index {
 		walk.walk_olympus(endian, at, len);
 	}
 
-	let orientation = walk.orientation;
+	let orientation = walk.orientation.unwrap_or(1);
 	let src = walk.src;
 	let preview = walk
 		.candidates
@@ -855,6 +857,29 @@ mod tests {
 		assert_eq!(found.dims(), (4416, 2944));
 	}
 
+	/// IFD0's word is final, upright included: a SubIFD or Exif IFD that
+	/// says otherwise describes something else, and every RAW reader takes
+	/// IFD0's tag as THE orientation.
+	#[test]
+	fn an_upright_ifd0_is_not_overruled_by_a_deeper_directory() {
+		let jpeg = jpeg_head(1600, 1200);
+		let mut file = header(8);
+		file.extend_from_slice(&2u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x0112, 3, 1, 1));
+		file.extend_from_slice(&entry(0x014A, 4, 1, 60));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(60, 0);
+		file.extend_from_slice(&3u16.to_le_bytes());
+		file.extend_from_slice(&entry(0x0112, 3, 1, 6));
+		file.extend_from_slice(&entry(0x0201, 4, 1, 200));
+		file.extend_from_slice(&entry(0x0202, 4, 1, 400));
+		file.extend_from_slice(&0u32.to_le_bytes());
+		file.resize(200, 0);
+		file.extend_from_slice(&jpeg);
+		file.resize(600, 0);
+		assert_eq!(scan(&mut MemSource(file)).orientation, 1);
+	}
+
 	/// The shape every TIFF-family RAW reduces to: a SubIFD carrying a JPEG
 	/// the top-level directory says nothing about.
 	#[test]
@@ -989,7 +1014,7 @@ mod tests {
 			src: &mut src,
 			visited: Vec::new(),
 			candidates: Vec::new(),
-			orientation: 1,
+			orientation: None,
 			maker_note: None,
 		};
 		walk.walk(Endian::Little, 0, 8, 0, Vocab::Maker);
