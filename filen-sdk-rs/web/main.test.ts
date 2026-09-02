@@ -881,7 +881,9 @@ const RAW_FIXTURES = [
 		path: "4659/nice/Canon%20-%20EOS%20R6%20-%203%3A2.CR3",
 		length: 5273174,
 		sha256: "74abb0a113d075ad9887a058082f40dd2a938c4813a08474d82356f11a027778",
-		preview: { width: 1620, height: 1080 }
+		// The full picture from the first track, not the 1620x1080 PRVW box the
+		// thumbnail is cut from.
+		preview: { width: 3408, height: 2272 }
 	},
 	{
 		name: "7737.NEF",

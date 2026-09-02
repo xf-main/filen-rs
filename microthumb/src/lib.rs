@@ -133,9 +133,9 @@ pub struct LocatedPreview {
 	/// Absolute offset of the SOI in the source.
 	pub offset: u64,
 	/// As the container claims it, bounds-checked against the source but NOT
-	/// trimmed to the JPEG's own EOI: CR3 derives it from the enclosing box's
-	/// extent, so a few bytes of box padding may follow. Every decoder stops
-	/// at the EOI.
+	/// trimmed to the JPEG's own EOI: a CR3 preview box's is the box's own
+	/// extent, so a few bytes of padding may follow, and Panasonic pads too.
+	/// Every decoder stops at the EOI.
 	pub len: u64,
 	/// From the preview's own SOF, not from any directory field claiming to
 	/// describe it.

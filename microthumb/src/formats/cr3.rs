@@ -6,12 +6,23 @@
 //! alongside the mosaic and decode that — so all this module does is walk to
 //! the box holding it.
 //!
-//! Two boxes carry one, both nested inside `uuid` boxes Canon defines: `PRVW`
-//! (1620x1080 across every pinned body, from the EOS R to the PowerShot V1)
-//! and `THMB` (160x120). The larger one wins when both are present. Both hold
-//! a bare JPEG — SOI straight into the quantisation tables, no APP1 — so the
-//! shot's orientation is not in the stream. It is in `CMT1`, the box beside
-//! them that carries the file's EXIF IFD0 as a plain TIFF.
+//! Three JPEGs are in there. Two sit in boxes nested inside `uuid` boxes
+//! Canon defines: `PRVW` (1620x1080 across every pinned body, from the EOS R
+//! to the PowerShot V1) and `THMB` (160x120). The third is the whole picture
+//! at sensor resolution, stored as the single sample of the first track —
+//! `moov` > `trak` > `mdia` > `minf` > `stbl`, where `stsd` names the codec
+//! (a `JPEG` box inside the `CRAW` sample entry; the sensor tracks carry
+//! `CMP1` there instead), `stsz` the sample's size and `co64` its offset in
+//! `mdat`. All three are bare JPEGs — SOI straight into the quantisation
+//! tables, no APP1 — so the shot's orientation is not in any stream. It is in
+//! `CMT1`, the box beside them that carries the file's EXIF IFD0 as a plain
+//! TIFF.
+//!
+//! Which JPEG serves depends on the caller. A thumbnail takes the largest
+//! box: an IDCT-scaled decode still reads every byte of the entropy stream,
+//! so decoding the full picture would cost twenty times PRVW's bytes for the
+//! same 256 px tile. A preview takes the largest of all, the full picture
+//! included — it is the only rendering of the shot a viewer will ever get.
 //!
 //! The walk is its own bounded parser rather than a media library: box sizes
 //! are attacker-controlled, so every one is checked against its parent's
@@ -28,9 +39,10 @@ pub struct Cr3;
 
 /// Boxes visited across the whole tree.
 const MAX_BOXES: usize = 256;
-/// How deep the containers nest before the walk stops. `moov` -> `uuid` ->
-/// `THMB` is the deepest real path.
-const MAX_DEPTH: u8 = 3;
+/// How deep the containers nest before the walk stops. `moov` -> `trak` ->
+/// `mdia` -> `minf` is the deepest real path; `stbl`'s own children are read
+/// flat by [`Walk::sample_table`].
+const MAX_DEPTH: u8 = 4;
 /// A box header is 8 bytes, or 16 when the size word is the `1` escape.
 const BOX_HEADER: u64 = 8;
 /// Bytes of a preview box's payload searched for the SOI. Both box types put
@@ -40,25 +52,40 @@ const PREVIEW_PROBE: u64 = 32;
 /// model, timestamps, a few hundred bytes on every pinned body — so this caps
 /// a forged box size rather than budgeting a real one.
 const CMT1_MAX_BYTES: u64 = 64 * 1024;
+/// Most of an `stsd` read to name a track's codec. A `CRAW` sample entry is
+/// ~120–240 bytes on every pinned body.
+const STSD_MAX_BYTES: u64 = 4096;
 
-/// The largest preview box, and the file's orientation.
+/// The JPEGs the file carries, and its orientation.
 ///
-/// The preview JPEGs carry no EXIF of their own, so a portrait shot would come
-/// out sideways without the file-level tag. `CMT1` is a TIFF, which is exactly
-/// the payload the EXIF walker takes.
-fn index(src: &mut dyn ByteSource) -> Index {
+/// `with_tracks` says whether the full picture in the first track is looked
+/// at as well: its head is a read at an `mdat` offset, which over the network
+/// is a chunk the thumbnail path never needs.
+///
+/// The JPEGs carry no EXIF of their own, so a portrait shot would come out
+/// sideways without the file-level tag. `CMT1` is a TIFF, which is exactly the
+/// payload the EXIF walker takes.
+fn index(src: &mut dyn ByteSource, with_tracks: bool) -> Index {
 	let mut walk = Walk {
 		boxes: 0,
 		previews: Vec::new(),
+		tracks: Vec::new(),
 		cmt1: None,
 	};
 	let end = src.len();
 	walk.boxes_in(src, 0, end, 0);
-	let preview = walk
-		.previews
-		.into_iter()
-		.filter_map(|(off, len)| raw::jpeg_window(src, off, len))
-		.max_by_key(Preview::area);
+	let mut believe = |claims: Vec<(u64, u64)>| {
+		claims
+			.into_iter()
+			.filter_map(|(off, len)| raw::jpeg_window(src, off, len))
+			.max_by_key(Preview::area)
+	};
+	let boxed = believe(walk.previews);
+	let track = if with_tracks {
+		believe(walk.tracks)
+	} else {
+		None
+	};
 	let orientation = walk
 		.cmt1
 		.and_then(|(body, body_end)| {
@@ -67,8 +94,14 @@ fn index(src: &mut dyn ByteSource) -> Index {
 		.map_or(1, |tiff| exif::orientation(&tiff));
 	Index {
 		orientation,
-		preview,
-		jpeg: preview,
+		// The box first: see the module doc for why a thumbnail never wants
+		// the full picture. The track only when there is no box at all —
+		// which `open` asks for only once it has seen that there is none.
+		preview: boxed.or(track),
+		jpeg: [boxed, track]
+			.into_iter()
+			.flatten()
+			.max_by_key(Preview::area),
 	}
 }
 
@@ -84,7 +117,7 @@ impl FormatDecoder for Cr3 {
 		&self,
 		src: &mut dyn ByteSource,
 	) -> Result<Option<LocatedPreview>, ThumbError> {
-		Ok(raw::locate(index(src)))
+		Ok(raw::locate(index(src, true)))
 	}
 
 	fn open(
@@ -92,11 +125,18 @@ impl FormatDecoder for Cr3 {
 		mut src: Box<dyn ByteSource>,
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
+		let mut found = index(&mut *src, false);
+		if found.preview.is_none() {
+			// No preview box at all: the picture track is the only JPEG
+			// left, and its head is worth the chunk when the alternative is
+			// no thumbnail.
+			found = index(&mut *src, true);
+		}
 		let Index {
 			orientation,
 			preview: Some(preview),
 			..
-		} = index(&mut *src)
+		} = found
 		else {
 			return Err(ThumbError::Decode(
 				"cr3: no preview box; the sensor data is not a decodable image".into(),
@@ -108,10 +148,40 @@ impl FormatDecoder for Cr3 {
 
 struct Walk {
 	boxes: usize,
-	/// Byte ranges claimed to hold a JPEG, unverified.
+	/// Byte ranges the preview boxes claim hold a JPEG, unverified.
 	previews: Vec<(u64, u64)>,
+	/// Byte ranges the sample tables claim hold a JPEG-coded track's one
+	/// sample, unverified.
+	tracks: Vec<(u64, u64)>,
 	/// Payload range of the first `CMT1` box: the file's EXIF IFD0.
 	cmt1: Option<(u64, u64)>,
+}
+
+/// One box header at `at`, as `(kind, body, body_end)`, or `None` when it
+/// does not fit inside `end` — a tree that is forged or truncated, where the
+/// caller stops rather than guessing where the next box starts.
+fn read_box(src: &mut dyn ByteSource, at: u64, end: u64) -> Option<([u8; 4], u64, u64)> {
+	let header = raw::read_exact_at(src, at, BOX_HEADER)?;
+	let kind: [u8; 4] = header[4..8].try_into().expect("four bytes");
+	let mut size = u64::from(u32::from_be_bytes(
+		header[0..4].try_into().expect("four bytes"),
+	));
+	let mut header_len = BOX_HEADER;
+	match size {
+		// The 64-bit escape.
+		1 => {
+			let large = raw::read_exact_at(src, at + BOX_HEADER, 8)?;
+			size = u64::from_be_bytes(large.try_into().expect("eight bytes"));
+			header_len = 16;
+		}
+		// "To the end of the enclosing box."
+		0 => size = end - at,
+		_ => {}
+	}
+	if size < header_len || at.checked_add(size).is_none_or(|box_end| box_end > end) {
+		return None;
+	}
+	Some((kind, at + header_len, at + size))
 }
 
 impl Walk {
@@ -122,34 +192,9 @@ impl Walk {
 		let mut at = start;
 		while at + BOX_HEADER <= end && self.boxes < MAX_BOXES {
 			self.boxes += 1;
-			let Some(header) = raw::read_exact_at(src, at, BOX_HEADER) else {
+			let Some((kind, body, body_end)) = read_box(src, at, end) else {
 				return;
 			};
-			let kind: [u8; 4] = header[4..8].try_into().expect("four bytes");
-			let mut size = u64::from(u32::from_be_bytes(
-				header[0..4].try_into().expect("four bytes"),
-			));
-			let mut header_len = BOX_HEADER;
-			match size {
-				// The 64-bit escape.
-				1 => {
-					let Some(large) = raw::read_exact_at(src, at + BOX_HEADER, 8) else {
-						return;
-					};
-					size = u64::from_be_bytes(large.try_into().expect("eight bytes"));
-					header_len = 16;
-				}
-				// "To the end of the enclosing box."
-				0 => size = end - at,
-				_ => {}
-			}
-			// A box that does not fit inside its parent means the tree is
-			// forged or truncated; stop rather than guess where the next one
-			// starts.
-			if size < header_len || at.checked_add(size).is_none_or(|box_end| box_end > end) {
-				return;
-			}
-			let (body, body_end) = (at + header_len, at + size);
 			match &kind {
 				b"PRVW" | b"THMB" => self.preview_box(src, body, body_end),
 				b"CMT1" => {
@@ -157,7 +202,10 @@ impl Walk {
 						self.cmt1 = Some((body, body_end));
 					}
 				}
-				b"moov" => self.boxes_in(src, body, body_end, depth + 1),
+				b"moov" | b"trak" | b"mdia" | b"minf" => {
+					self.boxes_in(src, body, body_end, depth + 1)
+				}
+				b"stbl" => self.sample_table(src, body, body_end),
 				// A `uuid` box names itself with 16 bytes and then, in Canon's
 				// case, either starts its children immediately or first writes
 				// a version word. Rather than hard-code which UUID does which,
@@ -188,6 +236,78 @@ impl Walk {
 		let off = body + soi as u64;
 		self.previews.push((off, body_end - off));
 	}
+
+	/// A track's sample table, read flat: the codec its sample entry names,
+	/// the size of its first sample and where that sample sits. Only a track
+	/// whose entry carries a `JPEG` box becomes a candidate — the sensor
+	/// tracks (`CMP1`) would cost a read at their `mdat` offset just to be
+	/// refused for having no SOI, and over the network that read is a chunk.
+	fn sample_table(&mut self, src: &mut dyn ByteSource, body: u64, end: u64) {
+		let (mut jpeg, mut size, mut offset) = (false, None, None);
+		let mut at = body;
+		while at + BOX_HEADER <= end && self.boxes < MAX_BOXES {
+			self.boxes += 1;
+			let Some((kind, body, body_end)) = read_box(src, at, end) else {
+				return;
+			};
+			let len = body_end - body;
+			match &kind {
+				b"stsd" => {
+					// Version and flags, an entry count, then the `CRAW`
+					// sample entry: the standard 78-byte visual entry, a few
+					// bytes Canon adds, then the codec box. The tail makes a
+					// fixed offset a guess, so the codec box is found by its
+					// name; the stream is verified by its own SOI and SOF
+					// either way.
+					if let Some(stsd) = raw::read_exact_at(src, body, len.min(STSD_MAX_BYTES)) {
+						jpeg = stsd
+							.get(8..)
+							.is_some_and(|entries| entries.windows(4).any(|w| w == b"JPEG"));
+					}
+				}
+				// Version and flags, a sample size that applies to every
+				// sample when non-zero, a count, then per-sample sizes.
+				b"stsz" => {
+					if let Some(stsz) = raw::read_exact_at(src, body, len.min(16)) {
+						let shared = be_u32(&stsz, 4);
+						let count = be_u32(&stsz, 8);
+						size = match (shared, count) {
+							(Some(0), Some(n)) if n >= 1 => be_u32(&stsz, 12).map(u64::from),
+							(Some(shared), _) if shared > 0 => Some(u64::from(shared)),
+							_ => None,
+						};
+					}
+				}
+				// Version and flags, a count, then chunk offsets — 64-bit in
+				// `co64`, 32-bit in `stco`. One sample per chunk here.
+				b"co64" => {
+					if let Some(co64) = raw::read_exact_at(src, body, len.min(16))
+						&& be_u32(&co64, 4).is_some_and(|n| n >= 1)
+						&& let Some(bytes) = co64.get(8..16)
+					{
+						offset = Some(u64::from_be_bytes(bytes.try_into().expect("eight bytes")));
+					}
+				}
+				b"stco" => {
+					if let Some(stco) = raw::read_exact_at(src, body, len.min(12))
+						&& be_u32(&stco, 4).is_some_and(|n| n >= 1)
+					{
+						offset = be_u32(&stco, 8).map(u64::from);
+					}
+				}
+				_ => {}
+			}
+			at = body_end;
+		}
+		if jpeg && let (Some(offset), Some(size)) = (offset, size) {
+			self.tracks.push((offset, size));
+		}
+	}
+}
+
+fn be_u32(data: &[u8], at: usize) -> Option<u32> {
+	data.get(at..at + 4)
+		.map(|b| u32::from_be_bytes(b.try_into().expect("four bytes")))
 }
 
 /// Where a `uuid` box's children begin: right after the UUID, or 8 bytes
@@ -241,6 +361,7 @@ mod tests {
 		let mut walk = Walk {
 			boxes: 0,
 			previews: Vec::new(),
+			tracks: Vec::new(),
 			cmt1: None,
 		};
 		let end = src.len();
@@ -379,23 +500,81 @@ mod tests {
 	/// The real layout: `moov` -> Canon `uuid` -> `CMT1` beside `THMB`, and
 	/// the `PRVW` in its own versioned `uuid`.
 	fn cr3(cmt1_body: Option<&[u8]>) -> Vec<u8> {
-		let mut canon = vec![0u8; 16];
-		if let Some(body) = cmt1_body {
-			canon.extend_from_slice(&boxed(b"CMT1", body));
+		cr3_with_track(cmt1_body, None)
+	}
+
+	/// A `trak` whose one sample is `sample_size` bytes at `offset`, coded as
+	/// `codec` — the `stsd` layout of every pinned body: version and flags,
+	/// a count, a `CRAW` entry with its 78 standard bytes, four of Canon's,
+	/// and the codec box.
+	fn track(codec: &[u8; 4], offset: u64, sample_size: u32) -> Vec<u8> {
+		let mut entry = vec![0u8; 78 + 4];
+		entry.extend_from_slice(&boxed(codec, &[0u8; 4]));
+		let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+		stsd.extend_from_slice(&boxed(b"CRAW", &entry));
+		let mut stsz = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+		stsz.extend_from_slice(&sample_size.to_be_bytes());
+		let mut co64 = vec![0, 0, 0, 0, 0, 0, 0, 1];
+		co64.extend_from_slice(&offset.to_be_bytes());
+		let mut stbl = boxed(b"stsd", &stsd);
+		stbl.extend_from_slice(&boxed(b"stsz", &stsz));
+		stbl.extend_from_slice(&boxed(b"co64", &co64));
+		boxed(
+			b"trak",
+			&boxed(b"mdia", &boxed(b"minf", &boxed(b"stbl", &stbl))),
+		)
+	}
+
+	/// [`cr3`], plus a first track whose sample is `sample` in an `mdat`
+	/// after everything else, described as `codec`. The track's boxes hold
+	/// the sample's absolute offset, so the file is laid out twice: once to
+	/// measure, once for real.
+	fn cr3_with_track(
+		cmt1_body: Option<&[u8]>,
+		track_sample: Option<(&[u8; 4], &[u8])>,
+	) -> Vec<u8> {
+		cr3_layout(cmt1_body, track_sample, true)
+	}
+
+	/// `with_boxes` false leaves out both preview boxes, PRVW and THMB.
+	fn cr3_layout(
+		cmt1_body: Option<&[u8]>,
+		track_sample: Option<(&[u8; 4], &[u8])>,
+		with_boxes: bool,
+	) -> Vec<u8> {
+		let build = |mdat_at: u64| {
+			let mut canon = vec![0u8; 16];
+			if let Some(body) = cmt1_body {
+				canon.extend_from_slice(&boxed(b"CMT1", body));
+			}
+			if with_boxes {
+				let mut thmb = vec![0u8; 16];
+				thmb.extend_from_slice(&real_jpeg(160, 120));
+				canon.extend_from_slice(&boxed(b"THMB", &thmb));
+			}
+			let mut moov = boxed(b"uuid", &canon);
+			if let Some((codec, sample)) = track_sample {
+				moov.extend_from_slice(&track(codec, mdat_at, sample.len() as u32));
+			}
+
+			let mut file = boxed(b"ftyp", b"crx iso");
+			file.extend_from_slice(&boxed(b"moov", &moov));
+			if with_boxes {
+				let mut versioned = vec![0u8; 16];
+				versioned.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+				let mut prvw = vec![0u8; 16];
+				prvw.extend_from_slice(&real_jpeg(640, 480));
+				versioned.extend_from_slice(&boxed(b"PRVW", &prvw));
+				file.extend_from_slice(&boxed(b"uuid", &versioned));
+			}
+			file
+		};
+		let head = build(0);
+		let mdat_at = head.len() as u64 + 8;
+		let mut file = build(mdat_at);
+		if let Some((_, sample)) = track_sample {
+			file.extend_from_slice(&boxed(b"mdat", sample));
 		}
-		let mut thmb = vec![0u8; 16];
-		thmb.extend_from_slice(&real_jpeg(160, 120));
-		canon.extend_from_slice(&boxed(b"THMB", &thmb));
-
-		let mut versioned = vec![0u8; 16];
-		versioned.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
-		let mut prvw = vec![0u8; 16];
-		prvw.extend_from_slice(&real_jpeg(640, 480));
-		versioned.extend_from_slice(&boxed(b"PRVW", &prvw));
-
-		let mut file = boxed(b"ftyp", b"crx iso");
-		file.extend_from_slice(&boxed(b"moov", &boxed(b"uuid", &canon)));
-		file.extend_from_slice(&boxed(b"uuid", &versioned));
 		file
 	}
 
@@ -448,6 +627,107 @@ mod tests {
 		let spec = ThumbSpec::new(64, 64, crate::DEFAULT_MEM_BUDGET);
 		assert!(Cr3.open(Box::new(MemSource(file.clone())), &spec).is_ok());
 		assert_eq!(locate_preview(&mut MemSource(file)).unwrap(), None);
+	}
+
+	/// The whole picture in the first track is the preview; PRVW stays the
+	/// thumbnail source, because an IDCT-scaled decode still reads every byte
+	/// of the stream it shrinks. Both take the `CMT1` orientation.
+	#[test]
+	fn the_full_size_track_is_the_preview_and_prvw_the_thumbnail() {
+		let full = real_jpeg(1600, 1200);
+		let file = cr3_with_track(Some(&cmt1(6)), Some((b"JPEG", &full)));
+		let offset = file
+			.windows(full.len())
+			.position(|w| w == full.as_slice())
+			.expect("the track JPEG is in the file") as u64;
+		let located = locate_preview(&mut MemSource(file.clone()))
+			.unwrap()
+			.expect("a preview");
+		assert_eq!((located.offset, located.len), (offset, full.len() as u64));
+		assert_eq!((located.width, located.height), (1600, 1200));
+		assert_eq!(located.orientation, 6);
+		let spec = ThumbSpec::new(512, 512, crate::DEFAULT_MEM_BUDGET);
+		let prepared = Cr3
+			.open(Box::new(MemSource(file)), &spec)
+			.expect("a thumbnail");
+		assert_eq!(
+			prepared.dims(),
+			(640, 480),
+			"the thumbnail must come from PRVW"
+		);
+		assert_eq!(prepared.orientation(), 6);
+	}
+
+	/// A file with no preview box at all still thumbnails: the picture track
+	/// is the only JPEG left, and `open` walks it only then — a normal CR3
+	/// never has its `mdat` read for a thumbnail.
+	#[test]
+	fn a_box_less_cr3_thumbnails_from_its_track() {
+		let full = real_jpeg(1600, 1200);
+		let file = cr3_layout(Some(&cmt1(6)), Some((b"JPEG", &full)), false);
+		let spec = ThumbSpec::new(512, 512, crate::DEFAULT_MEM_BUDGET);
+		let prepared = Cr3
+			.open(Box::new(MemSource(file.clone())), &spec)
+			.expect("the track serves");
+		assert_eq!(prepared.dims(), (1600, 1200));
+		assert_eq!(prepared.orientation(), 6);
+		let located = locate_preview(&mut MemSource(file))
+			.unwrap()
+			.expect("a preview");
+		assert_eq!((located.width, located.height), (1600, 1200));
+	}
+
+	/// A sensor track — `CMP1` in its sample entry — is never a candidate,
+	/// even when the bytes at its offset happen to be a JPEG: its head would
+	/// otherwise cost a read at an `mdat` offset, a whole chunk over the
+	/// network, to be refused. And a track that claims `JPEG` over bytes that
+	/// are not one is refused by those bytes.
+	#[test]
+	fn only_a_jpeg_coded_track_is_a_candidate_and_its_bytes_have_the_last_word() {
+		let full = real_jpeg(1600, 1200);
+		let crx = cr3_with_track(Some(&cmt1(1)), Some((b"CMP1", &full)));
+		let located = locate_preview(&mut MemSource(crx)).unwrap().expect("PRVW");
+		assert_eq!((located.width, located.height), (640, 480));
+
+		let lying = cr3_with_track(Some(&cmt1(1)), Some((b"JPEG", &[0x41u8; 4096])));
+		let located = locate_preview(&mut MemSource(lying))
+			.unwrap()
+			.expect("PRVW");
+		assert_eq!((located.width, located.height), (640, 480));
+	}
+
+	/// Forged sample tables: a size past the file, an offset past the file,
+	/// a table with no entries. None may panic; PRVW still serves.
+	#[test]
+	fn forged_sample_tables_are_refused_without_panicking() {
+		let full = real_jpeg(1600, 1200);
+		let good = cr3_with_track(Some(&cmt1(1)), Some((b"JPEG", &full)));
+		let forge = |stsz_tail: &[u8], co64_tail: &[u8]| {
+			let mut file = good.clone();
+			// The tables are unique byte strings in the synthetic file.
+			let stsz = file.windows(4).position(|w| w == b"stsz").expect("stsz");
+			file[stsz + 4..stsz + 4 + stsz_tail.len()].copy_from_slice(stsz_tail);
+			let co64 = file.windows(4).position(|w| w == b"co64").expect("co64");
+			file[co64 + 4..co64 + 4 + co64_tail.len()].copy_from_slice(co64_tail);
+			file
+		};
+		let mut huge = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+		huge.extend_from_slice(&u32::MAX.to_be_bytes());
+		let mut past = vec![0, 0, 0, 0, 0, 0, 0, 1];
+		past.extend_from_slice(&u64::MAX.to_be_bytes());
+		// Version and flags, a shared size of 0, a count of 0.
+		let no_sizes = vec![0u8; 12];
+		// Version and flags, a count of 0.
+		let no_offsets = vec![0u8; 8];
+		for file in [
+			forge(&huge, &[]),
+			forge(&[], &past),
+			forge(&no_sizes, &[]),
+			forge(&[], &no_offsets),
+		] {
+			let located = locate_preview(&mut MemSource(file)).unwrap().expect("PRVW");
+			assert_eq!((located.width, located.height), (640, 480));
+		}
 	}
 
 	/// `CMT1` is attacker-controlled bytes like every other box: garbage, a
