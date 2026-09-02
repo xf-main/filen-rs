@@ -2,37 +2,10 @@ use image::{DynamicImage, codecs::webp::WebPEncoder, imageops::FilterType};
 
 use crate::{ErrorKind, error::Error};
 
-// MUST BE SORTED ALPHABETICALLY
-const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
-	// AVIF goes through `heif-decoder` — libheif on its dav1d backend, the
-	// same container path HEIC takes, available on every target this builds
-	// for.
-	#[cfg(feature = "heif-decoder")]
-	"image/avif",
-	"image/gif",
-	#[cfg(feature = "heif-decoder")]
-	"image/heic",
-	#[cfg(feature = "heif-decoder")]
-	"image/heif",
-	"image/jpeg",
-	"image/png",
-	"image/qoi",
-	// Native only: the wasm build takes microthumb without its `svg` feature
-	// (resvg is a large dependency for a format phones never produce), so
-	// wasm keeps refusing SVG up front.
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	"image/svg+xml",
-	"image/tiff",
-	"image/webp",
-	"image/x-qoi",
-];
-
-pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
-	SUPPORTED_THUMBNAIL_MIME_TYPES.binary_search(&mime).is_ok()
-}
-
 /// Extensions worth spending bytes on, evaluated from the filename at READ
-/// time.
+/// time. The one gate in front of the pipeline, on every target: the mobile
+/// cache, `makeThumbnailInMemory` and `File.canMakeThumbnail` all consult it,
+/// so a format is admitted or refused in one place.
 ///
 /// This list is ours on purpose. The stored mime is written once at upload by
 /// whichever client uploaded the file — `mime-types` (JS), `mime_guess` (Rust)
@@ -53,25 +26,68 @@ pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
 /// answer the same everywhere and lets a new format be added in one line
 /// instead of waiting for three upstreams and a re-upload.
 ///
-/// The RAW entries are attempts, not promises: they are TIFF or ISO-BMFF
-/// containers that normally carry an embedded JPEG preview, which is exactly
-/// what the pipeline's preview probe looks for. Whether every vendor's layout
-/// yields one is unverified — no RAW fixtures were available — but a miss
-/// costs one chunk and answers "no thumbnail", which is what they do today
-/// anyway.
+/// The RAW entries reach for the JPEG the camera embeds beside the sensor
+/// mosaic, which is the only thing the pipeline ever decodes from a RAW file.
+/// microthumb's raw characterisation pins that against 100 CC0 samples: every
+/// CR2/CR3/NEF/ARW/PEF/SRW/ORF/RW2/RAF sample yields one, and the DNGs that do
+/// not are cinema/CFA files with no displayable image at all. The tail entries
+/// (3fr, iiq, ...) walk the same TIFF directories and are attempts rather than
+/// promises: a miss costs a chunk or two and answers "no thumbnail".
 ///
-/// `avif` is present because the vendored libheif carries an AV1 decoder
-/// (dav1d) alongside HEVC — the same container code path as HEIC (pinned by
-/// `heif-decoder`'s `hevc_and_av1_decode`).
+/// The cfg gates mirror what the pipeline can decode in THIS build, and must
+/// stay in step with it: `heic`/`heif`/`hif`/`avif` all go through the vendored
+/// libheif (HEVC and, since dav1d was vendored, AV1 — pinned by
+/// `heif-decoder`'s `hevc_and_av1_decode`), and SVG through resvg, which only
+/// the native target section of Cargo.toml enables (a rasteriser is a large
+/// dependency for a format phones never produce). A build without the decoder
+/// must answer "no" here rather than spend a chunk to be refused by the sniff.
 const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
 	// Formats the pipeline decodes directly. `svgz` is deliberately absent:
 	// the pipeline refuses gzipped SVG (no inflate), so looking would cost a
 	// chunk and answer nothing.
-	"avif", "bmp", "gif", "heic", "heif", "hif", "jfif", "jpe", "jpeg", "jpg", "png", "qoi", "svg",
-	"tif", "tiff", "webp", //
+	"bmp",
+	"gif",
+	"jfif",
+	"jpe",
+	"jpeg",
+	"jpg",
+	"png",
+	"qoi",
+	"tif",
+	"tiff",
+	"webp",
+	#[cfg(feature = "heif-decoder")]
+	"avif",
+	#[cfg(feature = "heif-decoder")]
+	"heic",
+	#[cfg(feature = "heif-decoder")]
+	"heif",
+	#[cfg(feature = "heif-decoder")]
+	"hif",
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	"svg",
 	// RAW: TIFF/BMFF containers, reached for their embedded preview.
-	"3fr", "arw", "cr2", "cr3", "dng", "erf", "iiq", "kdc", "mos", "mrw", "nef", "nrw", "orf",
-	"pef", "raf", "raw", "rw2", "rwl", "srf", "srw", "x3f",
+	"3fr",
+	"arw",
+	"cr2",
+	"cr3",
+	"dng",
+	"erf",
+	"iiq",
+	"kdc",
+	"mos",
+	"mrw",
+	"nef",
+	"nrw",
+	"orf",
+	"pef",
+	"raf",
+	"raw",
+	"rw2",
+	"rwl",
+	"srf",
+	"srw",
+	"x3f",
 ];
 
 /// Whether a thumbnail is worth attempting for this file.
@@ -79,22 +95,16 @@ const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
 /// Magic bytes remain the authority — this only decides whether to spend the
 /// bytes to look.
 ///
-/// **An extension, when there is one, decides on its own. The mime is
-/// consulted only for names that carry no extension at all.** Every library
-/// that wrote those stored mimes derived them from the extension in the first
-/// place, so for a named file the extension is the same evidence, only fresher
-/// and evaluated against a table we control. Falling back to the mime for
-/// extensionless names still honours a client that supplied one explicitly —
-/// a browser's `File.type`, say — which is the one case where the mime knows
-/// something the name does not.
-///
-/// This is what keeps `psd`, `dwg`, `tga` and friends out despite their
-/// `image/*` mimes: nothing here decodes them, so looking costs a chunk and
-/// answers nothing. It also means a file whose extension lies (`photo.xyz`
-/// holding a JPEG) is skipped even if
-/// its mime says otherwise — accepted, because that mime can only have been
-/// supplied by hand, and the alternative is paying a chunk for every unknown
-/// extension on the drive.
+/// **Either signal admits: a known extension, or a stored mime the table
+/// maps to one.** The extension rescues what the mime lost — HEIC and RAW
+/// stored as octet-stream by a library that never heard of them. The mime
+/// rescues what the name lost — a picker-supplied `image/jpeg` on a name whose
+/// last dot-segment is no extension (`IMG_2026.06.01`), which a content
+/// provider hands over without ever looking at the name. Both go through the
+/// one cfg-gated table, so a mime never admits what this build cannot decode,
+/// and `psd`, `dwg`, `tga` and friends stay out however their mime reads:
+/// nothing here decodes them, so looking would cost a chunk and answer
+/// nothing.
 ///
 /// Filename handling, all deliberate: the extension is what follows the LAST
 /// dot, matching every library that produced the stored mimes, so
@@ -102,15 +112,34 @@ const THUMBNAILABLE_EXTENSIONS: &[&str] = &[
 /// and tolerates surrounding whitespace. A dotfile named `.jpg` counts as a
 /// JPEG — permissive, and it costs at most a chunk to be wrong.
 pub fn might_be_thumbnailable(name: Option<&str>, mime: Option<&str>) -> bool {
-	match name.and_then(|name| name.rsplit_once('.')) {
-		Some((_, ext)) => {
-			let ext = ext.trim();
-			THUMBNAILABLE_EXTENSIONS
-				.iter()
-				.any(|known| ext.eq_ignore_ascii_case(known))
-		}
-		None => mime.is_some_and(|mime| mime.starts_with("image/")),
-	}
+	let extension_known = name
+		.and_then(|name| name.rsplit_once('.'))
+		.is_some_and(|(_, ext)| extension_is_thumbnailable(ext.trim()));
+	extension_known || mime.is_some_and(mime_is_thumbnailable)
+}
+
+fn extension_is_thumbnailable(ext: &str) -> bool {
+	THUMBNAILABLE_EXTENSIONS
+		.iter()
+		.any(|known| ext.eq_ignore_ascii_case(known))
+}
+
+/// The stored mime, read through the same cfg-gated table: `image/<sub>` is
+/// `<sub>` as an extension, bar the handful of subtypes that spell it
+/// differently. Anything the table does not know — `vnd.adobe.photoshop`,
+/// `x-icon` — stays out, exactly as its extension would, and a mime never
+/// admits what this build cannot decode.
+fn mime_is_thumbnailable(mime: &str) -> bool {
+	let Some(sub) = mime.strip_prefix("image/") else {
+		return false;
+	};
+	extension_is_thumbnailable(match sub {
+		"jpeg" => "jpg",
+		"svg+xml" => "svg",
+		"x-qoi" => "qoi",
+		"tiff" => "tif",
+		other => other,
+	})
 }
 
 #[cfg(test)]
@@ -119,53 +148,85 @@ mod gate_tests {
 
 	#[test]
 	fn the_extension_rescues_what_the_stored_mime_lost() {
-		// The case this exists for: HEIC stored as octet-stream by a Go client
-		// on macOS, or by any Rust client predating mime_guess 2.0.5.
-		assert!(might_be_thumbnailable(
-			Some("IMG_0042.heic"),
-			Some("application/octet-stream")
-		));
 		// RAW, absent from the JS table entirely.
 		assert!(might_be_thumbnailable(
 			Some("DSC_0001.NEF"),
 			Some("application/octet-stream")
 		));
-		// AVIF, decoded by libheif's AV1 backend since dav1d was vendored — if
-		// this ever goes back to refusing, the decoder went away with it.
 		assert!(might_be_thumbnailable(
-			Some("photo.avif"),
+			Some("IMG_0001.CR3"),
 			Some("application/octet-stream")
-		));
-		assert!(might_be_thumbnailable(
-			Some("photo.avif"),
-			Some("image/avif")
 		));
 		// Uppercase is the norm straight off a camera.
 		assert!(might_be_thumbnailable(Some("IMG_1234.JPG"), None));
-		// SVG rasterises through the bounded pipeline; gzipped SVG does not
-		// (the pipeline refuses it), so svgz stays out.
-		assert!(might_be_thumbnailable(
-			Some("logo.svg"),
-			Some("image/svg+xml")
-		));
+		// Gzipped SVG is refused by the pipeline (no inflate), so svgz is not
+		// in the table. (A stored mime naming plain SVG still admits it — a
+		// chunk spent on a hand-supplied mime that lied, and the sniff's no.)
 		assert!(!might_be_thumbnailable(
 			Some("logo.svgz"),
-			Some("image/svg+xml")
+			Some("application/octet-stream")
 		));
 	}
 
+	/// The gate admits a format only when this build decodes it; a mime
+	/// cannot say otherwise. Without the decoder the answer is "no" up front,
+	/// not a chunk spent to be refused by the sniff.
 	#[test]
-	fn the_mime_is_the_fallback_only_when_there_is_no_extension() {
-		// An explicitly-supplied mime is the only signal for a name that
-		// carries no extension, so it is honoured.
+	fn the_gate_follows_the_decoders_this_build_carries() {
+		// The case the extension gate exists for: HEIC stored as octet-stream
+		// by a Go client on macOS, or by any Rust client predating mime_guess
+		// 2.0.5. AVIF rides the same libheif path since dav1d was vendored —
+		// if either ever goes back to refusing, the decoder went away with it.
+		let heif = cfg!(feature = "heif-decoder");
+		for name in ["IMG_0042.heic", "IMG_0042.HIF", "photo.avif"] {
+			assert_eq!(
+				might_be_thumbnailable(Some(name), Some("application/octet-stream")),
+				heif
+			);
+		}
+		assert_eq!(
+			might_be_thumbnailable(Some("photo.avif"), Some("image/avif")),
+			heif
+		);
+		// SVG rasterises through resvg, which only the native target carries.
+		let svg = cfg!(not(all(target_family = "wasm", target_os = "unknown")));
+		assert_eq!(
+			might_be_thumbnailable(Some("logo.svg"), Some("image/svg+xml")),
+			svg
+		);
+		// The mime goes through the same gates as the extension: a rename
+		// that dropped the extension does not smuggle a format past them.
+		assert_eq!(
+			might_be_thumbnailable(Some("logo"), Some("image/svg+xml")),
+			svg
+		);
+		assert_eq!(
+			might_be_thumbnailable(Some("scan"), Some("image/heic")),
+			heif
+		);
+	}
+
+	#[test]
+	fn a_known_mime_admits_what_the_name_does_not() {
+		// No extension at all, or a last dot-segment that is none: the
+		// picker-supplied mime is the only signal, and it is honoured.
 		assert!(might_be_thumbnailable(Some("scan"), Some("image/jpeg")));
 		assert!(might_be_thumbnailable(None, Some("image/png")));
-		// But an extension we cannot decode wins over its own correct mime —
+		assert!(might_be_thumbnailable(
+			Some("IMG_2026.06.01"),
+			Some("image/jpeg")
+		));
+		assert!(might_be_thumbnailable(
+			Some("photo.final"),
+			Some("image/jpeg")
+		));
+		// A mime the table does not know admits nothing, extension or not —
 		// looking would cost a chunk to learn nothing.
 		assert!(!might_be_thumbnailable(
 			Some("art.psd"),
 			Some("image/vnd.adobe.photoshop")
 		));
+		assert!(!might_be_thumbnailable(Some("icon"), Some("image/x-icon")));
 	}
 
 	#[test]
@@ -942,14 +1003,16 @@ mod js_impls {
 	use filen_macros::js_type;
 
 	use super::{
-		ThumbSource, ThumbnailOutcome, is_supported_thumbnail_mime,
-		remote_chunks::thumbnail_remote_file,
+		ThumbSource, ThumbnailOutcome, might_be_thumbnailable, remote_chunks::thumbnail_remote_file,
 	};
 	use crate::{
 		Error,
 		auth::JsClient,
 		error::MetadataWasNotDecryptedError,
-		fs::file::{AnonymousRemoteFile, traits::HasFileInfo},
+		fs::{
+			HasName,
+			file::{AnonymousRemoteFile, traits::HasFileInfo},
+		},
 		js::File,
 		runtime::do_on_commander,
 	};
@@ -1035,7 +1098,12 @@ mod js_impls {
 				// shared-in listing (which reports no stable id) is fine.
 				let file = AnonymousRemoteFile::try_from(params.file)?;
 				let mime = file.mime().ok_or(MetadataWasNotDecryptedError)?;
-				if !is_supported_thumbnail_mime(mime) {
+				// The extension, not the stored mime: that mime is whatever the
+				// uploading client's library said years ago, and RAW is absent
+				// from every such table (see `might_be_thumbnailable`) — gated on
+				// it, this refused every RAW on the drive while the mobile cache
+				// thumbnailed them fine.
+				if !might_be_thumbnailable(file.name(), Some(mime)) {
 					return Ok(MakeThumbnailInMemoryResult::Unsupported);
 				}
 				let spec =

@@ -10,7 +10,7 @@ use meta::FileMeta;
 use crate::{
 	crypto::error::ConversionError,
 	io::{AnonymousRemoteFile, RemoteFile},
-	thumbnail::is_supported_thumbnail_mime,
+	thumbnail::might_be_thumbnailable,
 };
 
 #[js_type(import, export, wasm_all)]
@@ -56,7 +56,7 @@ pub struct File {
 	)]
 	chunks: u64,
 	// JS only field, indicates if the file can have a thumbnail generated
-	// this is here to avoid having to call into WASM to check mime types
+	// this is here to avoid having to call into WASM to check the name
 	can_make_thumbnail: bool,
 }
 
@@ -77,7 +77,7 @@ impl File {
 		let meta = file.meta.into();
 		File {
 			can_make_thumbnail: if let FileMeta::Decoded(meta) = &meta {
-				is_supported_thumbnail_mime(&meta.mime)
+				might_be_thumbnailable(Some(&meta.name), Some(&meta.mime))
 			} else {
 				false
 			},

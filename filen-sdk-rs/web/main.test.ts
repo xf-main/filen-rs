@@ -847,6 +847,111 @@ test("large webp thumbnail", async () => {
 	bitmap.close()
 }, 180000)
 
+/// Camera RAW, the case the extension gate exists for: the stored mime is whatever the
+/// uploading client's mime table said (RAW is absent from every JS one, and `.CR3` from
+/// most), so gated on the mime every RAW on the drive answered "unsupported" while the
+/// mobile cache — gated on the extension — thumbnailed them fine. The pipeline never
+/// decodes a sensor mosaic; it locates the JPEG the camera embedded and thumbnails that,
+/// so the answer must also SAY it came from the embedded preview.
+///
+/// Pinned CC0 samples from raw.pixls.us, a subset of microthumb's characterisation set
+/// (microthumb/tests/raw_fixtures/pins.rs), one per container mechanism: IFD0 strip
+/// (CR2), ISO-BMFF box (CR3), SubIFD (NEF), preview IFD (DNG), header pointer (RAF),
+/// maker note (ORF), private tag (RW2). They come through the dev server's `/raw-fixtures`
+/// cache (vitest.config.ts) — the same files the Rust suite pins — and are verified by
+/// length and SHA-256 before anything is uploaded. An absent file is a skip: the library
+/// is a volunteer-run host and its outages are not this SDK's; a wrong file is a failure.
+const RAW_FIXTURES = [
+	{
+		name: "2102.CR2",
+		path: "2102/nice/Canon%20-%20EOS%2040D%20-%20sRAW2%20%28sRAW%29%20%283%3A2%29.CR2",
+		length: 5805950,
+		sha256: "ba644e7dd2abe74eca260e67f0206ff113bf0f62e710f8130611e964d6be5bf1"
+	},
+	{
+		name: "4659.CR3",
+		path: "4659/nice/Canon%20-%20EOS%20R6%20-%203%3A2.CR3",
+		length: 5273174,
+		sha256: "74abb0a113d075ad9887a058082f40dd2a938c4813a08474d82356f11a027778"
+	},
+	{
+		name: "7737.NEF",
+		path: "7737/nice/Nikon%20-%20Z5_2%20-%208bit%20compressed%20%283%3A2%29.NEF",
+		length: 6174720,
+		sha256: "196971ea960cfa6f5c0a19cebe515ac118e079c57ceeef850ab3a4995dc7d20f"
+	},
+	{
+		name: "1033.DNG",
+		path: "1033/nice/Adobe%20DNG%20Converter%20-%20Canon%20EOS%205D%20Mark%20III%20-%20Lossy%20JPEG%20compression%2C%20rgb%20%283%3A2%29.DNG",
+		length: 2484836,
+		sha256: "b22f1e36331f679abb8b13e433b9bbde3988723adf10fee7aa0dda6381016a98"
+	},
+	{
+		name: "2726.RAF",
+		path: "2726/nice/Fujifilm%20-%20FinePix%20S5000%20-%204%3A3.RAF",
+		length: 6851240,
+		sha256: "dabd5e74521a6980156be9fd4b88d0c37b0fe4d0e0e6f5c12db8cffff1b76297"
+	},
+	{
+		name: "5424.ORF",
+		path: "5424/nice/Olympus%20-%20E-10%20-%2016bit%20%284%3A3%29.ORF",
+		length: 7614592,
+		sha256: "2bfdade72439017a60a47aad1e5bbcb1aca36f2be7a21e94a4257a678fb6f4da"
+	},
+	{
+		name: "7008.RW2",
+		path: "7008/nice/Panasonic%20-%20DMC-LX7%20-%201%3A1.RW2",
+		length: 3249664,
+		sha256: "d142a23aca836053ed53e9ce3cb3ed2d434541d734d71a94a6eefadcd08bd31b"
+	}
+]
+
+async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes)
+	return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("")
+}
+
+test("raw thumbnails come from the embedded preview", async () => {
+	const results = await Promise.all(
+		RAW_FIXTURES.map(async fixture => {
+			const res = await fetch(`raw-fixtures/${fixture.name}/${fixture.path}`)
+
+			if (!res.ok) {
+				console.warn(`SKIP ${fixture.name}: ${res.status} from the fixture cache`)
+
+				return null
+			}
+
+			const bytes = new Uint8Array(await res.arrayBuffer())
+			expect(bytes.length, `${fixture.name} length`).toBe(fixture.length)
+			expect(await sha256Hex(bytes), `${fixture.name} does not match its pin`).toBe(fixture.sha256)
+
+			const file = await state.uploadFile(bytes, { parent: testDir, name: fixture.name })
+			// Decided from the name, whatever mime the upload stored.
+			expect(file.canMakeThumbnail, `${fixture.name} canMakeThumbnail`).toBe(true)
+
+			const thumb = expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
+			expect(thumb.fromEmbeddedPreview, `${fixture.name} was not served from its embedded preview`).toBe(true)
+			expect(thumb.width).toBeLessThanOrEqual(256)
+			expect(thumb.height).toBeLessThanOrEqual(256)
+
+			const bitmap = await createImageBitmap(new Blob([thumb.webpData], { type: "image/webp" }))
+			expect(bitmap.width).toBe(thumb.width)
+			expect(bitmap.height).toBe(thumb.height)
+			bitmap.close()
+
+			return `${fixture.name} ${thumb.width}x${thumb.height}`
+		})
+	)
+	const produced = results.filter((r): r is string => r !== null)
+
+	if (produced.length === 0) {
+		console.warn("raw thumbnails: not one fixture was available; nothing was checked")
+	}
+
+	console.log("raw thumbnails:", produced.join(", "))
+}, 600_000)
+
 test("thumbnail verdicts are distinguishable", async () => {
 	// The point of the verdicts: three different "no picture" answers that a UI
 	// treats differently. Previously all three arrived as `undefined`, and a
