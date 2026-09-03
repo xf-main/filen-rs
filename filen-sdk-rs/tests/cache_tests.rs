@@ -1479,9 +1479,12 @@ async fn test_cache_resync_reports_progress() {
 	// converge eventually). The worker's startup gap-check can emit an EARLIER empty-roots
 	// Started/Finished pair (it runs before the add is processed) and the status callback
 	// appends batches via spawned tasks (order not guaranteed), so assert PRESENCE of each
-	// step rather than strict ordering.
+	// step rather than strict ordering. The window is the suite's convergence timeout, not a
+	// shorter number of its own: one contended lock acquisition is the worker's full patient
+	// budget (60 polls x 2 s ~= 120 s) and ends in `Finished { converged: false }` plus a
+	// retry, so a 120 s window was exactly one such acquisition (windows V1, 2026-09-03).
 	let saw_full_sequence = cache
-		.wait_for_messages(Duration::from_secs(120), |msgs| {
+		.wait_for_messages(CACHE_CONVERGE_TIMEOUT, |msgs| {
 			let progress: Vec<&ResyncProgress> = msgs
 				.iter()
 				.filter_map(|msg| match msg {
