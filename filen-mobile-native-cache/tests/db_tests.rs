@@ -4835,6 +4835,11 @@ pub async fn test_cache_version_bump_reinitializes_db() {
 		.await
 		.unwrap();
 	assert!(state.query_item(&test_dir_path).unwrap().is_some());
+	// Not merely dropped: the state's background tasks (its startup cleanup sweep, the live
+	// start) keep the SQLite connection open until they are gone, and a drop only aborts them
+	// asynchronously. The reopen below wipes the DB file, which Windows refuses while a handle
+	// is open (nightly 2026-09-03, os error 32); shutdown waits for the tasks to let go.
+	state.shutdown().await;
 	drop(state);
 
 	// tamper: pretend the DB was written by the previous cache version

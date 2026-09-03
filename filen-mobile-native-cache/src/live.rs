@@ -58,6 +58,7 @@ use tokio::sync::{
 use crate::{
 	CacheError,
 	auth::{AuthCacheState, AuthStatus, CacheState, FilenMobileCacheState},
+	env::BackgroundTasks,
 	replay::{self, ReplayOutcome},
 	sql::{
 		dir::DBDir, error::OptionalExtensionSQL, file::DBFile, item::RawDBItem, object::DBObject,
@@ -81,7 +82,7 @@ pub(crate) struct LiveState {
 struct LiveHandle {
 	/// Held for its `Drop`: it unregisters the callback from the socket's routing table.
 	_listener: ListenerHandle,
-	drainer: tokio::task::JoinHandle<()>,
+	drainer: tokio::task::AbortHandle,
 }
 
 impl Drop for LiveState {
@@ -138,7 +139,9 @@ fn live_event_types() -> Vec<Cow<'static, str>> {
 /// Brings the live path up for the current authenticated state, if it is not up already.
 /// Idempotent and cheap when it is (one read guard, one atomic swap), so it is called from every
 /// path that (re)establishes auth. Fire-and-forget: a failure only means the next call retries.
-pub(crate) fn ensure_started(state: &Arc<RwLock<CacheState>>) {
+/// The start and the drainer it spawns are filed under `tasks`, so dropping or shutting down
+/// the state stops them.
+pub(crate) fn ensure_started(state: &Arc<RwLock<CacheState>>, tasks: &BackgroundTasks) {
 	// Fast path, called from every authenticated FFI entry: no task and no queueing when the
 	// live path is already up (or the state is not authenticated). `try_read` failing means a
 	// writer is active — fall through to the task, which waits its turn.
@@ -149,7 +152,8 @@ pub(crate) fn ensure_started(state: &Arc<RwLock<CacheState>>) {
 		}
 	}
 	let state = state.clone();
-	crate::env::get_runtime().spawn(async move {
+	let drainer_tasks = tasks.clone();
+	tasks.spawn(async move {
 		// Phase 1, GUARDED and local-only: check auth, claim the start, clone the client.
 		let client = {
 			let guard = state.read().await;
@@ -184,8 +188,7 @@ pub(crate) fn ensure_started(state: &Arc<RwLock<CacheState>>) {
 				return;
 			}
 		};
-		let drainer =
-			crate::env::get_runtime().spawn(drain_live_events(Arc::downgrade(&state), receiver));
+		let drainer = drainer_tasks.spawn(drain_live_events(Arc::downgrade(&state), receiver));
 
 		// One brief re-acquire to install the handle. A re-auth may have replaced the state in
 		// between — a subscription on the old client belongs to nobody, so it is dropped (which
@@ -1339,7 +1342,7 @@ impl FilenMobileCacheState {
 	/// exists for explicit platform control and for tests (the in-memory constructor
 	/// deliberately never auto-starts).
 	pub fn start_live_updates(&self) {
-		ensure_started(&self.state);
+		ensure_started(&self.state, &self.tasks);
 	}
 
 	/// Tears the live path down: unsubscribes and stops applying. On a production (auth-file)

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedRwLockReadGuard;
 use tracing::{debug, info, trace};
 
-use crate::{CacheError, sql};
+use crate::{CacheError, env::BackgroundTasks, sql};
 
 const UNAUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const AUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -163,6 +163,9 @@ pub struct FilenMobileCacheState {
 	// allows spawning async tasks to check if the auth file has been updated
 	// to disable the provider, will always check if currently disabled
 	allow_auth_disable: bool,
+	/// Every background task spawned for this state; dropping the state aborts them and
+	/// [`shutdown`](Self::shutdown) waits for them. See [`BackgroundTasks`].
+	pub(crate) tasks: BackgroundTasks,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -678,7 +681,7 @@ impl FilenMobileCacheState {
 					let coordinator = self.state_write_coordinator.clone();
 
 					// run the update but do it async
-					crate::env::get_runtime().spawn(async move {
+					self.tasks.spawn(async move {
 						let auth_file = async_get_auth_file(&auth_file_path, dek.as_ref()).await;
 						// Only a TRUSTED read demotes an authenticated session: an unavailable
 						// file is no evidence of a logout, and demoting on it tore down a
@@ -735,7 +738,7 @@ impl FilenMobileCacheState {
 
 		update_state(&mut write_state, auth_file);
 		// A (re)established auth is what the live socket path keys off; idempotent otherwise.
-		crate::live::ensure_started(&self.state);
+		crate::live::ensure_started(&self.state, &self.tasks);
 
 		write_state.downgrade()
 	}
@@ -758,7 +761,7 @@ impl FilenMobileCacheState {
 
 		let file = sync_get_auth_file(&write_state.auth_file, write_state.dek.as_ref());
 		update_state(&mut write_state, file);
-		crate::live::ensure_started(&self.state);
+		crate::live::ensure_started(&self.state, &self.tasks);
 
 		Some(write_state.downgrade())
 	}
@@ -812,7 +815,7 @@ impl FilenMobileCacheState {
 		let auth_file = async_get_auth_file(&write_state.auth_file, write_state.dek.as_ref()).await;
 
 		update_state(&mut write_state, auth_file);
-		crate::live::ensure_started(&self.state);
+		crate::live::ensure_started(&self.state, &self.tasks);
 
 		write_state.downgrade()
 	}
@@ -835,7 +838,7 @@ impl FilenMobileCacheState {
 
 		let file = sync_get_auth_file(&write_state.auth_file, write_state.dek.as_ref());
 		update_state(&mut write_state, file);
-		crate::live::ensure_started(&self.state);
+		crate::live::ensure_started(&self.state, &self.tasks);
 
 		Some(write_state.downgrade())
 	}
@@ -1030,7 +1033,7 @@ impl FilenMobileCacheState {
 	/// side effect.
 	fn ensure_live_updates(&self) {
 		if self.allow_auth_disable {
-			crate::live::ensure_started(&self.state);
+			crate::live::ensure_started(&self.state, &self.tasks);
 		}
 	}
 
@@ -1187,6 +1190,7 @@ impl FilenMobileCacheState {
 			})),
 			state_write_coordinator: Arc::new(tokio::sync::Mutex::new(())),
 			allow_auth_disable: true,
+			tasks: BackgroundTasks::default(),
 		};
 		new.sync_launch_cleanup_task();
 		new
@@ -1215,7 +1219,24 @@ impl FilenMobileCacheState {
 			})),
 			state_write_coordinator: Arc::new(tokio::sync::Mutex::new(())),
 			allow_auth_disable: false,
+			tasks: BackgroundTasks::default(),
 		})
+	}
+}
+
+#[filen_macros::create_uniffi_wrapper]
+impl FilenMobileCacheState {
+	/// Stops every background task this state has spawned — the cleanup sweeps, the auth-file
+	/// re-check, the live path — and returns once they are gone, so nothing of the state
+	/// outlives the call. The tasks are what keep the authenticated state, and the SQLite
+	/// connection inside it, alive past a drop: a drop aborts them too, but an abort only lands
+	/// at the task's next yield on a runtime thread, and a caller that reopens the same
+	/// directory right after — a fresh instance, a wipe — found the DB still open (a sharing
+	/// violation on Windows; elsewhere a task working on a file it no longer owns). Terminal:
+	/// [`Self::stop_live_updates`] is the call for pausing the live path on a state that stays
+	/// in use.
+	pub async fn shutdown(&self) {
+		self.tasks.shutdown().await;
 	}
 }
 

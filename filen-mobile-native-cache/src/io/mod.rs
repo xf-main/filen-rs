@@ -1212,7 +1212,7 @@ impl FilenMobileCacheState {
 		trace!("Launching cleanup task asynchronously");
 		let cache = self.async_get_cache_state_owned().await;
 		let state = self.state.clone();
-		crate::env::get_runtime().spawn(async move {
+		self.tasks.spawn(async move {
 			CacheState::cleanup_cache_if_necessary(cache, state).await;
 		});
 	}
@@ -1220,7 +1220,7 @@ impl FilenMobileCacheState {
 		trace!("Launching cleanup task synchronously");
 		let cache = self.sync_get_cache_state_owned();
 		let state = self.state.clone();
-		crate::env::get_runtime().spawn(async move {
+		self.tasks.spawn(async move {
 			CacheState::cleanup_cache_if_necessary(cache, state).await;
 		});
 	}
