@@ -41,7 +41,10 @@ async fn upload_avatar() {
 	// this on the 2026-08-06/07 nightlies). Every such observer — and any concurrent
 	// upload_avatar, which this test's own before/after asserts race — already holds
 	// `test:chats` for its window, so one hold here serializes them all; a dedicated
-	// avatar lock would add nothing. Held across before-fetch → upload → after-fetch.
+	// avatar lock would add nothing. Observers must also re-read the avatar once INSIDE
+	// their window (`chat_tests::lock_chat` does): the client caches it for its lifetime,
+	// so a snapshot taken before queueing for the lock is stale after this rotates it.
+	// Held across before-fetch → upload → after-fetch.
 	let _lock = client
 		.acquire_lock_with_default("test:chats")
 		.await
