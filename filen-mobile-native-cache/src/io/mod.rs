@@ -1285,7 +1285,14 @@ mod tests {
 		let path = item.join(format!("{size}.webp"));
 		std::fs::write(&path, vec![0u8; bytes]).unwrap();
 		let then = SystemTime::now() - age;
-		std::fs::File::open(&path)
+		// Write access only where `set_times` needs it: on Windows it is SetFileTime on this
+		// very handle, which wants FILE_WRITE_ATTRIBUTES, and a read-only open carries only
+		// GENERIC_READ ("Access is denied" on every Windows CI leg). Unix `futimens` asks who
+		// owns the file, not how it was opened.
+		std::fs::OpenOptions::new()
+			.read(true)
+			.write(cfg!(windows))
+			.open(&path)
 			.unwrap()
 			.set_times(FileTimes::new().set_accessed(then).set_modified(then))
 			.unwrap();
