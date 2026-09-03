@@ -1,62 +1,57 @@
 ---
 name: commit-work
-description: CRITICAL: Always use this skill, no matter what task you are working on!
+description: >
+    Create high-quality git commits: review and stage only the intended changes, split them
+    into logical commits, and write clear Conventional Commit messages. Use when asked to
+    commit, stage changes, write a commit message, or split work into several commits.
 ---
 
-# Commit work
+# Commit Work
 
-## Goal
-
-Make commits that are easy to review and safe to ship:
-
-- only intended changes are included
-- commits are logically scoped (split when needed)
-- commit messages describe what changed and why
+Goal: commits that are easy to review and safe to ship — only intended changes, logically scoped, with messages that say what changed and why.
 
 ## Inputs to ask for (if missing)
-
 - Single commit or multiple commits? (If unsure: default to multiple small commits when there are unrelated changes.)
 - Commit style: Conventional Commits are required.
 - Any rules: max subject length, required scopes.
 
-## Workflow (checklist)
+## Workflow
+1. **Inspect** — `git status`, `git diff`, and `git diff --stat` when the change is large.
+2. **Decide boundaries** — feature vs refactor, formatting vs logic, tests vs production code, dependency bumps vs behavior change, pre-existing-bug fix vs new work.
+3. **Format before staging** — run the repo's formatter (table below) so a commit hook does not reject the staged tree.
+4. **Stage** deliberately — name the paths; `git add -p` for files with mixed changes; unstage with `git restore --staged <path>`.
+5. **Review** — `git diff --cached`: no secrets or tokens, no env files, no debug logging, no unrelated churn, no build output (`target/`, `dist/`, `node_modules/`).
+6. **Describe** the staged change in 1-2 sentences (what + why). If you cannot, it is too big or mixed — go back to step 2.
+7. **Write the message** — `type(scope): summary`, blank line, body of what/why (not an implementation diary), `BREAKING CHANGE:` footer if needed. Multi-line: write the text to a file and `git commit -F /abs/path/to/msg`. Template: `references/commit-message-template.md`.
+8. **Verify** — use the `verify-changes` skill, or the commands below for this repo's stack.
+9. **Repeat** until the working tree is clean.
 
-1. Inspect the working tree before staging
-    - `git status`
-    - `git diff` (unstaged)
-    - If many changes: `git diff --stat`
-2. Decide commit boundaries (split if needed)
-    - Split by: feature vs refactor, backend vs frontend, formatting vs logic, tests vs prod code, dependency bumps vs behavior changes.
-    - If changes are mixed in one file, plan to use patch staging.
-3. Stage only what belongs in the next commit
-    - Prefer patch staging for mixed changes: `git add -p`
-    - To unstage a hunk/file: `git restore --staged -p` or `git restore --staged <path>`
-4. Review what will actually be committed
-    - `git diff --cached`
-    - Sanity checks:
-        - no secrets or tokens
-        - no accidental debug logging
-        - no unrelated formatting churn
-5. Describe the staged change in 1-2 sentences (before writing the message)
-    - "What changed?" + "Why?"
-    - If you cannot describe it cleanly, the commit is probably too big or mixed; go back to step 2.
-6. Write the commit message
-    - Use Conventional Commits (required):
-        - `type(scope): short summary`
-        - blank line
-        - body (what/why, not implementation diary)
-        - footer (BREAKING CHANGE) if needed
-    - Prefer an editor for multi-line messages: `git commit -v`
-    - Use `references/commit-message-template.md` if helpful.
-7. Run the smallest relevant verification
-    - Run the repo's fastest meaningful check (unit tests, lint, or build) before moving on.
-8. Repeat for the next commit until the working tree is clean
-9. Do not co-author ever.
+## Per-language checks — detect by manifest (`Read` tool)
+| Manifest present | Format | Lint | Test |
+|---|---|---|---|
+| `Cargo.toml` (+ `rustfmt.toml`) | `cargo fmt --all --check` (fix: `cargo fmt -p <crate>`) | `cargo clippy` | `cargo test --lib` |
+| `package.json` | the `format` script / prettier | the `lint` script, `tsc --noEmit` | the `test` script |
+| `pyproject.toml` | `ruff format --check` | `ruff check` | `pytest` |
+| `Package.swift` | `swift-format lint` | `swift build` | `swift test` |
+| `go.mod` | `gofmt -l` on changed files | `go vet ./...` | `go test ./...` |
+
+Read the manifest for the scripts it actually declares; prefer a repo-wide `check`/`ci` script when one exists, and scope to the package you touched (`-p <crate>`, that package's own scripts).
+
+## Never
+- `git add .` / `git add -A` / `git commit -a` — stage by path.
+- `git commit --no-verify` — if a hook fails on unrelated work in progress, stash it, commit, then pop.
+- `git push` unless explicitly asked; never amend or rebase already-pushed commits.
+- Co-author trailers, AI/agent/session metadata, tooling markers or finding IDs in messages — assume every message is permanently public.
+- Staging env files, credentials, keys, or generated artifacts.
+
+## Shell rules
+- One known file: the `Read` tool, never `cat`/`head`/`sed -n`. Definitions and references: LSP (`goToDefinition`, `findReferences`, `workspaceSymbol`); the `Grep`/`Glob` tools only if available.
+- Text search: `git grep -n "PATTERN" -- '*.rs' '*.ts'` — always with an extension pathspec.
+- Untracked files only: `grep -rn "PATTERN" --include='*.rs' /abs/path/to/subtree` — an absolute subtree with no env file under it, never the repo root and never `.`.
+- No `cd` in any command; every path absolute. Never read or name an env file — ask the user instead.
 
 ## Deliverable
-
 Provide:
-
 - the final commit message(s)
 - a short summary per commit (what/why)
 - the commands used to stage/review (at minimum: `git diff --cached`, plus any tests run)

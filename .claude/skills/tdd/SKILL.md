@@ -1,114 +1,149 @@
 ---
 name: tdd
-description: CRITICAL: Always use this skill, no matter what task you are working on!
+description: >
+    Test-driven development in any language: write the test that specifies the behavior,
+    then the code. Use when implementing a feature, fixing a bug (failing test first),
+    refactoring, or adding coverage. Covers cargo test, Jest/Vitest/bun:test, pytest,
+    go test, swift test, and E2E (Playwright, Maestro). Trigger when the user mentions
+    tests, coverage, TDD, spec, red/green, a flaky test, or an E2E flow.
 ---
 
 # Test-Driven Development
 
-Tests are not optional. Every non-trivial piece of logic ships with tests. The cycle is
-red → green → refactor, but pragmatically applied — spikes and exploration are fine without tests,
-but nothing moves to production without coverage that actually verifies the behavior.
+Tests are not optional. Every non-trivial piece of logic ships with tests. Red, green, refactor —
+pragmatically applied: spikes may start untested, nothing ships untested.
+
+## Step 0 — Detect the toolchain from the manifest
+
+Read the manifest that is actually present; never assume the stack.
+
+| Manifest (Read it) | Test command | Lint / format |
+|---|---|---|
+| `Cargo.toml` | `cargo test --lib`, `cargo test -p <crate>` | `cargo clippy`, `cargo fmt --check` (`rustfmt.toml`) |
+| `package.json` | whatever `scripts.test` says — `vitest` / `jest` / `bun test` | `eslint`, `tsc --noEmit`, `prettier --check` |
+| `pyproject.toml` | `pytest` | `ruff check`, `ruff format --check` |
+| `go.mod` | `go test ./...` | `go vet`, `gofmt -l` |
+| `Package.swift` | `swift test` | `swift-format lint` |
+
+```
+Read(file_path: "/abs/repo/Cargo.toml")        # [dev-dependencies], [[test]], workspace members
+Read(file_path: "/abs/repo/package.json")      # scripts.test decides jest vs vitest vs bun test
+```
+
+Then find where tests already live and copy their conventions:
+
+```bash
+git grep -ln "#\[cfg(test)\]" -- '*.rs'
+git ls-files 'tests/*' '*.test.ts' '*.test.tsx' '*_test.go' 'test_*.py' '*Tests.swift'
+```
+
+**Search rules (they keep you out of `.env` and out of permission prompts):**
+
+- One known file → the `Read` tool, never `cat`/`head`/`sed -n`.
+- A definition, its references, a symbol → LSP (`goToDefinition`, `findReferences`, `workspaceSymbol`).
+- Text search → `git grep -n "PATTERN" -- '*.rs' '*.ts'` — **always** with an extension pathspec after `--`.
+  Tracked files only, so `target/`, `node_modules/` and any ignored `.env` are skipped for free.
+- Untracked files only → `grep -rn "PATTERN" --include='*.rs' /abs/repo/<subtree>`. An absolute subtree
+  with no `.env` under it; never the repo root, never `.`.
+- Never `cd`; every path absolute. Never read or name `.env*` — if a test needs a value from one, ask.
+- `Grep`/`Glob` tools, if available, work for the first three; `git grep` is the reliable fallback.
+
+Match the conventions already established. Never introduce a second test framework when one is in
+use, and never add an E2E framework to a project that has none without asking first.
 
 ---
 
-## Step 0 — Inspect the project first
+## The TDD cycle
 
-Before writing a single test or line of implementation, understand the testing setup:
+1. **UNDERSTAND** — what the unit does: inputs, outputs, edge cases
+2. **TEST** — write tests that specify the behavior
+3. **IMPLEMENT** — the minimum code that makes them pass
+4. **VERIFY** — actually run them; never assume green
+5. **REFACTOR** — clean up with the tests as the safety net
 
-```bash
-# JavaScript / TypeScript — what unit/integration framework is in use?
-cat package.json | grep -E '"jest"|"vitest"|"bun"|"@testing-library"|"@jest"|"msw"|"supertest"'
-cat jest.config.* 2>/dev/null || cat vitest.config.* 2>/dev/null
-
-# Is this a Bun project?
-cat package.json | grep -E '"scripts"' -A 10 | grep "bun test"
-ls bunfig.toml 2>/dev/null
-
-# E2E — web or mobile?
-cat package.json | grep -E '"playwright"|"@playwright"'
-ls .maestro 2>/dev/null || find . -name "*.yaml" -path "*maestro*" | head -5
-
-# Where do unit tests live?
-find . -name "*.test.ts" -o -name "*.test.tsx" -o -name "*.spec.ts" \
-  | grep -v node_modules | head -10
-
-# Rust — test structure
-grep -r "#\[cfg(test)\]" src/ | head -10
-cat Cargo.toml | grep -E '\[dev-dependencies\]' -A 20
-
-# Look at existing tests to understand conventions
-# — naming patterns, assertion style, mock approach, file co-location vs __tests__/
-```
-
-**Testing layers — understand which exist in the project:**
-
-```
-Unit / Integration   →  Jest, Vitest, bun:test, cargo test
-E2E Web             →  Playwright
-E2E Mobile          →  Maestro
-```
-
-Match the conventions already established. Never introduce a second testing library when one is
-already in use. Never add an E2E framework to a project that doesn't have one without confirming
-with the developer first.
+**Flexible on order, strict on coverage:** new feature → tests first or alongside. Bug fix → failing
+test first. Spike → implement freely, tests before it is "done". Refactor → tests must exist *before*
+you touch the implementation; never refactor untested code.
 
 ---
 
-## The TDD Cycle — Pragmatic
+## Rust — cargo test
 
+Two homes, pick by what you are testing:
+
+```rust
+// Unit tests — inline, can reach private items
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_two_positive_numbers() {
+        assert_eq!(add(2, 3), 5);
+    }
+
+    // Shared setup is a plain function, not a framework
+    fn make_config() -> Config { Config { timeout: 30, retries: 3 } }
+}
 ```
-1. UNDERSTAND   — clarify exactly what the unit should do, its inputs, outputs, edge cases
-2. TEST         — write tests that specify the behavior (can be before or alongside impl)
-3. IMPLEMENT    — write the minimum code to make tests pass
-4. VERIFY       — run the tests, confirm green
-5. REFACTOR     — clean up with tests as a safety net, keep green throughout
+
+```rust
+// Integration tests — tests/<name>.rs, public API only
+use my_crate::add;
+
+#[test]
+fn add_works_from_outside() { assert_eq!(add(10, 20), 30); }
 ```
 
-**Flexible on order, strict on coverage:**
+Assertions:
 
-- New feature from scratch → write tests first (or alongside), then implement
-- Bug fix → write a failing test that reproduces the bug first, then fix
-- Exploratory / spike → implement freely, but write tests before the code is considered done
-- Refactor → tests must exist before touching implementation; never refactor untested code
+```rust
+assert_eq!(result, expected);              // prints both sides on failure
+assert!(condition, "message if it fails");
 
-**Never skip the run.** Always actually execute the tests — don't assume they pass.
+#[test]
+#[should_panic(expected = "index out of bounds")]
+fn panics_on_out_of_bounds() { let _ = vec![1, 2, 3][99]; }
+
+// Don't unwrap in tests — return Result and use `?`
+#[test]
+fn parse_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(parse_input("valid")?.value, 42);
+    Ok(())
+}
+
+#[test]
+fn parse_fails_on_empty() {
+    let err = parse_input("").unwrap_err();
+    assert!(err.to_string().contains("empty input"));   // assert the message, not just is_err()
+}
+```
+
+Naming is snake_case and describes scenario + outcome: `returns_zero_for_empty_input`,
+`rejects_negative_values` — not `test1`, not `it_works`.
+
+```bash
+cargo test --lib                      # unit tests only, no network
+cargo test -p <crate> <substring>     # scope by crate, filter by name
+cargo test --test <integration_file>  # one integration target
+cargo test -- --nocapture             # show println!/dbg! output
+cargo test -- --test-threads=1        # serialize tests sharing state
+```
+
+Test in particular: every `Result`/`Option` branch (both arms), numeric boundaries and
+overflow-adjacent values, empty / whitespace-only / UTF-8-boundary strings, panic conditions via
+`#[should_panic]`, trait impls actually behaving, and **any `unsafe` block — thoroughly**.
 
 ---
 
-## Jest / Vitest
+## JavaScript / TypeScript — Jest, Vitest, bun:test
 
-### Detect which one is installed
-
-```bash
-cat package.json | grep -E '"jest"|"vitest"'
-# Use whichever is present. If both exist, check which the project scripts use:
-cat package.json | grep -A 5 '"scripts"' | grep -E "test"
-```
-
-Vitest and Jest have nearly identical APIs — `describe`, `it`/`test`, `expect`, `vi`/`jest` for
-mocking. The differences are in config and import style. Match what the project uses.
-
-### Test file location — match the project
-
-```bash
-# Co-located (common in RN/Expo and Vite projects)
-src/utils/format.ts
-src/utils/format.test.ts
-
-# Separate __tests__ directory (common in Jest projects)
-src/utils/format.ts
-src/__tests__/utils/format.test.ts
-
-# Check which pattern the project uses before creating new files
-find src -name "*.test.*" | head -5
-```
-
-### Structure — match existing conventions
+`scripts.test` in `package.json` decides which; their APIs are near-identical (`describe`, `it`,
+`expect`, `vi`/`jest`/`mock`). Use the one already there — never add a second.
 
 ```typescript
-// If the project uses describe/it blocks:
 describe("formatBytes", () => {
-	it("formats bytes to human-readable string", () => {
+	it("formats bytes to a human-readable string", () => {
 		expect(formatBytes(1024)).toBe("1 KB")
 	})
 
@@ -116,803 +151,143 @@ describe("formatBytes", () => {
 		expect(formatBytes(0)).toBe("0 B")
 	})
 
-	it("handles negative input", () => {
+	it("throws on negative input", () => {
 		expect(() => formatBytes(-1)).toThrow("Input must be non-negative")
 	})
 })
-
-// If the project uses flat test() calls:
-test("formatBytes: formats bytes to human-readable string", () => {
-	expect(formatBytes(1024)).toBe("1 KB")
-})
 ```
 
-### What to test — and what not to
-
-**Test:**
-
-- Return values for all meaningful input variations
-- Edge cases: empty, zero, null/undefined, boundary values, max values
-- Error conditions: does it throw the right error with the right message?
-- Side effects: was the right function called with the right args?
-- Async behavior: resolution, rejection, loading states
-
-**Don't test:**
-
-- Implementation details — test behavior, not how it's achieved internally
-- Third-party library internals — assume they work
-- Trivial getters/setters with no logic
-- Type definitions alone (TypeScript catches those at compile time)
-- Private methods directly — test them through the public interface
-
-### Assertions — be specific
+Assertions — be specific:
 
 ```typescript
-// ❌ Too vague — passes even if something is wrong
+// ❌ passes even when the behavior is wrong
 expect(result).toBeTruthy()
-expect(result).toBeDefined()
 
-// ✅ Specific — fails precisely when behavior changes
-expect(result).toBe("expected string")
+// ✅ fails precisely when behavior changes
 expect(result).toEqual({ id: 1, name: "Jan" })
-expect(result).toHaveLength(3)
 expect(mockFn).toHaveBeenCalledWith("expected-arg")
 expect(mockFn).toHaveBeenCalledTimes(1)
-
-// ✅ For errors — check message too, not just that it throws
 expect(() => parse("")).toThrow("Input cannot be empty")
 ```
 
-### Mocking — mock at the boundary, not deep inside
+Mocking — at the boundary only, and restore afterwards:
 
 ```typescript
-// ✅ Mock external dependencies (API calls, DB, file system, timers)
-// Vitest
 vi.mock("../api/users", () => ({
 	fetchUser: vi.fn().mockResolvedValue({ id: "1", name: "Jan" })
 }))
 
-// Jest
-jest.mock("../api/users", () => ({
-	fetchUser: jest.fn().mockResolvedValue({ id: "1", name: "Jan" })
-}))
+afterEach(() => vi.restoreAllMocks())   // jest.restoreAllMocks() / mock.restore() for bun:test
 
-// ✅ Restore mocks after each test — avoid test pollution
-afterEach(() => {
-	vi.restoreAllMocks() // Vitest
-	jest.restoreAllMocks() // Jest
-})
-
-// ❌ Don't mock the unit under test itself
-// ❌ Don't mock internal pure functions — test them directly
+// ❌ never mock the unit under test, or your own pure functions — test those directly
 ```
 
-### Async tests
+Async — always await, and test the rejection path:
 
 ```typescript
-// ✅ Always await — never let promises float
-it("fetches user data", async () => {
-	const user = await getUser("123")
-	expect(user.name).toBe("Jan")
-})
-
-// ✅ Test rejection explicitly
 it("throws on not found", async () => {
 	await expect(getUser("nonexistent")).rejects.toThrow("User not found")
 })
 ```
 
-### React component tests — check what's installed first
+Component tests (`@testing-library/*`) assert behavior: right content for given props, right
+callback on interaction, show/hide by state, loading and error states. Never internal state or refs.
 
 ```bash
-grep -E '"@testing-library/react"|"@testing-library/react-native"' package.json
+npx vitest run path/to/file.test.ts     # or: npx jest path/to/file.test.ts, bun test path/…
+npx vitest run --coverage
 ```
 
-```typescript
-// React (web) with @testing-library/react
-import { render, screen, fireEvent } from '@testing-library/react'
-
-it('calls onPress when button is tapped', () => {
-  const onPress = vi.fn()
-  render(<SubmitButton onPress={onPress} label="Submit" />)
-  fireEvent.click(screen.getByText('Submit'))
-  expect(onPress).toHaveBeenCalledTimes(1)
-})
-
-// React Native with @testing-library/react-native
-import { render, fireEvent } from '@testing-library/react-native'
-
-it('calls onPress when button is tapped', () => {
-  const onPress = jest.fn()
-  const { getByText } = render(<SubmitButton onPress={onPress} label="Submit" />)
-  fireEvent.press(getByText('Submit'))
-  expect(onPress).toHaveBeenCalledTimes(1)
-})
-```
-
-**Component tests should test behavior, not implementation:**
-
-- Does it render the right content given these props?
-- Does it call the right callback when interacted with?
-- Does it show/hide things based on state?
-- Does it handle loading/error states correctly?
-
-Never test internal state, refs, or implementation details of a component.
-
-### Running tests
-
-```bash
-# Vitest
-npx vitest run                        # run once
-npx vitest run src/utils/format.test.ts  # single file
-npx vitest --coverage                 # with coverage
-
-# Jest
-npx jest                              # run all
-npx jest src/utils/format.test.ts    # single file
-npx jest --coverage                   # with coverage
-npx jest --watch                      # watch mode during dev
-```
-
-Always run the specific test file after writing tests — don't run the full suite every time during
-development. Run the full suite before considering the work done.
+Run the single file you just wrote while iterating; run the full suite before calling it done.
 
 ---
 
-## bun:test — Bun Server Projects
+## E2E — Playwright (web), Maestro (mobile)
 
-Bun ships its own test runner (`bun:test`) that is Jest-compatible but significantly faster.
-Use it for Bun-native server projects. Do not add Jest or Vitest to a Bun project that already
-uses `bun:test`.
+E2E is for critical journeys that cross pages, real auth, real network or native OS dialogs — not
+for logic a unit test can cover, not for every state permutation.
 
-### Detect bun:test
-
-```bash
-# Check if bun test is the test runner
-cat package.json | grep -E '"test"' | grep "bun test"
-# Or check for bun-specific test imports in existing files
-grep -r "from 'bun:test'" src/ | head -5
-```
-
-### API — Jest-compatible with Bun imports
+Locator preference is the same everywhere: **role/accessibility id > label > test id > visible
+text**. Never CSS selectors, never XPath — they break on every refactor.
 
 ```typescript
-import { describe, it, expect, mock, beforeEach, afterEach } from "bun:test"
-
-describe("UserService", () => {
-	it("creates a user with hashed password", async () => {
-		const user = await UserService.create({
-			email: "mail@example.com",
-			password: "secret"
-		})
-		expect(user.email).toBe("mail@example.com")
-		expect(user.passwordHash).not.toBe("secret")
-		expect(user.passwordHash).toHaveLength(60) // bcrypt hash length
-	})
-})
+await page.getByRole("button", { name: "Upload" }).click()
+await page.getByLabel("Choose file").setInputFiles("test-assets/document.pdf")
+await expect(page.getByText("Upload complete")).toBeVisible()   // assert, never waitForTimeout
 ```
-
-### Mocking with bun:test
-
-```typescript
-import { mock, spyOn } from "bun:test"
-
-// Mock a module
-const fetchMock = mock(() => Promise.resolve(new Response('{"ok":true}')))
-globalThis.fetch = fetchMock
-
-// Spy on a method
-const spy = spyOn(db, "query").mockResolvedValue([{ id: 1 }])
-
-afterEach(() => {
-	mock.restore() // restore all mocks
-})
-```
-
-### Testing Bun.serve HTTP handlers directly
-
-```typescript
-import { describe, it, expect } from "bun:test"
-
-// Test handlers without spinning up a real server
-describe("POST /upload", () => {
-	it("rejects files over size limit", async () => {
-		const req = new Request("http://localhost/upload", {
-			method: "POST",
-			body: new Uint8Array(11 * 1024 * 1024) // 11MB — over limit
-		})
-		const res = await handleUpload(req)
-		expect(res.status).toBe(413)
-		const body = await res.json()
-		expect(body.error).toContain("File too large")
-	})
-
-	it("accepts valid files", async () => {
-		const form = new FormData()
-		form.append("file", new Blob(["hello"]), "test.txt")
-		const req = new Request("http://localhost/upload", {
-			method: "POST",
-			body: form
-		})
-		const res = await handleUpload(req)
-		expect(res.status).toBe(200)
-	})
-})
-```
-
-### Testing Bun native APIs
-
-```typescript
-import { describe, it, expect, afterEach } from "bun:test"
-import { rm } from "node:fs/promises"
-
-describe("FileStore", () => {
-	const testPath = "/tmp/bun-test-file"
-
-	afterEach(async () => {
-		await rm(testPath, { force: true })
-	})
-
-	it("writes and reads back correctly", async () => {
-		const data = new Uint8Array([1, 2, 3, 4])
-		await Bun.write(testPath, data)
-		const read = new Uint8Array(await Bun.file(testPath).arrayBuffer())
-		expect(read).toEqual(data)
-	})
-})
-```
-
-### Running bun:test
-
-```bash
-bun test                          # run all tests
-bun test src/utils/format.test.ts # single file
-bun test --watch                  # watch mode
-bun test --coverage               # coverage report
-bun test --timeout 10000          # custom timeout (ms)
-```
-
----
-
-## Rust — cargo test
-
-### Test organization — match the project
-
-```bash
-# Check if tests are inline (unit) or in separate files (integration)
-grep -r "#\[cfg(test)\]" src/ | head -10
-ls tests/ 2>/dev/null  # integration tests directory
-```
-
-Rust has two natural homes for tests:
-
-**Unit tests — inline in the module (preferred for testing private functions):**
-
-```rust
-pub fn add(a: i32, b: i32) -> i32 {
-    a + b
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;  // imports everything from the parent module, including private items
-
-    #[test]
-    fn adds_two_positive_numbers() {
-        assert_eq!(add(2, 3), 5);
-    }
-
-    #[test]
-    fn handles_negative_numbers() {
-        assert_eq!(add(-1, 1), 0);
-    }
-}
-```
-
-**Integration tests — in `tests/` directory (public API only):**
-
-```rust
-// tests/add_integration.rs
-use my_crate::add;
-
-#[test]
-fn add_works_from_outside() {
-    assert_eq!(add(10, 20), 30);
-}
-```
-
-### Assertions
-
-```rust
-// Equality
-assert_eq!(result, expected);         // fails with both values shown
-assert_ne!(result, unexpected);
-
-// Boolean
-assert!(condition, "message if fails");
-
-// Panics — test that code panics as expected
-#[test]
-#[should_panic(expected = "index out of bounds")]
-fn panics_on_out_of_bounds() {
-    let v = vec![1, 2, 3];
-    let _ = v[99];
-}
-
-// Results — don't unwrap in tests, use ? or assert explicitly
-#[test]
-fn parse_succeeds() -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = parse_input("valid")?;
-    assert_eq!(parsed.value, 42);
-    Ok(())
-}
-
-#[test]
-fn parse_fails_on_empty() {
-    let result = parse_input("");
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("empty input"));
-}
-```
-
-### Test naming — descriptive, snake_case
-
-```rust
-// ✅ Name describes the scenario and expected outcome
-#[test] fn returns_zero_for_empty_input() { ... }
-#[test] fn rejects_negative_values() { ... }
-#[test] fn handles_utf8_boundary_correctly() { ... }
-
-// ❌ Vague
-#[test] fn test1() { ... }
-#[test] fn it_works() { ... }
-```
-
-### Test setup — use helper functions, not a test framework
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Shared setup via plain functions — no special framework needed
-    fn make_config() -> Config {
-        Config {
-            timeout: 30,
-            retries: 3,
-            base_url: "http://localhost".to_string(),
-        }
-    }
-
-    #[test]
-    fn connects_with_valid_config() {
-        let config = make_config();
-        assert!(connect(config).is_ok());
-    }
-}
-```
-
-### Running tests
-
-```bash
-cargo test                            # run all tests
-cargo test test_name                  # run tests matching name (substring match)
-cargo test --lib                      # unit tests only
-cargo test --test integration_test    # specific integration test file
-cargo test -- --nocapture             # show println! output during tests
-cargo test -- --test-threads=1        # run sequentially (for tests with shared state)
-```
-
-### What to test in Rust
-
-- All `Result`/`Option` return paths — both `Ok`/`Some` and `Err`/`None`
-- Boundary values for numeric types (0, max, overflow-adjacent values)
-- String handling: empty, UTF-8 boundaries, whitespace-only
-- Panic conditions with `#[should_panic]`
-- Trait implementations — does the type actually behave correctly?
-- Any `unsafe` code — it must have thorough tests
-
----
-
-## Playwright — Web E2E
-
-Playwright tests real user flows in a real browser. They are slower than unit tests and should
-cover critical paths — not every permutation. Use them for flows that span multiple pages,
-require real network, or verify visual/interaction behavior that unit tests cannot catch.
-
-### Detect Playwright
-
-```bash
-cat package.json | grep "@playwright/test"
-ls playwright.config.* 2>/dev/null
-ls e2e/ tests/e2e/ 2>/dev/null
-```
-
-### File structure — match the project
-
-```bash
-# Common locations
-e2e/
-tests/e2e/
-playwright/
-
-# Check what's already there
-find . -name "*.spec.ts" | grep -v node_modules | head -10
-```
-
-### Writing Playwright tests
-
-```typescript
-import { test, expect } from "@playwright/test"
-
-// Test a critical user flow end-to-end
-test("user can upload and share a file", async ({ page }) => {
-	await page.goto("/drive")
-
-	// Use user-visible locators — never CSS selectors or XPath for stable tests
-	await page.getByRole("button", { name: "Upload" }).click()
-	await page.getByLabel("Choose file").setInputFiles("test-assets/document.pdf")
-
-	// Wait for upload to complete — use expect, not sleep
-	await expect(page.getByText("document.pdf")).toBeVisible()
-	await expect(page.getByText("Upload complete")).toBeVisible()
-
-	// Share the file
-	await page.getByRole("button", { name: "Share" }).click()
-	const shareLink = page.getByTestId("share-link")
-	await expect(shareLink).toBeVisible()
-	expect(await shareLink.inputValue()).toMatch(/^https:\/\//)
-})
-```
-
-### Locator strategy — preferred order
-
-```typescript
-// ✅ Best — role-based (accessible, resilient)
-page.getByRole("button", { name: "Submit" })
-page.getByRole("textbox", { name: "Email" })
-
-// ✅ Good — label-based
-page.getByLabel("Password")
-
-// ✅ Good — test ID (add data-testid to elements specifically for testing)
-page.getByTestId("file-upload-zone")
-
-// ✅ Acceptable — visible text
-page.getByText("Upload complete")
-
-// ❌ Avoid — CSS selectors break on refactor
-page.locator(".btn-primary.upload")
-
-// ❌ Never — XPath
-page.locator('//div[@class="container"]/button')
-```
-
-### Waiting — use assertions, never arbitrary sleeps
-
-```typescript
-// ❌ Brittle — arbitrary delay
-await page.waitForTimeout(2000)
-
-// ✅ Wait for actual condition
-await expect(page.getByRole("status")).toHaveText("Saved")
-await expect(page.getByTestId("spinner")).not.toBeVisible()
-await page.waitForURL("/dashboard")
-```
-
-### Authentication — use storageState to avoid re-login on every test
-
-```typescript
-// playwright.config.ts
-export default defineConfig({
-	use: {
-		storageState: "e2e/.auth/user.json" // reuse logged-in state
-	}
-})
-
-// e2e/auth.setup.ts — runs once, saves auth state
-import { test as setup } from "@playwright/test"
-
-setup("authenticate", async ({ page }) => {
-	await page.goto("/login")
-	await page.getByLabel("Email").fill("mail@example.com")
-	await page.getByLabel("Password").fill(process.env.TEST_PASSWORD!)
-	await page.getByRole("button", { name: "Sign in" }).click()
-	await page.waitForURL("/drive")
-	await page.context().storageState({ path: "e2e/.auth/user.json" })
-})
-```
-
-### What Playwright should and shouldn't test
-
-```
-✅ Test with Playwright:
-  - Critical user journeys (login → upload → share → download)
-  - Flows that cross multiple pages or require real auth
-  - File upload/download behavior
-  - Form validation with real network responses
-  - Navigation and routing
-
-❌ Don't test with Playwright:
-  - Unit-level logic (use Jest/Vitest/bun:test instead)
-  - Every component state (use @testing-library instead)
-  - Styling details (use visual regression tools if needed)
-  - Things that can be verified without a browser
-```
-
-### Running Playwright
-
-```bash
-npx playwright test                           # run all
-npx playwright test e2e/upload.spec.ts        # single file
-npx playwright test --headed                  # show browser (debug)
-npx playwright test --ui                      # interactive UI mode
-npx playwright test --project=chromium        # single browser
-npx playwright show-report                    # view last run report
-```
-
----
-
-## Maestro — Mobile E2E (React Native / Expo)
-
-Maestro runs E2E tests against a real or simulated device. Tests are written in YAML and drive
-the app through actual user interactions. Use for critical mobile flows that must be verified
-on-device — not for unit logic.
-
-### Detect Maestro
-
-```bash
-ls .maestro/ 2>/dev/null
-find . -name "*.yaml" | xargs grep -l "appId" 2>/dev/null | head -5
-which maestro 2>/dev/null
-```
-
-### File structure
-
-```
-.maestro/
-  flows/
-    login.yaml
-    upload_file.yaml
-    share.yaml
-  config.yaml        # optional global config
-```
-
-### Writing Maestro flows
 
 ```yaml
-# .maestro/flows/upload_file.yaml
 appId: com.example.app
 ---
-# Launch and navigate to upload
 - launchApp
-- tapOn: "Drive"
 - tapOn:
-      id: "upload-button" # use accessibility IDs when possible
-
-# Wait for the upload sheet to appear
-- assertVisible: "Upload from device"
-- tapOn: "Upload from device"
-
-# After file picker (handled natively), wait for upload
+      id: "upload-button"          # matches the accessibility id set in code
 - assertVisible:
       text: "document.pdf"
-      timeout: 10000 # ms — give uploads time
-
-# Verify upload succeeded
-- assertVisible: "Upload complete"
+      timeout: 10000               # a timeout on the assertion, not a fixed sleep
 - assertNotVisible: "Uploading..."
-
-# Navigate to the file and verify it appears in drive
-- tapOn: "document.pdf"
-- assertVisible: "Share"
-- assertVisible: "Download"
 ```
 
-### Locator strategy for Maestro
-
-```yaml
-# ✅ Best — testID / accessibility identifier set in code
-- tapOn:
-      id: "upload-button" # matches testID="upload-button" in RN
-
-# ✅ Good — visible text
-- tapOn: "Upload"
-
-# ✅ Good — index when multiple elements match
-- tapOn:
-      text: "Delete"
-      index: 0
-# For React Native — set testID on interactive elements:
-# <TouchableOpacity testID="upload-button" onPress={handleUpload}>
-```
-
-### Waiting and assertions
-
-```yaml
-# Wait for element with timeout (don't use fixed sleeps)
-- assertVisible:
-      text: "Sync complete"
-      timeout: 15000
-
-# Assert element is gone
-- assertNotVisible: "Loading..."
-
-# Input text
-- tapOn: "Email"
-- inputText: "mail@example.com"
-
-# Scroll to find element
-- scrollUntilVisible:
-      element:
-          text: "document.pdf"
-      direction: DOWN
-```
-
-### Running Maestro
+Wait on conditions, never on the clock. Reuse a logged-in session (Playwright `storageState`) rather
+than logging in at the top of every test; take credentials from the environment the runner already
+provides — do not open `.env` files yourself.
 
 ```bash
-maestro test .maestro/flows/upload_file.yaml     # single flow
-maestro test .maestro/flows/                      # all flows in directory
-maestro studio                                    # interactive recorder
-maestro test --device <id> flow.yaml             # specific device
-```
-
-### What Maestro should and shouldn't test
-
-```
-✅ Test with Maestro:
-  - Critical user journeys end-to-end on real device/simulator
-  - Flows that involve native OS interactions (file picker, camera, permissions)
-  - Push notification handling
-  - Deep link navigation
-  - App state after backgrounding and foregrounding
-
-❌ Don't test with Maestro:
-  - Unit logic (use Jest/bun:test)
-  - Component rendering (use @testing-library/react-native)
-  - Anything that can be verified without a running device
-  - Every possible state — only critical paths
+npx playwright test e2e/upload.spec.ts   # --headed / --ui to debug
+maestro test .maestro/flows/upload_file.yaml
 ```
 
 ---
 
-## Bug Fix Protocol — Always Reproduce First
+## Bug fix protocol — reproduce first
 
-When fixing a bug, the sequence is non-negotiable:
-
-```
-1. Write a test that reproduces the bug (it must fail before the fix)
-2. Confirm the test fails — run it and see the red
+1. Write a test that reproduces the bug — it **must fail** before the fix
+2. Run it, see the red (a test that never failed proves nothing)
 3. Fix the bug
-4. Confirm the test passes — run it and see the green
-5. Run the full test suite — confirm nothing else broke
-```
+4. Run it, see the green
+5. Run the full suite — confirm nothing else broke
 
-This proves the fix works and prevents regression.
+---
 
-```typescript
-// Example: bug report — formatBytes(0) returns 'NaN B' instead of '0 B'
+## Coverage
 
-// Step 1: write the reproducing test FIRST
-it("formatBytes: handles zero correctly", () => {
-	expect(formatBytes(0)).toBe("0 B") // this fails before the fix
-})
+Coverage is a signal, not a goal; 100% with weak assertions is worthless. Aim for: every happy path,
+every error path, every boundary. The number follows — don't chase it. If a report shows an untested
+branch, either test it or delete it as dead code.
 
-// Step 2: run it — confirm it's red
-// Step 3: fix the implementation
-// Step 4: run it — confirm it's green
-// Step 5: run full suite
+---
+
+## Test data — real over mocked
+
+If the real API/server/DB is reachable in this environment (dev server up, test data seeded,
+credentials already in the runner's environment, fast enough), write a genuine integration test
+against it. Real data finds bugs mocks never would.
+
+If it is not reachable, **ask before inventing data**: mock the response, add a fixture/seed, or mark
+the test integration-only? Never silently fabricate realistic-looking data.
+
+Mocking *is* the right call for: third-party APIs (payments, email, cloud storage — never call the
+real one), services unavailable in CI by design, irreversible side effects (sends mail, charges a
+card, deletes data), error conditions that are hard to trigger for real (500, timeout, rate limit),
+and raw speed when a suite would otherwise make hundreds of network calls.
+
+When you do mock, mirror the real response shape exactly — check the actual shape first from the
+API docs, an existing call site, or a recorded fixture:
+
+```bash
+git grep -n "mockResolvedValue\|mock_response\|serde_json::json!" -- '*.ts' '*.rs' '*.py'
+git ls-files '*fixtures*' '*mocks*'
 ```
 
 ---
 
-## Coverage — What Good Looks Like
+## What NOT to do
 
-Coverage is a signal, not a goal. 100% coverage with weak assertions is worthless.
-Good coverage means every meaningful behavior path is verified.
-
-**Aim for:**
-
-- All happy paths tested
-- All error/failure paths tested
-- Edge cases and boundaries tested
-- Coverage naturally follows — don't chase the number
-
-**Meaningful coverage check:**
-
-```bash
-# Vitest
-npx vitest --coverage
-
-# Jest
-npx jest --coverage
-
-# Rust
-cargo tarpaulin --out Stdout   # requires: cargo install cargo-tarpaulin
-```
-
-If coverage reveals an untested branch — add a test for it. If the branch is genuinely
-unreachable dead code, remove it.
-
----
-
-## Test Data — Real API Data vs Mocks
-
-When a test needs data that comes from an API or server, always check whether real data is
-available before reaching for mocks. Real data finds bugs mocks never would.
-
-### Decision flow
-
-```
-Does the test need API/server data?
-│
-├─ Can we hit the real API/server in this test environment?
-│   (dev server running, test DB seeded, API key available, no rate limits, fast enough)
-│   │
-│   ├─ YES → Use real data. Write an integration test.
-│   │         Seed or query the actual endpoint. Don't mock it.
-│   │
-│   └─ NO  → Ask the developer before inventing data:
-│             "This test needs data from <endpoint/service>.
-│              I can't reach it in this context. Should I:
-│              (a) mock the response with example data?
-│              (b) set up a test fixture/seed instead?
-│              (c) skip this test and mark it as integration-only?"
-│
-└─ Never silently invent mock data that looks realistic.
-   Always ask first when real data isn't available.
-```
-
-### Checking if the real API/server is reachable
-
-```bash
-# Is a local dev server running?
-curl -s http://localhost:3000/health | head -5
-curl -s http://localhost:8080/api/ping | head -5
-
-# Is a test database configured?
-cat .env.test 2>/dev/null | grep -E "DATABASE_URL|DB_HOST|DB_PORT"
-cat .env.local 2>/dev/null | grep -E "DATABASE_URL|DB_HOST"
-
-# Are API credentials available for a test environment?
-cat .env.test 2>/dev/null | grep -E "API_KEY|API_URL|TEST_"
-
-# Does the project have existing integration test setup?
-find . -name "*.test.ts" | xargs grep -l "supertest\|testClient\|fetch.*localhost" 2>/dev/null | head -5
-```
-
-If the real endpoint is reachable, write a genuine integration test against it. Only fall back
-to mocking when you've confirmed the real thing isn't accessible.
-
-### When mocking is the right call
-
-Mocking is appropriate when:
-
-- External third-party APIs (payment providers, email services, cloud storage) — never call real ones in tests
-- The API is unavailable in CI/test environments by design
-- The operation has irreversible side effects (send email, charge card, delete data)
-- The test needs to simulate specific error conditions (500, timeout, rate limit) that are hard to trigger on a real server
-- Speed — a test suite that makes hundreds of real network calls is impractical
-
-When mocking IS used, the mock data must accurately represent the real response shape. Check
-the actual API response structure first (docs, existing calls in the codebase, or a real request),
-then mirror it precisely.
-
-```bash
-# Find examples of real API responses already in the codebase
-grep -r "mockResolvedValue\|mockReturnValue" src/ | head -10
-find . -name "*.json" -path "*fixtures*" -o -name "*.json" -path "*mocks*" | head -10
-```
-
----
-
-## What NOT to Do
-
-- **Don't write tests after the fact just to hit a number** — tests written to satisfy coverage metrics are usually weak. Write them to specify behavior.
-- **Don't test implementation details** — if you refactor and tests break without behavior changing, the tests were wrong.
-- **Don't share mutable state between tests** — every test must be independently runnable in any order.
-- **Don't use `any` or loose assertions to make tests pass** — a test that always passes is worse than no test.
-- **Don't leave `test.only` or `it.only` committed** — these silently disable the rest of the suite.
-- **Don't ignore flaky tests** — a flaky test is a broken test. Fix or delete it.
-- **Don't mock what you own** — mock external dependencies (HTTP, DB, time), not your own modules.
+- **Don't write tests after the fact just to hit a number** — tests written for a coverage metric are weak. Write them to specify behavior.
+- **Don't test implementation details** — if a refactor with unchanged behavior breaks the test, the test was wrong.
+- **Don't share mutable state between tests** — every test must pass alone, and in any order.
+- **Don't loosen assertions to get green** (`any`, `toBeTruthy`, bare `is_ok()`) — a test that always passes is worse than no test.
+- **Don't commit `.only` / `#[ignore]` / `t.Skip`** — they silently disable the rest of the suite.
+- **Don't tolerate a flaky test** — flaky means broken. Diagnose the root cause and fix it, or delete the test.
+- **Don't mock what you own** — mock HTTP, DB, clock, filesystem; not your own modules.
+- **Don't skip the run.** Execute the tests and read the output. Never report a result you did not see.

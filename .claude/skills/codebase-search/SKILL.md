@@ -1,207 +1,169 @@
 ---
 name: codebase-search
-description: CRITICAL: Always use this skill, no matter what task you are working on!
+description: >
+    Use before writing or reviewing code, calling any function/method you have not read, using any
+    type you have not seen defined, adding an import, or implementing a pattern that may already
+    exist. Also when asked how something works, or whether something exists. Default posture:
+    search first, then write. Never invent paths, names, or APIs.
 ---
 
-# Codebase Search Skill
+# Codebase Search — Search First, Then Write
 
-When working in any existing codebase, you must actively search for relevant context before writing or answering. Never rely on assumptions about how things are named, shaped, or wired together. This skill defines when and how to search.
+## When to Search
 
----
+Search before proceeding if:
 
-## Rule: When in Doubt, Search
+- You're about to call a function or method you haven't read
+- You're about to use a type, trait, interface, or schema you haven't seen defined
+- You need an import/`use` path you're not certain about
+- You're implementing something that likely has existing related code
+- You're adding to a pattern (route, event, endpoint, component, test) and want to match existing ones
+- You're unsure whether something already exists, or you're asked "how does X work?"
 
-If any of the following are true, **run a search before proceeding**:
+One search is always cheaper than code written against a wrong assumption.
 
-- You are about to call a function, method, or hook you haven't read
-- You are about to use a type, interface, or schema you haven't seen defined
-- You need to import something and aren't certain of its exact export name or path
-- You are implementing a feature that likely has related existing code
-- You are asked how something works but haven't read the relevant files
-- You see a reference (variable, constant, config key) whose value you don't know
-- You are adding to a pattern (e.g. a new route, a new event, a new component) and want to match existing ones
-- You are unsure whether something already exists before creating it
+## Search Toolkit — Use in Priority Order
 
-**Default posture: search first, then write.** It is always cheaper to run a grep than to write code against a wrong assumption.
+Most precise tool first. Symbol-aware tools resolve through re-exports, barrel files, path aliases,
+`pub use`, macros and renames — text search can't. Fall back to text search for what LSP doesn't
+index (string literals, comments, config values, docs, SQL, generated code).
 
----
+### 1. LSP — symbol navigation (highest priority for code)
 
-## Search Toolkit
+If an LSP server exists for the file's language (rust-analyzer, tsserver, pyright, sourcekit-lsp,
+gopls…), use the `LSP` tool for any symbol question:
 
-Use these tools in order of specificity. Prefer faster/cheaper tools first.
+| Question | LSP operation |
+| --- | --- |
+| Where is X defined? | `goToDefinition` |
+| Where is X used? / Who calls X? | `findReferences`, `incomingCalls` |
+| What does X call? | `outgoingCalls` |
+| Type / signature of X? | `hover` (no need to open the file) |
+| Symbols in this file / in the repo? | `documentSymbol` / `workspaceSymbol` |
+| Implementations / impls of X? | `goToImplementation` |
 
-### 1. Grep — find by name or pattern
+After writing or editing code, check LSP diagnostics on the changed file. Don't ignore type errors
+or missing imports.
 
-```bash
-# Find where a symbol is defined
-grep -rn "export.*MyFunction\|export.*MyFunction" --include="*.ts" --include="*.tsx" . | grep -v node_modules
+### 2. Read a known file
 
-# Find all usages of a symbol
-grep -rn "MyFunction" --include="*.ts" --include="*.tsx" . | grep -v node_modules | grep -v ".d.ts"
+For a single file whose path you know, use the `Read` tool — never `cat`/`head`/`sed -n`; it never
+trips the permission rules below. Read the file you're about to edit top to bottom.
 
-# Find a type or interface definition
-grep -rn "^(export )?(type|interface) MyType" --include="*.ts" . | grep -v node_modules
+### 3. Text search — `git grep` with a pathspec
 
-# Find a config key or constant
-grep -rn "MY_CONSTANT\|myConstant" . | grep -v node_modules | grep -v dist
-
-# Case-insensitive search for a concept
-grep -rni "upload.*progress\|progress.*upload" --include="*.ts" --include="*.tsx" . | grep -v node_modules
-```
-
-### 2. Find — locate files by name
-
-```bash
-# Find a file when you know roughly what it's called
-find . -name "*auth*" -o -name "*Auth*" | grep -v node_modules | grep -v dist
-
-# Find files by extension in a specific area
-find ./src/components -name "*.tsx" | head -20
-
-# Find test files related to a module
-find . -name "*.test.ts" -path "*upload*" | grep -v node_modules
-```
-
-### 3. Read specific files
-
-Once you've located the right file via grep/find, read it in full or in relevant ranges:
+`git grep` searches tracked files only, so `node_modules`, `dist`, `target`, `build`, `.venv` and
+any ignored `.env` are skipped for free. **Always give it an extension pathspec after `--`.**
 
 ```bash
-cat ./src/hooks/useUpload.ts
+# Definition of a symbol (mixed-language repo)
+git grep -nE "fn my_function|export .*myFunction|def my_function" -- '*.rs' '*.ts' '*.py'
 
-# Or with line numbers for large files
-cat -n ./src/api/routes.ts | head -80
+# All usages (':!' excludes a pathspec)
+git grep -n "MyType" -- '*.rs' '*.ts' ':!*.d.ts'
+
+# A type / struct / interface definition
+git grep -nE "^(pub )?(struct|enum|trait) MyType|^(export )?(type|interface) MyType" -- '*.rs' '*.ts'
+
+# A config key or constant, in code and in config files
+git grep -niE "MY_CONSTANT|my_constant" -- '*.rs' '*.ts' '*.toml' '*.json' '*.yaml'
+
+# Another repo: -C with an absolute path, never `cd`
+git -C /abs/other/repo grep -n "PATTERN" -- '*.rs'
+
+# Files by name (tracked)
+git ls-files '*.rs' | grep -i auth
 ```
 
-### 4. List directory structure
+If the dedicated `Grep`/`Glob` tools are available in this session, they're equivalent and
+sidestep the shell entirely — but never depend on them; `git grep` with a pathspec is the default.
 
-When you need to understand module boundaries or find where something belongs:
+### 4. Explore subagent — broad / open-ended
 
-```bash
-# Two levels deep, ignoring noise
-find ./src -maxdepth 2 -type d | grep -v node_modules | sort
+Use an `Explore` subagent (thorough setting) when 3 different patterns came up empty, when you need
+to understand a feature spanning many files, or when the thing may be named nothing like you expect.
 
-# All files in a specific module
-find ./src/features/auth -type f | sort
-```
+## Never Sweep a Directory That Contains a `.env`
 
----
+The permission checker resolves a shell command's **file arguments** and matches them against the
+`Read(.env)` deny rule. Flags do nothing — `--include`, `--exclude-dir`, `-t rust` are all ignored.
+A directory argument with a `.env` anywhere under it (repo root, `web/`, `sandbox/`, …) turns the
+command into a permission prompt every single time.
 
-## What to Search For
+- ❌ `grep -rn X --include="*.rs" .` — directory `.` contains `.env` → prompt
+- ❌ `rg -n X -t rust .` — same
+- ❌ `git grep -n X` with no pathspec — treated as `.` → prompt (even `git grep --help`)
+- ❌ any command that writes `.env` literally, even as `--exclude=.env` → denied outright
+- ❌ `cd /abs/dir && git log abc..HEAD` / `cd /repo && grep -rn X crate/src` — after any `cd`, even
+  to an absolute directory, the checker can't determine the working directory and treats every
+  non-flag argument (a revision range included) as a path → prompt, whatever the target
+- ✅ `git grep -n X -- '*.rs' '*.toml'` — an extension pathspec cannot match `.env`; tracked files only
+- ✅ `grep -rn X --include="*.rs" /abs/repo/crate/src` — absolute path to a subtree with no `.env` under it
+- ✅ one known file → the `Read` tool, not `cat`
 
-### Before using any function or hook
+Plain `grep -r` is only for **untracked** (not yet `git add`ed) files, and only against an absolute
+subtree path — never the repo root, never `.`. Same for `find /abs/repo/<subtree> -name '*.rs'`.
+Never `cd` inside a command; the Bash cwd persists between calls anyway. Never read `.env`,
+`.env.*`, `.env.example` — if you need a value from one, stop and ask.
 
-Search for its definition to understand the real signature, return type, and any quirks:
+## Know the Repo — Read the Manifest
 
-```bash
-grep -rn "export.*function useFoo\|export const useFoo" --include="*.ts" --include="*.tsx" . | grep -v node_modules
-```
+Which extensions to search and which tools exist come from the root manifest. `Read` it:
 
-### Before using any type or interface
+| Manifest | Pathspecs | Build · test · lint · format |
+| --- | --- | --- |
+| `Cargo.toml` | `'*.rs'` `'*.toml'` | `cargo build` · `test --lib` · `clippy` · `fmt --check` |
+| `package.json` | `'*.ts'` `'*.tsx'` `':!*.d.ts'` | its `scripts` block, via npm/yarn/pnpm/bun run |
+| `pyproject.toml` | `'*.py'` | `pytest` · `ruff check` · `ruff format --check` |
+| `Package.swift` | `'*.swift'` | `swift build` · `swift test` · `swiftformat` |
+| `go.mod` | `'*.go'` | `go build ./...` · `go test ./...` · `go vet` |
 
-Read the actual definition — don't reconstruct it from memory:
+In a workspace (Cargo `[workspace] members`, npm `workspaces`, Go modules), read the member list
+from that manifest rather than guessing directory names — and check sibling members before writing
+something one of them may already have.
 
-```bash
-grep -rn "interface FooProps\|type FooProps" --include="*.ts" --include="*.tsx" . | grep -v node_modules
-```
+## Search Depth
 
-### Before adding a new instance of a pattern
+**A first search not finding it does NOT mean it doesn't exist.** Things hide behind re-exports,
+`pub use`, barrel files, aliases, macros, feature flags, or unexpected directories.
 
-Find existing instances to match the exact shape:
+| Situation | Minimum searches |
+| --- | --- |
+| Using a function already read this session | 0 |
+| Using a type/function not yet read | 2–3 searches with different patterns |
+| Implementing a new feature | 5–8 across patterns, names, and dirs |
+| Refactoring existing behavior | read every affected file + `findReferences` per symbol |
+| "I don't think this exists" | 3+ varied terms before concluding |
 
-```bash
-# e.g., before adding a new API route handler
-grep -rn "router\.(get|post|put|delete)" --include="*.ts" . | grep -v node_modules | head -10
-```
+### Strategies, in order
 
-### Before creating something that might already exist
+Exhaust LSP first (`goToDefinition` → `workspaceSymbol` → `findReferences`). Then, for text search:
 
-Check first:
+1. **Exact name** — `git grep -n "my_function" -- '*.rs'`
+2. **Fuzzy** — `git grep -niE "myfunc|my_func" -- '*.rs' '*.ts'` (casing, prefixes)
+3. **Semantic variants** — `format|render|display`, `cache|store|persist`, `delete|remove|destroy`
+4. **File name** — `git ls-files | grep -i foo` — maybe it's a whole file
+5. **Directory scan** — `git ls-files '<member>/src/*.rs'` — browse the likely module
+6. **Re-exports** — `mod.rs` / `lib.rs` / `index.ts` for `pub use` / `export … from`
+7. **Usage search** — find how others consume it, then read one real call site
 
-```bash
-grep -rn "formatDate\|format_date" --include="*.ts" --include="*.js" . | grep -v node_modules
-```
+## Per-Scenario Cookbook
 
-### Before importing from a module
+- **Using a function or type** — `goToDefinition` / `hover`, else `git grep`. Read the real signature, return type and error cases; never reconstruct one from context.
+- **Adding an instance of a pattern** — find 1–2 existing ones and match their shape (a route handler, an API wrapper, a `#[test]`, a migration).
+- **Creating something** — first check it doesn't exist: `git grep -niE "format_date|formatDate" -- '*.rs' '*.ts'`.
+- **Importing** — verify the exported/`pub` item and its exact path (`workspaceSymbol`, or read the module's `lib.rs`/`mod.rs`/`index.ts`).
+- **Third-party symbol** — read it in the dependency source (`~/.cargo/registry/src/…`, `node_modules/…`, the venv) instead of guessing its API.
 
-Verify the export exists and get the exact name:
-
-```bash
-grep -rn "^export" ./src/utils/index.ts
-```
-
----
-
-## Search Depth Guidelines
-
-| Situation                                     | Searches needed                                          |
-| --------------------------------------------- | -------------------------------------------------------- |
-| Using one known, previously-read function     | 0 — already have context                                 |
-| Using a function seen earlier in this session | 0 — already in context                                   |
-| Using any type/function not yet read          | 1–2 targeted greps                                       |
-| Implementing a new feature                    | 3–5 searches across related files                        |
-| Refactoring or modifying existing behavior    | Read all directly affected files first                   |
-| Answering "how does X work"                   | Read the relevant files, don't summarize from assumption |
-
----
-
-## Anti-Patterns to Avoid
-
-**Never do these:**
+## Never Do These
 
 - ❌ Invent a function signature because it "seems right"
-- ❌ Assume an import path without verifying it exists
+- ❌ Assume an import/`use` path without verifying it exists
 - ❌ Reconstruct a type from context instead of reading its definition
 - ❌ Assume a pattern is consistent without checking a real example
 - ❌ Write code that calls into modules you haven't read
-- ❌ Answer "does X exist?" without searching
+- ❌ Answer "does X exist?" — or conclude it doesn't — after one search
+- ❌ Point `grep -r`, `rg`, `find | xargs grep`, or a bare `git grep` at a repo root
+- ❌ Read or name any `.env*` file in a command
 
-**Always do these instead:**
-
-- ✅ Grep for the symbol, read the definition, then use it
-- ✅ Find one or two real usages before writing your own
-- ✅ Check the actual export list before importing
-- ✅ Read the file you're editing from top to bottom before changing it
-- ✅ If a definition, type, function, variable etc. comes from a third party dependency, look it up in the dependency directory (e.g. node_modules)
-
----
-
-## Efficient Search Habits
-
-- **Combine greps**: search for both the definition and a usage in one pass to orient yourself fast
-- **Read before editing**: always `cat` the full file you're about to modify, not just the target lines
-- **Follow imports**: if a file imports something unfamiliar, check what it is before using it
-- **Check barrel files**: many projects re-export from `index.ts` — check these for the canonical import path
-- **Scope searches**: use `--include` and path filters to avoid noise from `node_modules`, `dist`, `__pycache__`, etc.
-
----
-
-## Noise Filters (use consistently)
-
-```bash
-# Standard exclusions for most projects
-grep -rn "..." . \
-  | grep -v node_modules \
-  | grep -v "/dist/" \
-  | grep -v "/.next/" \
-  | grep -v "__pycache__" \
-  | grep -v ".d.ts" \
-  | grep -v "/coverage/"
-```
-
-Or use `--exclude-dir` for cleaner commands:
-
-```bash
-grep -rn "..." \
-  --include="*.ts" \
-  --exclude-dir=node_modules \
-  --exclude-dir=dist \
-  --exclude-dir=.next \
-  .
-```
-
----
-
-## Reminder
-
-Code that is written without reading the codebase first is a guess. Guesses break things. The codebase is always the source of truth — search it.
+Code written without reading the codebase first is a guess. The codebase is the source of truth.
