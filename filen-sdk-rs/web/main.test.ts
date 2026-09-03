@@ -49,6 +49,24 @@ function expectThumbnail(result: MakeThumbnailInMemoryResult): InMemoryThumbnail
 	return result.thumbnail
 }
 
+/// Bounds ONE step of a test instead of the whole test. `uploadFile` queues on the
+/// account-wide drive-write lock, which the nightly's three native legs contend for the
+/// entire run, so a per-test cap sized for a decode is blown by the upload in front of it
+/// (firefox, 2026-09-03: two 180 s caps, decodes that then finished in seconds). The step
+/// is not cancelled on expiry — neither is it by vitest's own timeout — it just stops being
+/// waited for, with a message that names it.
+async function within<T>(ms: number, what: string, work: Promise<T>): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined
+	const deadline = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`${what} did not finish within ${ms} ms`)), ms)
+	})
+	try {
+		return await Promise.race([work, deadline])
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
 let state: Client
 let shareClient: Client
 let testDir: Dir
@@ -229,7 +247,9 @@ test("thumbnail decode stays inside a bounded memory budget", async () => {
 	const file = await state.uploadFile(bytes, { parent: testDir, name: "memory-12mp.png" })
 	expect(file.canMakeThumbnail).toBe(true)
 
-	const thumb = expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
+	const thumb = expectThumbnail(
+		await within(180000, "12 MP png decode", state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
+	)
 	const after = heapBytes()
 	console.log(
 		`12 MP png thumbnail: source ${bytes.length} B, heap ${before} -> ${after} (+${after - before} bytes)`
@@ -252,7 +272,7 @@ test("thumbnail decode stays inside a bounded memory budget", async () => {
 	expect(after - before).toBeLessThan(40 * 1024 * 1024)
 	// And memory is never returned, so a later reading can only be >=.
 	expect(heapBytes()).toBeGreaterThanOrEqual(after)
-}, 180000)
+})
 
 test("login", async () => {
 	expect(state).toBeDefined()
@@ -834,7 +854,9 @@ test("large webp thumbnail", async () => {
 	const file = await state.uploadFile(bytes, { parent: testDir, name: "large.webp" })
 	expect(file.canMakeThumbnail).toBe(true)
 
-	const thumb = expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
+	const thumb = expectThumbnail(
+		await within(180000, "large webp decode", state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
+	)
 
 	const bitmap = await createImageBitmap(new Blob([thumb.webpData], { type: "image/webp" }))
 	expect(bitmap.width).toBeLessThanOrEqual(256)
@@ -846,7 +868,7 @@ test("large webp thumbnail", async () => {
 	// a real (streamed, bounded) decode.
 	expect(thumb.fromEmbeddedPreview).toBe(false)
 	bitmap.close()
-}, 180000)
+})
 
 /// Camera RAW, the case the extension gate exists for: the stored mime is whatever the
 /// uploading client's mime table said (RAW is absent from every JS one, and `.CR3` from
@@ -1113,7 +1135,7 @@ test("a queued thumbnail is not expired by another caller's decode", async () =>
 
 	const started = Date.now()
 	const pending = Array.from({ length: QUEUED }, () => slow.makeThumbnailInMemory({ file, maxHeight: 64, maxWidth: 64 }))
-	const results = await Promise.all(pending)
+	const results = await within(240000, "queued decodes", Promise.all(pending))
 	const elapsed = Date.now() - started
 
 	// Load-bearing precondition, asserted first: the last caller really did sit armed through at
@@ -1126,7 +1148,7 @@ test("a queued thumbnail is not expired by another caller's decode", async () =>
 	for (const result of results) {
 		expectThumbnail(result)
 	}
-}, 240000)
+})
 
 test("exif upload applies DateTimeOriginal", async () => {
 	// Each fixture in test-assets/imgs has EXIF DateTimeOriginal=2020:06:15 10:30:00
