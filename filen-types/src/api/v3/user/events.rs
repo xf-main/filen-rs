@@ -160,15 +160,17 @@ pub struct BaseInfo<'a> {
 }
 
 /// Shared by the single-metadata file events. Which of the optional fields are
-/// actually populated varies per kind; the captured fixtures in
-/// `tests/fixtures/user_events/` are the reference:
+/// actually populated varies per kind, as observed live:
 ///
 /// - `fileUploaded`: everything except `favorited` and `current_uuid`
 /// - `fileMoved` / `fileRestored`: everything except `current_uuid`
 /// - `versionedFileRestored`: everything, `current_uuid` being the uuid that
 ///   was current before the old version was restored over it
-/// - `fileVersioned` / `fileTrash`: only `uuid` (of the superseded / trashed
-///   file — there is no `newUUID`-style field pointing at a successor)
+/// - `fileTrash`: `uuid`, `stable_uuid` and — on a versioning-disabled edit —
+///   `new_uuid`, exactly as the socket twin carries them; see the field docs
+///   for whose stable id that is
+/// - `fileVersioned`: only `uuid` of the superseded file (last observed before
+///   the 2026-09-03 server change, not re-verified since)
 /// - `deleteFilePermanently`: none of them, not even `uuid`
 /// - `fileRm`: unverified (never observed live)
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
@@ -185,7 +187,10 @@ pub struct FileMetadataInfo<'a> {
 	/// [`super::super::socket::FileDeletedPermanent::stable_uuid`] means it.
 	/// Also absent on any event logged before the server carried the field, so
 	/// a replaying consumer must treat missing as "cannot replay", never as a
-	/// default.
+	/// default. On a `fileTrash` with `new_uuid` set it is NOT the lineage's but
+	/// the retired row's freshly minted id, exactly as
+	/// [`super::super::socket::FileTrash::stable_uuid`] carries it — resolve
+	/// that event by `uuid`.
 	#[serde(default, rename = "stableUUID")]
 	pub stable_uuid: Option<StableUuid>,
 	/// Present iff `uuid` was superseded by `new_uuid`. Its ABSENCE means

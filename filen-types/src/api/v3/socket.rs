@@ -780,6 +780,13 @@ pub struct FileMove<'a> {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileTrash {
 	pub uuid: Uuid,
+	/// The stable id of what this event retires. On a user trash that is the
+	/// lineage's, the row staying restorable under it. With `new_uuid` set it is
+	/// the trashed row's own FRESHLY MINTED id: the lineage moved to the
+	/// successor (announced by the paired `fileNew`, which carries it), and a
+	/// `fileTrash` naming the lineage next to that `fileNew` would let a
+	/// stable-keyed consumer tombstone the live file. That fresh id never names
+	/// a live file and its row is purged almost at once — correlate by `uuid`.
 	#[serde(rename = "stableUUID")]
 	pub stable_uuid: StableUuid,
 	/// Present iff `uuid` was trashed AND superseded by `new_uuid` — an edit on
