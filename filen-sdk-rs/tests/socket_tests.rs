@@ -226,19 +226,32 @@ async fn test_websocket_file_events() {
 		.await
 		.unwrap();
 
-	await_event(
+	// A versioning-ENABLED edit archives the old uuid as a version OF the lineage, so this
+	// event names the lineage — unlike the versioning-disabled `fileTrash`, which names the
+	// retired row (see `test_websocket_file_edit_versioning_disabled`).
+	let archived = await_map_event(
 		&mut receiver,
 		|event| match event {
 			DecryptedSocketEvent::Drive {
 				inner: DecryptedDriveEvent::FileArchived(file),
 				..
-			} => file.uuid == old_file_a.uuid(),
-			_ => false,
+			} if file.uuid == old_file_a.uuid() => Some(file),
+			_ => None,
 		},
 		Duration::from_secs(20),
 		"fileArchived",
 	)
 	.await;
+	assert_eq!(
+		archived.stable_uuid,
+		old_file_a.stable_uuid(),
+		"fileArchived names the lineage the version joined"
+	);
+	assert_eq!(
+		archived.new_uuid,
+		Some(file_a.uuid()),
+		"fileArchived from an edit points at its successor via newUUID"
+	);
 
 	client.set_file_favorite(&mut file_a, true).await.unwrap();
 	let event = await_map_event(
@@ -395,10 +408,15 @@ async fn test_websocket_file_events() {
 	.await;
 }
 
-/// An edit on a versioning-disabled account trashes the old uuid and re-mints the
-/// lineage at a new one. The server announces this as `fileTrash` with `newUUID`
-/// set — never a user trash action — and must also announce the successor with a
-/// `fileNew`, since `fileTrash` carries no metadata to construct it from.
+/// An edit on a versioning-disabled account re-mints the file's uuid: the lineage's
+/// stable id moves to the new upload and the old uuid is trashed. The server announces
+/// the trash as `fileTrash` with `newUUID` set — never a user trash action — stamped
+/// with the RETIRED row's own freshly minted stable id, never the lineage's: the
+/// lineage is alive under the successor, whose `fileNew` (carrying the lineage id) must
+/// also arrive, since `fileTrash` has no metadata to construct it from. A `fileTrash`
+/// naming the lineage next to a `fileNew` naming it would let a stable-keyed consumer
+/// tombstone the live file, the bug the server fixed on 2026-09-03; consumers correlate
+/// this event by uuid and `newUUID` alone.
 #[shared_test_runtime]
 async fn test_websocket_file_edit_versioning_disabled() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -476,6 +494,11 @@ async fn test_websocket_file_edit_versioning_disabled() {
 				inner: DecryptedDriveEvent::FileNew(data),
 				..
 			} if data.0.uuid == second.uuid() => {
+				assert_eq!(
+					data.0.stable_uuid(),
+					first.stable_uuid(),
+					"the successor's fileNew carries the lineage's stable id"
+				);
 				saw_successor_file_new = true;
 				None
 			}
@@ -490,10 +513,10 @@ async fn test_websocket_file_edit_versioning_disabled() {
 	)
 	.await;
 
-	assert_eq!(
+	assert_ne!(
 		trash.stable_uuid,
 		first.stable_uuid(),
-		"fileTrash must carry the lineage's stable id"
+		"a fileTrash with newUUID names the retired row's own stable id, never the lineage's"
 	);
 	assert_eq!(
 		trash.new_uuid,
@@ -502,19 +525,24 @@ async fn test_websocket_file_edit_versioning_disabled() {
 	);
 
 	if !saw_successor_file_new {
-		await_event(
+		let successor_stable = await_map_event(
 			&mut receiver,
 			|event| match event {
 				DecryptedSocketEvent::Drive {
 					inner: DecryptedDriveEvent::FileNew(data),
 					..
-				} => data.0.uuid == second.uuid(),
-				_ => false,
+				} if data.0.uuid == second.uuid() => Some(data.0.stable_uuid()),
+				_ => None,
 			},
 			Duration::from_secs(20),
 			"fileNew (successor of a versioning-disabled edit)",
 		)
 		.await;
+		assert_eq!(
+			successor_stable,
+			first.stable_uuid(),
+			"the successor's fileNew carries the lineage's stable id"
+		);
 	}
 
 	client.set_versioning_enabled(true).await.unwrap();

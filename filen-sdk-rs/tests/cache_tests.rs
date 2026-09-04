@@ -1,7 +1,10 @@
-use std::time::Duration;
+use std::{
+	sync::{Arc, Mutex},
+	time::Duration,
+};
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::cache::{CacheError, CacheMessage, ResyncProgress};
+use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheMessage, ResyncProgress, SyncRootCallback};
 use filen_sdk_rs::{
 	ErrorKind,
 	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
@@ -1575,6 +1578,111 @@ async fn test_cache_file_sync_root_follows_an_edit() {
 		"the superseded uuid is retired"
 	);
 }
+/// The same edit on a versioning-DISABLED account. There the server retires the old uuid with a
+/// `fileTrash` whose stable id is the retired row's own freshly minted one — never the lineage's,
+/// or a stable-keyed consumer would tombstone the live file — so the engine has to find the
+/// lineage through the row it holds, not through the event, for the identity update to happen.
+#[shared_test_runtime]
+async fn test_cache_file_sync_root_follows_a_versioning_disabled_edit() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	// Same order as the socket and user tests: version-chain lock, then the account-wide
+	// versioning-flag lock.
+	let _version_lock = resources
+		.client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	let _versioning_lock = resources
+		.client
+		.acquire_lock_with_default("test:user-versioning")
+		.await
+		.unwrap();
+	resources
+		.client
+		.set_versioning_enabled(false)
+		.await
+		.unwrap();
+
+	let client = derive_client(resources.client.as_ref());
+	let test_dir = &resources.dir;
+	let path = temp_cache_path();
+	client.configure_cache(path.clone(), |_| {}).await.unwrap();
+
+	let file = client
+		.make_file_builder("file_root_vd_edit.txt", test_dir.uuid())
+		.unwrap();
+	let file = client.upload_file(file, b"v1").await.unwrap();
+
+	// What the file root is told is the difference between re-keying the row and deleting it:
+	// the retirement must reach it as the identity update it is, never as a removal.
+	let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+	let seen_cb = seen.clone();
+	let recording: SyncRootCallback =
+		Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
+			seen_cb
+				.lock()
+				.unwrap()
+				.extend(events.map(|event| format!("{:?}", event.event)));
+		});
+	let _handle = client
+		.clone()
+		.add_file_sync_root(file.stable_uuid(), recording)
+		.await
+		.unwrap();
+	ensure_socket_ready(&client).await;
+
+	assert!(
+		poll_for_item(&path, file.uuid(), Duration::from_secs(30)).await,
+		"the convergence fetch populates the tracked file (nothing else can)"
+	);
+
+	// backend timestamps have a resolution of one second
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	let edited = client
+		.upload_file(
+			client
+				.make_file_builder("file_root_vd_edit.txt", test_dir.uuid())
+				.unwrap(),
+			b"v2 contents",
+		)
+		.await
+		.unwrap();
+	assert_ne!(edited.uuid(), file.uuid(), "an edit re-mints the uuid");
+	assert_eq!(
+		edited.stable_uuid(),
+		file.stable_uuid(),
+		"the lineage's stable id moves to the successor"
+	);
+
+	assert!(
+		poll_for_item(&path, edited.uuid(), Duration::from_secs(30)).await,
+		"the tracked row is re-filed under the successor uuid"
+	);
+	assert!(
+		poll_for_item_absent(&path, file.uuid(), Duration::from_secs(30)).await,
+		"the superseded uuid is retired"
+	);
+	// The dispatch lands after the commit the polls observed, so give it a moment of its own.
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+	loop {
+		let events = seen.lock().unwrap().clone();
+		if events.iter().any(|event| event.contains("Trashed")) {
+			assert!(
+				events.iter().all(|event| !event.contains("Removed")),
+				"no removal is ever dispatched for the tracked lineage: {events:?}"
+			);
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the retirement never reached the file root as an identity update: {events:?}"
+		);
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+
+	resources.client.set_versioning_enabled(true).await.unwrap();
+}
+
 /// A tracked file TRASHED while the cache was closed. No socket event for it will ever be
 /// delivered, so the reopen's by-stable head fetch is the only thing that can notice — and what it
 /// gets back is a head parented to the TRASH. That head is the removal a `fileTrash` would have
