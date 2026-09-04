@@ -1641,13 +1641,14 @@ mod applier_tests {
 			DecryptedDriveEvent::FileNew(ev::FileNew(file_record(1, 2, 8))),
 		);
 
-		// The supersede: never a trash.
+		// The supersede: never a trash. As on the wire, its stable id is the retired row's
+		// freshly minted one, not the lineage's (2).
 		assert_eq!(
 			apply(
 				&conn,
 				DecryptedDriveEvent::FileTrash(ev::FileTrash {
 					uuid: uuid(1),
-					stable_uuid: stable(2),
+					stable_uuid: stable(99),
 					new_uuid: Some(uuid(11)),
 				})
 			),

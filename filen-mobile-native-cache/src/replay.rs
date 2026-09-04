@@ -156,9 +156,19 @@ pub(crate) fn target_for(conn: &Connection, event: &DecryptedUserEvent) -> Event
 		| K::FileRestored(i)
 		| K::VersionedFileRestored(i)
 		| K::FileMoved(i)
-		| K::FileTrash(i)
 		| K::FileRm(i)
 		| K::DeleteFilePermanently(i) => (i.uuid, i.stable_uuid.map(Uuid::from), i.parent),
+		// With `newUUID` set this is a versioning-disabled edit's retirement of the old uuid, and
+		// its stable id is the retired row's freshly minted one — never the lineage's, which lives
+		// on under the successor — so it can name no row we hold; the uuid does.
+		K::FileTrash(i) => (
+			i.uuid,
+			i.new_uuid
+				.is_none()
+				.then(|| i.stable_uuid.map(Uuid::from))
+				.flatten(),
+			i.parent,
+		),
 		K::FileRenamed(i) | K::FileMetadataChanged(i) => {
 			(i.uuid, i.stable_uuid.map(Uuid::from), None)
 		}
