@@ -27,7 +27,8 @@
 //!
 //! Replay is an optimization and refuses rather than guesses. [`ReplayOutcome::Fallback`] is
 //! returned when there is no cursor yet, when an event in the range cannot be decoded or
-//! attributed, when `deleteAll` appears, when paging cannot reach the cursor, or when the
+//! attributed — a file event without the lineage id the server has logged since 2026-09-01
+//! included — when `deleteAll` appears, when paging cannot reach the cursor, or when the
 //! targeted set grows big enough that the sweep is cheaper anyway.
 //!
 //! ## Paging without a sub-second cursor
@@ -45,7 +46,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::user::events::{DecryptedUserEvent, DecryptedUserEventKind};
-use filen_types::fs::{ParentUuid, Uuid};
+use filen_types::fs::{ObjectType, ParentUuid, Uuid};
 use rusqlite::Connection;
 
 use crate::sql::item::RawDBItem;
@@ -151,28 +152,51 @@ pub(crate) fn target_for(conn: &Connection, event: &DecryptedUserEvent) -> Event
 				trash: true,
 			};
 		}
+		// Every file kind here has carried its lineage id since the server began logging it, on
+		// 2026-09-01. An event without one is older than that, or a server anomaly, and its uuid
+		// alone cannot tell a lineage this cache holds under a re-minted uuid from a part of the
+		// drive it never listed — resolving it anyway drops it as irrelevant and closes the gap
+		// over a stale container. Refused instead, like every other event replay cannot read.
 		K::FileUploaded(i)
 		| K::FileVersioned(i)
 		| K::FileRestored(i)
 		| K::VersionedFileRestored(i)
 		| K::FileMoved(i)
-		| K::FileRm(i)
-		| K::DeleteFilePermanently(i) => (i.uuid, i.stable_uuid.map(Uuid::from), i.parent),
+		| K::FileRm(i) => {
+			let Some(stable) = i.stable_uuid else {
+				return EventTarget::Unknown;
+			};
+			(i.uuid, Some(Uuid::from(stable)), i.parent)
+		}
+		// The one kind whose missing stable id is a message rather than an age: only archived
+		// versions died, the live head stands, and the uuid it names resolves as usual.
+		K::DeleteFilePermanently(i) => (i.uuid, i.stable_uuid.map(Uuid::from), i.parent),
 		// With `newUUID` set this is a versioning-disabled edit's retirement of the old uuid, and
 		// its stable id is the retired row's freshly minted one — never the lineage's, which lives
 		// on under the successor — so it can name no row we hold; the uuid does.
-		K::FileTrash(i) => (
-			i.uuid,
-			i.new_uuid
-				.is_none()
-				.then(|| i.stable_uuid.map(Uuid::from))
-				.flatten(),
-			i.parent,
-		),
+		K::FileTrash(i) => {
+			let Some(stable) = i.stable_uuid else {
+				return EventTarget::Unknown;
+			};
+			(
+				i.uuid,
+				i.new_uuid.is_none().then(|| Uuid::from(stable)),
+				i.parent,
+			)
+		}
 		K::FileRenamed(i) | K::FileMetadataChanged(i) => {
+			let Some(stable) = i.stable_uuid else {
+				return EventTarget::Unknown;
+			};
+			(i.uuid, Some(Uuid::from(stable)), None)
+		}
+		// Folder favourites never carry a stable id; file ones always have.
+		K::ItemFavorite(i) => {
+			if i.item_type == Some(ObjectType::File) && i.stable_uuid.is_none() {
+				return EventTarget::Unknown;
+			}
 			(i.uuid, i.stable_uuid.map(Uuid::from), None)
 		}
-		K::ItemFavorite(i) => (i.uuid, i.stable_uuid.map(Uuid::from), None),
 		// `baseFolderCreated` is deliberately NOT here: its payload has never been observed
 		// live (see the wire type's own doc), and classifying an unverified shape as
 		// attributable would drop it silently if it turns out to carry no parent. It fires
@@ -597,6 +621,83 @@ mod tests {
 				DecryptedUserEventKind::DeleteFilePermanently(file_info(None, None, None))
 			),
 			EventTarget::Unknown
+		);
+	}
+
+	/// Every file kind has carried its lineage id since the server began logging it. An event
+	/// without one predates that, or is a server anomaly, and its uuid alone cannot tell a
+	/// lineage this cache holds under a re-minted uuid from a part of the drive it never listed
+	/// — dropping it as irrelevant would close the gap over a stale container. So it is the
+	/// pass's problem, even when the uuid or the parent IS held.
+	#[test]
+	fn a_file_event_without_a_stable_id_is_handed_to_the_pass() {
+		let mut conn = db();
+		hold_dir(&mut conn, 8, ROOT);
+		hold_file(&mut conn, 1, 2, 8);
+
+		assert_eq!(
+			targets(
+				&conn,
+				DecryptedUserEventKind::FileUploaded(file_info(Some(1), None, Some(8)))
+			),
+			EventTarget::Unknown
+		);
+		assert_eq!(
+			targets(
+				&conn,
+				DecryptedUserEventKind::FileTrash(file_info(Some(1), None, None))
+			),
+			EventTarget::Unknown
+		);
+		let renamed = DecryptedUserEventKind::FileRenamed(UserEventFilePairInfo {
+			ip: "1.2.3.4".to_owned(),
+			user_agent: "ua".to_owned(),
+			metadata: FileMeta::Encrypted(EncryptedString(Cow::Borrowed("new"))),
+			old_metadata: FileMeta::Encrypted(EncryptedString(Cow::Borrowed("old"))),
+			uuid: Some(uuid(1)),
+			stable_uuid: None,
+		});
+		assert_eq!(targets(&conn, renamed), EventTarget::Unknown);
+		let favorited = DecryptedUserEventKind::ItemFavorite(UserEventItemFavoriteInfo {
+			ip: "1.2.3.4".to_owned(),
+			user_agent: "ua".to_owned(),
+			value: true,
+			metadata: FileMeta::Encrypted(EncryptedString(Cow::Borrowed("enc-file"))),
+			uuid: Some(uuid(1)),
+			stable_uuid: None,
+			item_type: Some(filen_types::fs::ObjectType::File),
+		});
+		assert_eq!(targets(&conn, favorited), EventTarget::Unknown);
+	}
+
+	/// The two absences that are legitimate today, and must keep resolving: a
+	/// `deleteFilePermanently` of archived versions only (the live head stands, and the event
+	/// names its uuid), and a folder favourite, which never carries a stable id.
+	#[test]
+	fn the_kinds_that_legitimately_lack_a_stable_id_still_resolve() {
+		let mut conn = db();
+		hold_dir(&mut conn, 8, ROOT);
+		hold_file(&mut conn, 1, 2, 8);
+
+		assert_eq!(
+			targets(
+				&conn,
+				DecryptedUserEventKind::DeleteFilePermanently(file_info(Some(1), None, None))
+			),
+			containers(vec![uuid(8)])
+		);
+		let folder_favorite = DecryptedUserEventKind::ItemFavorite(UserEventItemFavoriteInfo {
+			ip: "1.2.3.4".to_owned(),
+			user_agent: "ua".to_owned(),
+			value: true,
+			metadata: FileMeta::Encrypted(EncryptedString(Cow::Borrowed("enc-dir"))),
+			uuid: Some(uuid(8)),
+			stable_uuid: None,
+			item_type: Some(filen_types::fs::ObjectType::Dir),
+		});
+		assert_eq!(
+			targets(&conn, folder_favorite),
+			containers(vec![uuid(ROOT)])
 		);
 	}
 
