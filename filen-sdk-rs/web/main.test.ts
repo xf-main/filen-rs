@@ -49,22 +49,13 @@ function expectThumbnail(result: MakeThumbnailInMemoryResult): InMemoryThumbnail
 	return result.thumbnail
 }
 
-/// Bounds ONE step of a test instead of the whole test. `uploadFile` queues on the
-/// account-wide drive-write lock, which the nightly's three native legs contend for the
-/// entire run, so a per-test cap sized for a decode is blown by the upload in front of it
-/// (firefox, 2026-09-03: two 180 s caps, decodes that then finished in seconds). The step
-/// is not cancelled on expiry — neither is it by vitest's own timeout — it just stops being
-/// waited for, with a message that names it.
-async function within<T>(ms: number, what: string, work: Promise<T>): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined
-	const deadline = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new Error(`${what} did not finish within ${ms} ms`)), ms)
-	})
-	try {
-		return await Promise.race([work, deadline])
-	} finally {
-		clearTimeout(timer)
-	}
+/// An explicit per-test timeout, stretched by the same `VITE_TEST_TIMEOUT_MULT` that
+/// vitest.config.ts applies to the 3-minute default. Bounds that measure the SDK itself
+/// — the 30 s parked-worker check — are deliberately left unscaled.
+const TIMEOUT_MULT = Number(import.meta.env.VITE_TEST_TIMEOUT_MULT) || 1
+
+function cap(ms: number): number {
+	return ms * TIMEOUT_MULT
 }
 
 let state: Client
@@ -177,7 +168,7 @@ beforeAll(async () => {
 			})
 		})()
 	])
-}, 120000)
+})
 
 afterEach(() => {
 	if (listenerErrors.length > 0) {
@@ -247,9 +238,7 @@ test("thumbnail decode stays inside a bounded memory budget", async () => {
 	const file = await state.uploadFile(bytes, { parent: testDir, name: "memory-12mp.png" })
 	expect(file.canMakeThumbnail).toBe(true)
 
-	const thumb = expectThumbnail(
-		await within(180000, "12 MP png decode", state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
-	)
+	const thumb = expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
 	const after = heapBytes()
 	console.log(
 		`12 MP png thumbnail: source ${bytes.length} B, heap ${before} -> ${after} (+${after - before} bytes)`
@@ -854,9 +843,7 @@ test("large webp thumbnail", async () => {
 	const file = await state.uploadFile(bytes, { parent: testDir, name: "large.webp" })
 	expect(file.canMakeThumbnail).toBe(true)
 
-	const thumb = expectThumbnail(
-		await within(180000, "large webp decode", state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
-	)
+	const thumb = expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 256, maxWidth: 256 }))
 
 	const bitmap = await createImageBitmap(new Blob([thumb.webpData], { type: "image/webp" }))
 	expect(bitmap.width).toBeLessThanOrEqual(256)
@@ -960,7 +947,7 @@ async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
 	return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("")
 }
 
-test("raw thumbnails come from the embedded preview", async () => {
+test("raw thumbnails come from the embedded preview", { timeout: cap(600_000) }, async () => {
 	const results = await Promise.all(
 		RAW_FIXTURES.map(async fixture => {
 			const res = await fetch(`raw-fixtures/${fixture.name}/${fixture.path}`)
@@ -1026,7 +1013,7 @@ test("raw thumbnails come from the embedded preview", async () => {
 	}
 
 	console.log("raw thumbnails:", produced.join(", "))
-}, 600_000)
+})
 
 /// Removes an OPFS entry whose writable the SDK still holds, once the SDK's abort of that
 /// stream has released the lock — within a bound, so a stream never aborted is a failure.
@@ -1086,8 +1073,9 @@ test("an aborted preview does not park the decode worker", async () => {
 
 	const started = Date.now()
 	expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 128, maxWidth: 128 }))
+	// Not cap()-scaled: it only means something while it stays under the worker's 60 s stall deadline.
 	expect(Date.now() - started, "a thumbnail after an aborted preview waited on a dead worker").toBeLessThan(30_000)
-}, 240_000)
+})
 
 test("thumbnail verdicts are distinguishable", async () => {
 	// The point of the verdicts: three different "no picture" answers that a UI
@@ -1135,7 +1123,7 @@ test("a queued thumbnail is not expired by another caller's decode", async () =>
 
 	const started = Date.now()
 	const pending = Array.from({ length: QUEUED }, () => slow.makeThumbnailInMemory({ file, maxHeight: 64, maxWidth: 64 }))
-	const results = await within(240000, "queued decodes", Promise.all(pending))
+	const results = await Promise.all(pending)
 	const elapsed = Date.now() - started
 
 	// Load-bearing precondition, asserted first: the last caller really did sit armed through at

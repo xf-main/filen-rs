@@ -247,3 +247,6 @@ jobs:
           VITE_TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
           VITE_TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           VITE_TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          # Multiplies every test timeout (3 min by default): every upload here waits on
+          # the same drive-write lock the native legs churn for the whole run.
+          VITE_TEST_TIMEOUT_MULT: '10'

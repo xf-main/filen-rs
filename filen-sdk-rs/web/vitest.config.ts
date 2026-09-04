@@ -65,12 +65,20 @@ function rawFixtures(): Plugin {
 	}
 }
 
+// Every test and hook gets 3 minutes, times `VITE_TEST_TIMEOUT_MULT` (default 1). The nightly
+// sets 10: there each upload queues on the account-wide drive-write lock behind six native
+// legs, and a cap sized for one machine says nothing (2026-09-04: a test of two tiny uploads
+// took 419 s). main.test.ts reads the same variable through `import.meta.env` for the few
+// explicit per-test timeouts, so set it in the shell, not in a .env file.
+const TIMEOUT_MULT = Number(process.env.VITE_TEST_TIMEOUT_MULT) || 1
+const TIMEOUT = 180_000 * TIMEOUT_MULT
+
 export default defineConfig({
 	...mergeConfig(viteConfig, {
 		plugins: [rawFixtures()],
 		test: {
-			hookTimeout: 3600_000,
-			testTimeout: 3600_000,
+			hookTimeout: TIMEOUT,
+			testTimeout: TIMEOUT,
 			teardownTimeout: 3600_000,
 			browser: {
 				enabled: true,
