@@ -357,6 +357,12 @@ fn init_db(
 	Ok(db)
 }
 
+/// Opens the account's cache DB, re-initializing it whenever the state file says the one on
+/// disk cannot be trusted. The state comes back only when the DB is the one it describes: a
+/// re-init has just written a default `db_state.json`, and `from_sdk_config` seeds the live gap
+/// bookkeeping — watermark, events cursor, reconcile debt, materialized set — from what is
+/// returned here. Carried over a wiped DB, a watermark reads as "caught up": no pass runs,
+/// nothing fills the cache, and a replay over the empty DB closes the gap having listed nothing.
 fn db_from_dir(
 	files_dir: &Path,
 	db_dir: &Path,
@@ -401,28 +407,19 @@ fn db_from_dir(
 			*sql::statements::DB_INIT_HASH,
 			saved_state.db_hash
 		);
-		Ok((
-			init_db(files_dir, db_dir, cache_state_file, owner)?,
-			Some(saved_state),
-		))
+		Ok((init_db(files_dir, db_dir, cache_state_file, owner)?, None))
 	} else if !db_path.exists() {
 		tracing::info!(
 			"Database file does not exist, creating new one: {}",
 			db_path.display()
 		);
-		Ok((
-			init_db(files_dir, db_dir, cache_state_file, owner)?,
-			Some(saved_state),
-		))
+		Ok((init_db(files_dir, db_dir, cache_state_file, owner)?, None))
 	} else if saved_state.version.is_none_or(|v| v < CACHE_VERSION) {
 		tracing::info!(
 			"Database version is outdated or missing, reinitializing database: {}",
 			db_path.display()
 		);
-		Ok((
-			init_db(files_dir, db_dir, cache_state_file, owner)?,
-			Some(saved_state),
-		))
+		Ok((init_db(files_dir, db_dir, cache_state_file, owner)?, None))
 	} else if saved_state.owner.as_deref() != Some(owner) {
 		// The cache belongs to a different account (or predates the owner stamp, which reads
 		// the same way): its tree — and its decrypted names — must not leak into this session.
@@ -431,10 +428,7 @@ fn db_from_dir(
 			saved_state.owner,
 			db_path.display()
 		);
-		Ok((
-			init_db(files_dir, db_dir, cache_state_file, owner)?,
-			Some(saved_state),
-		))
+		Ok((init_db(files_dir, db_dir, cache_state_file, owner)?, None))
 	} else {
 		tracing::info!(
 			"Database hash matches, using existing database: {}",
@@ -457,10 +451,7 @@ fn db_from_dir(
 				) =>
 			{
 				tracing::error!("cached database unusable ({e:?}: {msg:?}); reinitializing");
-				Ok((
-					init_db(files_dir, db_dir, cache_state_file, owner)?,
-					Some(saved_state),
-				))
+				Ok((init_db(files_dir, db_dir, cache_state_file, owner)?, None))
 			}
 			Err(e) => Err(e.into()),
 		}
@@ -1471,6 +1462,76 @@ mod owner_stamp_tests {
 
 		let conn = open(&dir, OWNER_A);
 		assert_eq!(marker_count(&conn), 1, "one re-init on upgrade, not two");
+	}
+}
+
+#[cfg(test)]
+mod reinit_state_tests {
+	use filen_types::fs::{Uuid, UuidStr};
+
+	use super::{DB_FILE_NAME, SavedDBState, db_from_dir, test_support::TempDbDir};
+	use crate::auth::update_saved_db_state;
+
+	const OWNER_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+	const OWNER_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+	/// The gap bookkeeping the constructor seeds from the state `db_from_dir` hands back.
+	fn gap_state(state: Option<SavedDBState>) -> (Option<u64>, Option<i64>, Option<bool>, bool) {
+		state
+			.map(|s| {
+				(
+					s.drive_watermark,
+					s.events_cursor,
+					s.pending_reconcile,
+					s.materialized_containers.is_some(),
+				)
+			})
+			.unwrap_or_default()
+	}
+
+	async fn record_a_caught_up_session(state_file: &std::path::Path) {
+		update_saved_db_state(state_file, |state| {
+			state.drive_watermark = Some(42);
+			state.events_cursor = Some(7);
+			state.pending_reconcile = Some(true);
+			state.materialized_containers = Some(vec![UuidStr::from(Uuid::from_bytes([1; 16]))]);
+		})
+		.await
+		.unwrap();
+	}
+
+	/// A re-init wipes the DB and writes a default db_state.json, and what it hands back must
+	/// describe THAT file, not the one the wipe discarded. The constructor seeds the live gap
+	/// bookkeeping from it — watermark, events cursor, reconcile debt, materialized set — and a
+	/// watermark carried over an emptied DB reads as "caught up": no pass runs, nothing fills the
+	/// cache, and a replay over the empty DB folds every event as irrelevant and closes the gap
+	/// having listed nothing.
+	#[tokio::test]
+	async fn a_reinit_hands_back_no_state_from_before_the_wipe() {
+		let dir = TempDbDir::create("filen-cache-reinit-state");
+		let state_file = dir.0.join("db_state.json");
+		drop(db_from_dir(&dir.0, &dir.0, &state_file, OWNER_A).unwrap());
+		record_a_caught_up_session(&state_file).await;
+
+		// An account swap: the re-init every install can hit.
+		let (conn, state) = db_from_dir(&dir.0, &dir.0, &state_file, OWNER_B).unwrap();
+		assert_eq!(
+			gap_state(state),
+			(None, None, None, false),
+			"an owner swap carried the previous account's gap state into the wiped cache"
+		);
+		drop(conn);
+
+		// The DB gone under a valid state file: what a disable-wipe leaves behind, since it
+		// deletes the DB but keeps db_state.json.
+		record_a_caught_up_session(&state_file).await;
+		std::fs::remove_file(dir.0.join(DB_FILE_NAME)).unwrap();
+		let (_conn, state) = db_from_dir(&dir.0, &dir.0, &state_file, OWNER_B).unwrap();
+		assert_eq!(
+			gap_state(state),
+			(None, None, None, false),
+			"a re-created DB carried the gap state of the DB it replaced"
+		);
 	}
 }
 
