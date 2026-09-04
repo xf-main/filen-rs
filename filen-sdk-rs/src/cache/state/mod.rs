@@ -2162,11 +2162,24 @@ impl CacheState {
 						self.extend_owning_roots(parent, &mut owners);
 					}
 				}
-				// A trash/archive carries the lineage's id itself; the pre-snapshot is only needed
-				// for the dir root it sat in.
-				FileEvent::Trashed { stable_uuid, .. }
-				| FileEvent::Archived { stable_uuid, .. } => {
-					self.extend_owning_file_root(Some(*stable_uuid), &mut owners);
+				// A trash/archive of a tracked lineage: the lineage is what OUR row carried before
+				// the apply, as for `Removed`. With no row, the event's own stable id stands in
+				// where it names the lineage: always for an archive (a version joins its lineage),
+				// and for a trash only without a successor — with one it names the retired row,
+				// freshly minted on a versioning-disabled account, which no root is keyed by.
+				FileEvent::Trashed {
+					stable_uuid,
+					new_uuid,
+					..
+				} => {
+					let lineage = pre.stable.or(new_uuid.is_none().then_some(*stable_uuid));
+					self.extend_owning_file_root(lineage, &mut owners);
+					if let Some(parent) = pre.parent {
+						self.extend_owning_roots(parent, &mut owners);
+					}
+				}
+				FileEvent::Archived { stable_uuid, .. } => {
+					self.extend_owning_file_root(pre.stable.or(Some(*stable_uuid)), &mut owners);
 					if let Some(parent) = pre.parent {
 						self.extend_owning_roots(parent, &mut owners);
 					}
@@ -2878,27 +2891,38 @@ impl CacheState {
 			// An EDIT of a TRACKED lineage — `fileTrash` with a successor on a versioning-disabled
 			// account, `fileArchived` with one otherwise — is an identity update, not a removal:
 			// the row is re-filed under the successor uuid (or, if the paired `fileNew` already
-			// landed, the superseded row is dropped in favour of the fresh one). The file root
-			// itself is never dropped here — a genuine trash (`new_uuid: None`) can be undone by a
-			// restore, and the registration's owner learns of it through the dispatch. Everything
+			// landed, the superseded row is dropped in favour of the fresh one). Which lineage
+			// that is comes from OUR row for `uuid`, never from the event: with a successor the
+			// event's stable id names the thing that retires, and on a versioning-disabled
+			// account the server mints the trashed row a fresh one at that moment — it must, or
+			// a `fileTrash` naming the lineage next to the successor's `fileNew` naming it too
+			// would let a stable-keyed consumer tombstone the live file. The file root itself is
+			// never dropped here — a genuine trash (`new_uuid: None`) can be undone by a restore,
+			// and the registration's owner learns of it through the dispatch. Everything
 			// untracked keeps the historical behaviour: both events delete the row.
-			FileEvent::Trashed {
-				uuid,
-				stable_uuid,
-				new_uuid,
+			FileEvent::Trashed { uuid, new_uuid, .. }
+			| FileEvent::Archived { uuid, new_uuid, .. } => {
+				let lineage = match new_uuid {
+					Some(_) => self.stable_of_uuid(uuid).map_err(|e| {
+						db_err_vec(
+							e,
+							format!("resolving the lineage of superseded file {uuid}"),
+						)
+					})?,
+					None => None,
+				};
+				match new_uuid {
+					Some(new_uuid)
+						if lineage.is_some_and(|stable| self.file_roots.contains_key(&stable)) =>
+					{
+						self.supersede_file_uuid(uuid, new_uuid)
+							.map_err(|e| db_err_vec(e, format!("superseding tracked file {uuid}")))
+					}
+					_ => self.delete_items(once(uuid)).map_err(|e| {
+						db_err_vec(e, format!("failed to trash file with uuid: {uuid}"))
+					}),
+				}
 			}
-			| FileEvent::Archived {
-				uuid,
-				stable_uuid,
-				new_uuid,
-			} => match new_uuid {
-				Some(new_uuid) if self.file_roots.contains_key(&stable_uuid) => self
-					.supersede_file_uuid(uuid, new_uuid)
-					.map_err(|e| db_err_vec(e, format!("superseding tracked file {uuid}"))),
-				_ => self
-					.delete_items(once(uuid))
-					.map_err(|e| db_err_vec(e, format!("failed to trash file with uuid: {uuid}"))),
-			},
 			FileEvent::MetadataChanged { uuid, meta } => {
 				self.update_file_meta(uuid, &meta).map_err(|e| {
 					// uuid only — `meta` holds the FileKey; never serialize it into an error/log.

@@ -2664,10 +2664,18 @@ fn successor_of(original: &CacheableFile<'static>, uuid: u128) -> CacheableFile<
 	successor
 }
 
+/// The `fileTrash` the server sends for `file`. With a successor — a versioning-DISABLED edit —
+/// it carries the RETIRED row's freshly minted stable id, never the lineage's: the lineage lives
+/// on under `new_uuid` and the paired `fileNew` re-announces it, so an event naming it here would
+/// let a stable-keyed consumer tombstone the live file. A genuine trash keeps the lineage's id.
 fn trashed(file: &CacheableFile<'_>, new_uuid: Option<Uuid>) -> CacheEventType<'static> {
+	let stable_uuid = match new_uuid {
+		Some(_) => StableUuid::new_for_test(Uuid::from_u128(0xdead)),
+		None => file.stable_uuid,
+	};
 	CacheEventType::File(FileEvent::Trashed {
 		uuid: file.uuid,
-		stable_uuid: file.stable_uuid,
+		stable_uuid,
 		new_uuid,
 	})
 }
@@ -2917,6 +2925,61 @@ fn untracked_file_trash_still_deletes_the_row() {
 		!item_exists(&state, Uuid::from_u128(11)),
 		"and nothing is created for the successor it never tracked"
 	);
+}
+
+/// A tracked lineage whose row is NOT cached yet (registering never waits for the head fetch)
+/// still hears a versioning-ENABLED edit's `fileArchived`: that event names the lineage, so with
+/// no row to read it from, the event's own stable id resolves the owner.
+#[test]
+fn tracked_file_archive_reaches_the_root_without_a_cached_row() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	drain_socket_event(&mut state, 1, archived(&file, Some(Uuid::from_u128(11))));
+
+	let seen = seen.lock().unwrap();
+	assert_eq!(
+		seen.len(),
+		1,
+		"the archive reaches the tracked root: {seen:?}"
+	);
+	assert!(seen[0].contains("Archived"), "{seen:?}");
+}
+
+/// The versioning-DISABLED twin names the RETIRED row, never the lineage, so with no cached row
+/// there is nothing to resolve an owner from — and nothing to tell it yet: the successor's
+/// `fileNew`, which carries the lineage, is what reaches the root.
+#[test]
+fn superseding_file_trash_without_a_cached_row_reaches_no_root() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	drain_socket_event(&mut state, 1, trashed(&file, Some(Uuid::from_u128(11))));
+	let after_trash = seen.lock().unwrap().clone();
+	assert!(
+		after_trash.is_empty(),
+		"nothing names the lineage yet: {after_trash:?}"
+	);
+
+	let successor = successor_of(&file, 11);
+	drain_socket_event(
+		&mut state,
+		2,
+		CacheEventType::File(FileEvent::New(successor)),
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(
+		seen.len(),
+		1,
+		"the successor's fileNew is what reaches the root: {seen:?}"
+	);
+	assert!(seen[0].contains("New"), "{seen:?}");
 }
 
 /// A `fileArchived` carrying a successor is the versioning-ENABLED account's edit, and must be

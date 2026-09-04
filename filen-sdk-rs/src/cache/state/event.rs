@@ -46,13 +46,19 @@ pub enum FileEvent<'a> {
 	},
 	Removed(Uuid),
 	/// A `fileTrash`, kept distinct from [`Removed`](Self::Removed) because it (like
-	/// [`Archived`](Self::Archived)) carries the lineage's whole-life id — which is what a file
-	/// sync root is keyed by — and because a trash is undoable while a removal is not.
+	/// [`Archived`](Self::Archived)) carries a stable id and because a trash is undoable while a
+	/// removal is not.
 	///
 	/// `new_uuid` is `Some` exactly when the trash is a versioning-DISABLED EDIT: `uuid` was
 	/// superseded by `new_uuid`, the same file under a re-minted id (the server also announces the
 	/// successor with a `fileNew`, in no guaranteed order). For a TRACKED file root that is an
 	/// identity update, never a removal; anything untracked is deleted, as a `fileTrash` always was.
+	///
+	/// `stable_uuid` is the server's: on a genuine trash the lineage's, the row staying restorable
+	/// under it; with a successor the RETIRED row's freshly minted one, which never names a live
+	/// file (a `fileTrash` naming the lineage next to the successor's `fileNew` naming it too would
+	/// let a stable-keyed consumer tombstone the live file). The apply resolves the lineage of a
+	/// superseded uuid from the row it holds, never from this field.
 	Trashed {
 		uuid: Uuid,
 		stable_uuid: StableUuid,
@@ -115,8 +121,9 @@ impl<'a> CacheEventType<'a> {
 				}
 				Err(e) => return Err((e, file.uuid())),
 			},
-			// The trash/archive keeps its stable id + successor: only the apply path knows whether
-			// the lineage is a tracked file root, and only it can decide update-vs-delete.
+			// The trash/archive keeps its stable id + successor as sent; the apply path decides
+			// update-vs-delete from the row it holds for `uuid`, and the dispatch reads the stable
+			// id only where it names the lineage (see the variants' docs).
 			DecryptedDriveEvent::FileTrash(FileTrash {
 				uuid,
 				stable_uuid,
