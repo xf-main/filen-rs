@@ -160,19 +160,26 @@ pub struct BaseInfo<'a> {
 }
 
 /// Shared by the single-metadata file events. Which of the optional fields are
-/// actually populated varies per kind, as observed live:
+/// populated varies per kind, as observed live on 2026-09-04:
 ///
-/// - `fileUploaded`: everything except `favorited` and `current_uuid`
-/// - `fileMoved` / `fileRestored`: everything except `current_uuid`
-/// - `versionedFileRestored`: everything, `current_uuid` being the uuid that
-///   was current before the old version was restored over it
+/// - `fileUploaded`: `uuid`, `stable_uuid`, `parent`, `bucket`, `region`, `rm`,
+///   `chunks`, `version` and the item `timestamp`
+/// - `fileMoved` / `fileRestored`: the same, plus `favorited`
+/// - `versionedFileRestored`: the same, plus `current_uuid` — the uuid that
+///   was current before the old version was restored over it, carried since
+///   before the identity fields existed
+/// - `fileVersioned`: `uuid` of the superseded file, `stable_uuid`, and
+///   `new_uuid` naming the successor on all but a small minority (what those
+///   are is unverified)
 /// - `fileTrash`: `uuid`, `stable_uuid` and — on a versioning-disabled edit —
 ///   `new_uuid`, exactly as the socket twin carries them; see the field docs
 ///   for whose stable id that is
-/// - `fileVersioned`: only `uuid` of the superseded file (last observed before
-///   the 2026-09-03 server change, not re-verified since)
-/// - `deleteFilePermanently`: none of them, not even `uuid`
+/// - `deleteFilePermanently`: `uuid`, and `stable_uuid` only when the whole
+///   lineage died; a delete of archived versions carries `uuid` alone
 /// - `fileRm`: unverified (never observed live)
+///
+/// Every identity field is absent on events logged before the server carried
+/// it, and the log keeps those forever — see [`Self::stable_uuid`].
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadataInfo<'a> {
@@ -185,8 +192,9 @@ pub struct FileMetadataInfo<'a> {
 	/// archived-version rows — on `deleteFilePermanently` that absence is the
 	/// signal that only old VERSIONS died and the live head stands, exactly as
 	/// [`super::super::socket::FileDeletedPermanent::stable_uuid`] means it.
-	/// Also absent on any event logged before the server carried the field, so
-	/// a replaying consumer must treat missing as "cannot replay", never as a
+	/// Also absent on every event logged before the server carried the field —
+	/// it began on 2026-09-01, and the log keeps older events forever — so a
+	/// replaying consumer must treat missing as "cannot replay", never as a
 	/// default. On a `fileTrash` with `new_uuid` set it is NOT the lineage's but
 	/// the retired row's freshly minted id, exactly as
 	/// [`super::super::socket::FileTrash::stable_uuid`] carries it — resolve
@@ -281,7 +289,8 @@ pub struct FileLinkEditedInfo<'a> {
 /// - `subFolderCreated` / `folderMoved` / `folderRestored`: `uuid`, `parent`
 ///   (the *new* parent for a move) and `timestamp`
 /// - `folderTrash`: `uuid` and `parent`
-/// - `deleteFolderPermanently`: none of the optionals
+/// - `deleteFolderPermanently`: `uuid` (absent on events logged before
+///   2026-09-01, which the log keeps forever)
 /// - `baseFolderCreated`: unverified (never observed live)
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
